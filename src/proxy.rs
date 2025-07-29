@@ -137,7 +137,7 @@ impl ProxyRequest {
         })
     }
 
-    pub async fn execute(&self, client: &Client) -> Result<Response> {
+    pub async fn execute(&self, client: &Client, config: &Config) -> Result<Response> {
         let start_time = Instant::now();
 
         let mut headers = HeaderMap::new();
@@ -145,7 +145,10 @@ impl ProxyRequest {
             "authorization",
             HeaderValue::from_str(&format!("Bearer {}", self.token))?,
         );
-        headers.insert("ai-resource-group", HeaderValue::from_static("default"));
+        headers.insert(
+            "ai-resource-group",
+            HeaderValue::from_str(&config.resource_group)?,
+        );
         headers.insert("content-type", HeaderValue::from_static("application/json"));
 
         tracing::debug!("Proxying request to: {}", self.url);

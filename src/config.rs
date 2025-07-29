@@ -17,6 +17,8 @@ pub struct Config {
     pub models: HashMap<String, String>,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    #[serde(default = "default_resource_group")]
+    pub resource_group: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -29,6 +31,8 @@ pub struct ConfigFile {
     pub port: u16,
     #[serde(default)]
     pub models: Vec<Model>,
+    #[serde(default)]
+    pub resource_group: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -54,6 +58,10 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn default_resource_group() -> String {
+    "default".to_string()
+}
+
 #[derive(Debug)]
 struct PartialConfig {
     uaa_token_url: Option<String>,
@@ -64,6 +72,7 @@ struct PartialConfig {
     port: u16,
     models: HashMap<String, String>,
     log_level: String,
+    resource_group: String,
 }
 
 impl PartialConfig {
@@ -72,6 +81,10 @@ impl PartialConfig {
 
         if let Some(log_level) = file_config.log_level {
             self.log_level = log_level;
+        }
+
+        if let Some(resource_group) = file_config.resource_group {
+            self.resource_group = resource_group;
         }
 
         if let Some(creds) = file_config.credentials {
@@ -132,6 +145,9 @@ impl PartialConfig {
         if let Ok(val) = env::var("LOG_LEVEL") {
             self.log_level = val;
         }
+        if let Ok(val) = env::var("RESOURCE_GROUP") {
+            self.resource_group = val;
+        }
     }
 
     fn into_config(self) -> Result<Config> {
@@ -154,6 +170,7 @@ impl PartialConfig {
             port: self.port,
             models: self.models,
             log_level: self.log_level,
+            resource_group: self.resource_group,
         })
     }
 }
@@ -169,6 +186,7 @@ impl Default for PartialConfig {
             port: default_port(),
             models: HashMap::new(),
             log_level: default_log_level(),
+            resource_group: default_resource_group(),
         }
     }
 }
@@ -334,6 +352,7 @@ credentials:
                 name: "model1".to_string(),
                 deployment_id: "dep1".to_string(),
             }],
+            resource_group: Some("test-group".to_string()),
         };
 
         partial_config.merge_file(config_file);
@@ -347,6 +366,7 @@ credentials:
             partial_config.models.get("model1"),
             Some(&"dep1".to_string())
         );
+        assert_eq!(partial_config.resource_group, "test-group");
     }
 
     #[test]
@@ -365,6 +385,7 @@ credentials:
                 api_key: Some("key".to_string()),
             }),
             models: vec![],
+            resource_group: None,
         };
 
         partial_config.merge_file(config_file1);
@@ -385,6 +406,7 @@ credentials:
                 api_key: Some("key".to_string()),
             }),
             models: vec![],
+            resource_group: None,
         };
 
         partial_config.merge_file(config_file2);
@@ -405,6 +427,7 @@ credentials:
                 api_key: Some("key".to_string()),
             }),
             models: vec![],
+            resource_group: None,
         };
 
         partial_config.merge_file(config_file3);
@@ -425,6 +448,7 @@ credentials:
                 api_key: Some("key".to_string()),
             }),
             models: vec![],
+            resource_group: None,
         };
 
         partial_config.merge_file(config_file4);

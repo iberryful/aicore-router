@@ -93,7 +93,7 @@ async fn execute_proxy_request(
     )
     .await?;
 
-    Ok(proxy.execute(&state.client).await?)
+    Ok(proxy.execute(&state.client, &state.config).await?)
 }
 
 pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
