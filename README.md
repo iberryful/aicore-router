@@ -8,6 +8,9 @@ A high-performance Rust-based proxy service for SAP AI Core, providing unified a
 
 - **Multi-Model Support**: OpenAI GPT, Claude (Anthropic), and Gemini (Google) APIs
 - **Streaming Support**: Real-time streaming responses for all supported models
+- **Dynamic Model Resolution**: Automatic discovery and mapping of models from AI Core deployments
+- **CLI Administration**: Command-line tools to inspect deployments and resource groups
+- **Token Usage Statistics**: Logs token usage for all streaming responses
 - **OAuth Token Management**: Automatic token refresh with SAP UAA
 - **High Performance**: Built with Rust and async/await for maximum throughput
 - **Simple Configuration**: YAML config file only
@@ -78,13 +81,17 @@ credentials:
   uaa_token_url: https://your-tenant.authentication.sap.hana.ondemand.com/oauth/token
   uaa_client_id: your-client-id
   uaa_client_secret: your-client-secret
-  aicore_api_url: https://api.ai.prod.sap.com
+  genai_api_url: https://api.ai.prod.sap.com
+  resource_group: your-resource-group
   api_key: your-api-key
 
 # Server configuration
 port: 8900
+refresh_interval_secs: 600
 
-# Model mappings
+# Model mappings (optional)
+# Models are now discovered automatically from your AI Core deployments.
+# You can still define them here to override or add custom mappings.
 models:
   - name: gpt-4
     deployment_id: deployment-id-from-aicore
@@ -151,6 +158,24 @@ cargo run
 cargo test
 ```
 
+## CLI Commands
+
+The AI Core Router includes a command-line interface (CLI) for administrative tasks.
+
+### List Deployments
+
+List all deployments in a resource group:
+```bash
+acr deployments list -r <your-resource-group>
+```
+
+### List Resource Groups
+
+List all available resource groups:
+```bash
+acr resource-group list
+```
+
 ## Configuration Reference
 
 ### Required Configuration
@@ -162,7 +187,8 @@ All of the following must be set in the config file:
 | `credentials.uaa_token_url` | SAP UAA OAuth token endpoint |
 | `credentials.uaa_client_id` | OAuth client ID |
 | `credentials.uaa_client_secret` | OAuth client secret |
-| `credentials.aicore_api_url` | SAP AI Core API base URL |
+| `credentials.genai_api_url` | SAP AI Core API base URL |
+| `credentials.resource_group` | AI Core resource group |
 | `credentials.api_key` | API key for accessing the router |
 
 ### Optional Configuration
@@ -171,6 +197,7 @@ All of the following must be set in the config file:
 |------------------|---------|-------------|
 | `port` | 8900 | Server port |
 | `log_level` | INFO | Logging level |
+| `refresh_interval_secs` | 600 | Interval for refreshing model deployments |
 
 ### Model Configuration
 
@@ -182,7 +209,7 @@ models:
     deployment_id: deployment-id
 ```
 
-If no models are configured, the models endpoint will return an empty list.
+If no models are configured, the router will automatically discover them from your AI Core deployments.
 
 ## Streaming
 
