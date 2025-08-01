@@ -8,11 +8,17 @@ use axum::{
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::{config::Config, proxy::ProxyRequest, token::TokenManager};
+use crate::{
+    config::Config,
+    proxy::{ProxyRequest, ProxyRequestParams},
+    registry::ModelRegistry,
+    token::TokenManager,
+};
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
+    pub model_registry: ModelRegistry,
     pub token_manager: TokenManager,
     pub client: reqwest::Client,
 }
@@ -82,22 +88,23 @@ async fn execute_proxy_request(
     model: &str,
     action: Option<String>,
 ) -> Result<Response, AppError> {
-    let proxy = ProxyRequest::new(
+    let params = ProxyRequestParams {
         headers,
-        Method::POST,
+        method: Method::POST,
         body,
-        model.to_string(),
+        model: model.to_string(),
         action,
-        &state.config,
-        &state.token_manager,
-    )
-    .await?;
+        config: &state.config,
+        token_manager: &state.token_manager,
+        model_registry: &state.model_registry,
+    };
 
+    let proxy = ProxyRequest::from_params(params).await?;
     Ok(proxy.execute(&state.client, &state.config).await?)
 }
 
 pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
-    let model_names = state.config.get_available_models().await;
+    let model_names = state.model_registry.get_available_models().await;
 
     let model_data: Vec<serde_json::Value> = model_names
         .into_iter()

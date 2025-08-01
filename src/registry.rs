@@ -6,38 +6,82 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use crate::client::AiCoreClient;
-use crate::config::{Config, Model};
+use crate::config::Model;
 
-pub struct DeploymentResolver {
-    client: AiCoreClient,
-    resource_group: String,
-    refresh_interval: Duration,
+/// Runtime model registry that manages resolved deployment IDs and handles resolution
+#[derive(Debug, Clone)]
+pub struct ModelRegistry {
+    /// Resolved model name to deployment ID mappings
     resolved_models: Arc<RwLock<HashMap<String, String>>>,
-    model_configs: Vec<Model>,
+    /// Original model configurations from config file
+    config_models: Vec<Model>,
+    /// AI Core client for fetching deployments
+    client: AiCoreClient,
+    /// Resource group for deployment queries
+    resource_group: String,
+    /// Refresh interval for background updates
+    refresh_interval: Duration,
 }
 
-impl DeploymentResolver {
-    pub fn new(config: &Config, client: AiCoreClient) -> Self {
+impl ModelRegistry {
+    /// Create a new model registry
+    pub fn new(
+        config_models: Vec<Model>,
+        client: AiCoreClient,
+        resource_group: String,
+        refresh_interval_secs: u64,
+    ) -> Self {
         Self {
+            resolved_models: Arc::new(RwLock::new(HashMap::new())),
+            config_models,
             client,
-            resource_group: config.resource_group.clone(),
-            refresh_interval: Duration::from_secs(config.refresh_interval_secs),
-            resolved_models: Arc::clone(&config.resolved_models),
-            model_configs: config.models.clone(),
+            resource_group,
+            refresh_interval: Duration::from_secs(refresh_interval_secs),
         }
     }
 
+    /// Start the registry with initial resolution and background refresh
     pub async fn start(&self) -> Result<()> {
         // Initial resolution
         self.refresh_deployments().await?;
 
         // Start background refresh task
-        let resolver = self.clone();
+        let registry = self.clone();
         tokio::spawn(async move {
-            resolver.background_refresh().await;
+            registry.background_refresh().await;
         });
 
         Ok(())
+    }
+
+    /// Get deployment ID for a resolved model
+    pub async fn get_deployment_id(&self, model_name: &str) -> Option<String> {
+        let resolved = self.resolved_models.read().await;
+        resolved.get(model_name).cloned()
+    }
+
+    /// Get all available (resolved) model names
+    pub async fn get_available_models(&self) -> Vec<String> {
+        let resolved = self.resolved_models.read().await;
+        let mut models: Vec<String> = resolved.keys().cloned().collect();
+        models.sort();
+        models
+    }
+
+    /// Check if a model is available (has been resolved)
+    pub async fn is_model_available(&self, model_name: &str) -> bool {
+        let resolved = self.resolved_models.read().await;
+        resolved.contains_key(model_name)
+    }
+
+    /// Find model configuration by name
+    pub fn find_model_config(&self, model_name: &str) -> Option<&Model> {
+        self.config_models.iter().find(|m| m.name == model_name)
+    }
+
+    /// Get model names from configuration (not necessarily resolved)
+    pub fn get_configured_model_names(&self) -> Vec<&str> {
+        self.config_models.iter().map(|m| m.name.as_str()).collect()
     }
 
     async fn background_refresh(&self) {
@@ -65,7 +109,7 @@ impl DeploymentResolver {
 
         let mut resolved = HashMap::new();
 
-        for model_config in &self.model_configs {
+        for model_config in &self.config_models {
             if let Some(deployment_id) = &model_config.deployment_id {
                 // Direct deployment ID mapping
                 resolved.insert(model_config.name.clone(), deployment_id.clone());
@@ -110,17 +154,5 @@ impl DeploymentResolver {
         );
 
         Ok(())
-    }
-}
-
-impl Clone for DeploymentResolver {
-    fn clone(&self) -> Self {
-        Self {
-            client: self.client.clone(),
-            resource_group: self.resource_group.clone(),
-            refresh_interval: self.refresh_interval,
-            resolved_models: Arc::clone(&self.resolved_models),
-            model_configs: self.model_configs.clone(),
-        }
     }
 }

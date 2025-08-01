@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::env;
 use std::path::Path;
+
+use crate::constants::config::*;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -15,8 +16,6 @@ pub struct Config {
     pub port: u16,
     #[serde(default)]
     pub models: Vec<Model>,
-    #[serde(skip)]
-    pub resolved_models: std::sync::Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     #[serde(default = "default_log_level")]
     pub log_level: String,
     #[serde(default = "default_resource_group")]
@@ -58,19 +57,19 @@ pub struct Model {
 }
 
 fn default_port() -> u16 {
-    8900
+    DEFAULT_PORT
 }
 
 fn default_log_level() -> String {
-    "info".to_string()
+    DEFAULT_LOG_LEVEL.to_string()
 }
 
 fn default_refresh_interval_secs() -> u64 {
-    300 // 5 minutes
+    DEFAULT_REFRESH_INTERVAL_SECS
 }
 
 fn default_resource_group() -> String {
-    "default".to_string()
+    DEFAULT_RESOURCE_GROUP.to_string()
 }
 
 fn normalize_oauth_token_url(url: String) -> String {
@@ -126,16 +125,6 @@ impl Config {
 
     pub fn get_model_names(&self) -> Vec<&str> {
         self.models.iter().map(|m| m.name.as_str()).collect()
-    }
-
-    pub async fn get_resolved_deployment_id(&self, model_name: &str) -> Option<String> {
-        let resolved = self.resolved_models.read().await;
-        resolved.get(model_name).cloned()
-    }
-
-    pub async fn get_available_models(&self) -> Vec<String> {
-        let resolved = self.resolved_models.read().await;
-        resolved.keys().cloned().collect()
     }
 
     fn from_file_and_env(file_config: ConfigFile) -> Result<Self> {
@@ -226,7 +215,6 @@ impl Config {
             api_key,
             port,
             models,
-            resolved_models: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             log_level,
             resource_group,
             refresh_interval_secs,

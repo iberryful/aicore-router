@@ -11,6 +11,8 @@ use std::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::config::Config;
+use crate::constants::{api::*, models::*};
+use crate::registry::ModelRegistry;
 use crate::routes::AppError;
 use crate::token::TokenManager;
 
@@ -79,55 +81,96 @@ pub struct ProxyRequest {
     pub model: String,
 }
 
-impl ProxyRequest {
-    pub async fn new(
-        headers: &HeaderMap,
-        method: Method,
-        body: Value,
-        model: String,
-        action: Option<String>,
-        config: &Config,
-        token_manager: &TokenManager,
-    ) -> Result<Self, AppError> {
-        let api_key = extract_api_key(headers).ok_or(AppError::MissingApiKey)?;
+/// Input parameters for building a ProxyRequest
+#[derive(Debug)]
+pub struct ProxyRequestParams<'a> {
+    pub headers: &'a HeaderMap,
+    pub method: Method,
+    pub body: Value,
+    pub model: String,
+    pub action: Option<String>,
+    pub config: &'a Config,
+    pub token_manager: &'a TokenManager,
+    pub model_registry: &'a ModelRegistry,
+}
 
-        let token = token_manager
-            .get_token(&api_key)
-            .await
-            .map_err(AppError::Internal)?
-            .ok_or(AppError::InvalidApiKey)?;
+/// Builder for ProxyRequest with step-by-step validation
+pub struct ProxyRequestBuilder<'a> {
+    params: ProxyRequestParams<'a>,
+}
 
-        let normalized_model =
-            normalize_model(&model, config).map_err(|e| AppError::BadRequest(e.to_string()))?;
+impl<'a> ProxyRequestBuilder<'a> {
+    pub fn new(params: ProxyRequestParams<'a>) -> Self {
+        Self { params }
+    }
 
-        let deployment_id = resolve_deployment_id(&normalized_model, config)
-            .await
-            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    pub async fn build(self) -> Result<ProxyRequest, AppError> {
+        // Step 1: Extract and validate API key
+        let api_key = self.extract_api_key()?;
 
+        // Step 2: Get authentication token
+        let token = self.get_auth_token(&api_key).await?;
+
+        // Step 3: Resolve model and deployment
+        let (normalized_model, deployment_id) = self.resolve_model().await?;
+
+        // Step 4: Determine LLM family and stream flag
         let family = determine_family(&normalized_model);
-        let mut body = body;
-        let stream = extract_stream_flag(&body, &family, &action);
+        let stream = extract_stream_flag(&self.params.body, &family, &self.params.action);
 
+        // Step 5: Prepare request body
+        let mut body = self.params.body;
+        prepare_body(&mut body, &family, stream)?;
+
+        // Step 6: Build target URL
         let url = build_url(
             &normalized_model,
             &deployment_id,
-            &action,
-            &config.genai_api_url,
+            &self.params.action,
+            &self.params.config.genai_api_url,
             &family,
             stream,
         )?;
 
-        prepare_body(&mut body, &family, stream)?;
-
-        Ok(Self {
+        Ok(ProxyRequest {
             family,
-            method,
+            method: self.params.method,
             body,
             stream,
             url,
             token,
             model: normalized_model,
         })
+    }
+
+    fn extract_api_key(&self) -> Result<String, AppError> {
+        extract_api_key(self.params.headers).ok_or(AppError::MissingApiKey)
+    }
+
+    async fn get_auth_token(&self, api_key: &str) -> Result<String, AppError> {
+        self.params
+            .token_manager
+            .get_token(api_key)
+            .await
+            .map_err(AppError::Internal)?
+            .ok_or(AppError::InvalidApiKey)
+    }
+
+    async fn resolve_model(&self) -> Result<(String, String), AppError> {
+        let normalized_model = normalize_model(&self.params.model, self.params.model_registry)
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+
+        let deployment_id = resolve_deployment_id(&normalized_model, self.params.model_registry)
+            .await
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+
+        Ok((normalized_model, deployment_id))
+    }
+}
+
+impl ProxyRequest {
+    pub async fn from_params(params: ProxyRequestParams<'_>) -> Result<Self, AppError> {
+        ProxyRequestBuilder::new(params).build().await
     }
 
     pub async fn execute(&self, client: &Client, config: &Config) -> Result<Response> {
@@ -300,25 +343,27 @@ impl ProxyRequest {
     }
 }
 
-fn normalize_model(model: &str, config: &Config) -> Result<String> {
+fn normalize_model(model: &str, registry: &ModelRegistry) -> Result<String> {
     // Simple normalization - if the model exists in config, use it
-    if config.models.iter().any(|m| m.name == model) {
+    if registry.find_model_config(model).is_some() {
         return Ok(model.to_string());
     }
 
     // Basic fallback for claude models
-    if model.starts_with("claude") && config.models.iter().any(|m| m.name == "claude-sonnet-4") {
-        return Ok("claude-sonnet-4".to_string());
+    if model.starts_with(CLAUDE_PREFIX)
+        && registry.find_model_config(DEFAULT_CLAUDE_MODEL).is_some()
+    {
+        return Ok(DEFAULT_CLAUDE_MODEL.to_string());
     }
 
     Ok(model.to_string())
 }
 
-async fn resolve_deployment_id(model: &str, config: &Config) -> Result<String> {
-    if let Some(deployment_id) = config.get_resolved_deployment_id(model).await {
+async fn resolve_deployment_id(model: &str, registry: &ModelRegistry) -> Result<String> {
+    if let Some(deployment_id) = registry.get_deployment_id(model).await {
         Ok(deployment_id)
     } else {
-        let available = config.get_available_models().await.join(", ");
+        let available = registry.get_available_models().await.join(", ");
         Err(anyhow::anyhow!(
             "Model '{}' not found or not resolved. Available models: {}",
             model,
@@ -328,9 +373,9 @@ async fn resolve_deployment_id(model: &str, config: &Config) -> Result<String> {
 }
 
 fn determine_family(model: &str) -> LlmFamily {
-    if model.starts_with("claude") {
+    if model.starts_with(CLAUDE_PREFIX) {
         LlmFamily::Claude
-    } else if model.starts_with("gemini") {
+    } else if model.starts_with(GEMINI_PREFIX) {
         LlmFamily::Gemini
     } else {
         LlmFamily::OpenAi
@@ -343,7 +388,7 @@ fn extract_stream_flag(body: &Value, family: &LlmFamily, action: &Option<String>
             .get("stream")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
-        LlmFamily::Gemini => action.as_deref() == Some("streamGenerateContent"),
+        LlmFamily::Gemini => action.as_deref() == Some(STREAM_GENERATE_CONTENT_ACTION),
         LlmFamily::OpenAi => body
             .get("stream")
             .and_then(|v| v.as_bool())
@@ -355,7 +400,7 @@ fn prepare_body(body: &mut Value, family: &LlmFamily, stream: bool) -> Result<()
     match family {
         LlmFamily::Claude => {
             if let Some(obj) = body.as_object_mut() {
-                obj.insert("anthropic_version".to_string(), json!("bedrock-2023-05-31"));
+                obj.insert("anthropic_version".to_string(), json!(ANTHROPIC_VERSION));
                 obj.remove("stream");
                 obj.remove("model");
 
@@ -448,33 +493,31 @@ fn build_url(
     family: &LlmFamily,
     stream: bool,
 ) -> Result<String> {
-    const DEFAULT_API_VERSION: &str = "2025-04-01-preview";
-
     match family {
         LlmFamily::Claude => {
             let action = if stream {
-                "invoke-with-response-stream"
+                INVOKE_STREAM_ACTION
             } else {
-                "invoke"
+                INVOKE_ACTION
             };
             Ok(format!(
-                "{base_url}/v2/inference/deployments/{deployment_id}/{action}"
+                "{base_url}{INFERENCE_DEPLOYMENTS_PATH}/{deployment_id}/{action}"
             ))
         }
         LlmFamily::Gemini => {
-            let action = action.as_deref().unwrap_or("generateContent");
+            let action = action.as_deref().unwrap_or(GENERATE_CONTENT_ACTION);
             Ok(format!(
-                "{base_url}/v2/inference/deployments/{deployment_id}/models/{model}:{action}"
+                "{base_url}{INFERENCE_DEPLOYMENTS_PATH}/{deployment_id}{MODELS_PATH}/{model}:{action}"
             ))
         }
         LlmFamily::OpenAi => {
-            if model.starts_with("text") {
+            if model.starts_with(TEXT_PREFIX) {
                 Ok(format!(
-                    "{base_url}/v2/inference/deployments/{deployment_id}/embeddings?api-version={DEFAULT_API_VERSION}"
+                    "{base_url}{INFERENCE_DEPLOYMENTS_PATH}/{deployment_id}{EMBEDDINGS_PATH}?api-version={DEFAULT_API_VERSION}"
                 ))
             } else {
                 Ok(format!(
-                    "{base_url}/v2/inference/deployments/{deployment_id}/chat/completions?api-version={DEFAULT_API_VERSION}"
+                    "{base_url}{INFERENCE_DEPLOYMENTS_PATH}/{deployment_id}{CHAT_COMPLETIONS_PATH}?api-version={DEFAULT_API_VERSION}"
                 ))
             }
         }

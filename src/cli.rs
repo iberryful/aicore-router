@@ -8,7 +8,7 @@ use crate::{
     client::AiCoreClient,
     commands::CommandHandler,
     config::Config,
-    resolver::DeploymentResolver,
+    registry::ModelRegistry,
     routes::{AppState, create_router},
     token::{OAuthConfig, TokenManager},
 };
@@ -129,19 +129,25 @@ impl Cli {
         // Create AI Core client for deployment resolution
         let aicore_client = AiCoreClient::from_config(config.clone());
 
-        // Create and start deployment resolver
+        // Create and start model registry
         tracing::info!(
-            "Initializing deployment resolver with refresh interval: {}s",
+            "Initializing model registry with refresh interval: {}s",
             config.refresh_interval_secs
         );
-        let resolver = DeploymentResolver::new(&config, aicore_client);
-        resolver
+        let model_registry = ModelRegistry::new(
+            config.models.clone(),
+            aicore_client,
+            config.resource_group.clone(),
+            config.refresh_interval_secs,
+        );
+        model_registry
             .start()
             .await
-            .context("Failed to start deployment resolver")?;
+            .context("Failed to start model registry")?;
 
         let state = AppState {
             config: config.clone(),
+            model_registry,
             token_manager,
             client,
         };

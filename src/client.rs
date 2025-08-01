@@ -130,7 +130,7 @@ impl From<Config> for AiCoreClientConfig {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AiCoreClient {
     client: Client,
     config: AiCoreClientConfig,
