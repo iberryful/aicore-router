@@ -389,79 +389,47 @@ fn prepare_body(body: &mut Value, family: &LlmFamily, stream: bool) -> Result<()
 }
 
 fn extract_token_stats(data: &str, family: &LlmFamily) -> Option<TokenStats> {
+    let parsed: Value = serde_json::from_str(data).ok()?;
+
     match family {
         LlmFamily::Claude => {
-            if let Ok(parsed) = serde_json::from_str::<Value>(data) {
-                if let Some(event_type) = parsed.get("type").and_then(|v| v.as_str()) {
-                    if event_type == "message_stop" {
-                        if let Some(metrics) = parsed.get("amazon-bedrock-invocationMetrics") {
-                            let input_tokens =
-                                metrics.get("inputTokenCount").and_then(|v| v.as_u64());
-                            let output_tokens =
-                                metrics.get("outputTokenCount").and_then(|v| v.as_u64());
-                            let cache_read = metrics
-                                .get("cacheReadInputTokenCount")
-                                .and_then(|v| v.as_u64());
-                            let cache_write = metrics
-                                .get("cacheWriteInputTokenCount")
-                                .and_then(|v| v.as_u64());
-                            return Some(TokenStats {
-                                input_tokens,
-                                output_tokens,
-                                cache_read,
-                                cache_write,
-                            });
-                        }
-                    }
-                }
+            if parsed.get("type")?.as_str()? == "message_stop" {
+                let metrics = parsed.get("amazon-bedrock-invocationMetrics")?;
+                Some(TokenStats {
+                    input_tokens: metrics.get("inputTokenCount")?.as_u64(),
+                    output_tokens: metrics.get("outputTokenCount")?.as_u64(),
+                    cache_read: metrics.get("cacheReadInputTokenCount")?.as_u64(),
+                    cache_write: metrics.get("cacheWriteInputTokenCount")?.as_u64(),
+                })
+            } else {
+                None
             }
         }
         LlmFamily::OpenAi => {
-            if let Ok(parsed) = serde_json::from_str::<Value>(data) {
-                if let Some(usage) = parsed.get("usage") {
-                    let input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64());
-                    let output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64());
-
-                    return Some(TokenStats {
-                        input_tokens,
-                        output_tokens,
-                        cache_read: None,
-                        cache_write: None,
-                    });
-                }
-            }
+            let usage = parsed.get("usage")?;
+            Some(TokenStats {
+                input_tokens: usage.get("prompt_tokens")?.as_u64(),
+                output_tokens: usage.get("completion_tokens")?.as_u64(),
+                cache_read: None,
+                cache_write: None,
+            })
         }
         LlmFamily::Gemini => {
-            if let Ok(parsed) = serde_json::from_str::<Value>(data) {
-                if let Some(usage_metadata) = parsed.get("usageMetadata") {
-                    let input_tokens = usage_metadata
-                        .get("promptTokenCount")
-                        .and_then(|v| v.as_u64());
-                    let total_tokens = usage_metadata
-                        .get("totalTokenCount")
-                        .and_then(|v| v.as_u64());
+            let usage_metadata = parsed.get("usageMetadata")?;
+            let input_tokens = usage_metadata.get("promptTokenCount")?.as_u64()?;
+            let total_tokens = usage_metadata.get("totalTokenCount")?.as_u64();
+            let output_tokens = total_tokens.map(|t| t.saturating_sub(input_tokens));
 
-                    // Output tokens = total - input (prompt)
-                    let output_tokens = match (total_tokens, input_tokens) {
-                        (Some(total), Some(input)) => Some(total.saturating_sub(input)),
-                        _ => None,
-                    };
-
-                    let cache_read = usage_metadata
-                        .get("cachedContentTokenCount")
-                        .and_then(|v| v.as_u64());
-
-                    return Some(TokenStats {
-                        input_tokens,
-                        output_tokens,
-                        cache_read,
-                        cache_write: None,
-                    });
-                }
-            }
+            Some(TokenStats {
+                input_tokens: Some(input_tokens),
+                output_tokens,
+                cache_read: usage_metadata
+                    .get("cachedContentTokenCount")
+                    .and_then(|v| v.as_u64()),
+                cache_write: None,
+            })
         }
     }
-    None
 }
 
 fn build_url(
