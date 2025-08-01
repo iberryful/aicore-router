@@ -90,6 +90,22 @@ impl Deployment {
         }
         (None, None)
     }
+
+    pub fn get_aicore_model_name(&self) -> Option<String> {
+        if let Some(details) = &self.details {
+            if let Some(resources) = &details.resources {
+                if let Some(backend_details) = resources.get("backendDetails") {
+                    if let Some(model) = backend_details.get("model") {
+                        return model
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +130,7 @@ impl From<Config> for AiCoreClientConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct AiCoreClient {
     client: Client,
     config: AiCoreClientConfig,
@@ -258,5 +275,24 @@ impl AiCoreClient {
 
     pub fn get_client(&self) -> &Client {
         &self.client
+    }
+
+    pub async fn build_model_to_deployment_mapping(
+        &self,
+        resource_group: Option<&str>,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let deployments = self.list_deployments(resource_group).await?;
+
+        let mut mapping = std::collections::HashMap::new();
+
+        for deployment in &deployments.resources {
+            if deployment.status == "RUNNING" {
+                if let Some(model_name) = deployment.get_aicore_model_name() {
+                    mapping.insert(model_name, deployment.id.clone());
+                }
+            }
+        }
+
+        Ok(mapping)
     }
 }

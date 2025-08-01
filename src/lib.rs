@@ -3,5 +3,6 @@ pub mod client;
 pub mod commands;
 pub mod config;
 pub mod proxy;
+pub mod resolver;
 pub mod routes;
 pub mod token;

@@ -7,7 +7,6 @@ use axum::{
 use futures::stream::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -98,18 +97,12 @@ impl ProxyRequest {
             .map_err(AppError::Internal)?
             .ok_or(AppError::InvalidApiKey)?;
 
-        let normalized_model = normalize_model(&model, &config.models)
+        let normalized_model =
+            normalize_model(&model, config).map_err(|e| AppError::BadRequest(e.to_string()))?;
+
+        let deployment_id = resolve_deployment_id(&normalized_model, config)
+            .await
             .map_err(|e| AppError::BadRequest(e.to_string()))?;
-        let deployment_id = config
-            .models
-            .get(&normalized_model)
-            .ok_or_else(|| {
-                let available = config.models.keys().cloned().collect::<Vec<_>>().join(", ");
-                AppError::BadRequest(format!(
-                    "Model '{model}' not found. Available models: {available}"
-                ))
-            })?
-            .clone();
 
         let family = determine_family(&normalized_model);
         let mut body = body;
@@ -307,16 +300,31 @@ impl ProxyRequest {
     }
 }
 
-fn normalize_model(model: &str, models: &HashMap<String, String>) -> Result<String> {
-    if models.contains_key(model) {
+fn normalize_model(model: &str, config: &Config) -> Result<String> {
+    // Simple normalization - if the model exists in config, use it
+    if config.models.iter().any(|m| m.name == model) {
         return Ok(model.to_string());
     }
 
-    if model.starts_with("claude") && models.contains_key("claude-sonnet-4") {
+    // Basic fallback for claude models
+    if model.starts_with("claude") && config.models.iter().any(|m| m.name == "claude-sonnet-4") {
         return Ok("claude-sonnet-4".to_string());
     }
 
     Ok(model.to_string())
+}
+
+async fn resolve_deployment_id(model: &str, config: &Config) -> Result<String> {
+    if let Some(deployment_id) = config.get_resolved_deployment_id(model).await {
+        Ok(deployment_id)
+    } else {
+        let available = config.get_available_models().await.join(", ");
+        Err(anyhow::anyhow!(
+            "Model '{}' not found or not resolved. Available models: {}",
+            model,
+            available
+        ))
+    }
 }
 
 fn determine_family(model: &str) -> LlmFamily {

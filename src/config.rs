@@ -14,11 +14,15 @@ pub struct Config {
     #[serde(default = "default_port")]
     pub port: u16,
     #[serde(default)]
-    pub models: HashMap<String, String>,
+    pub models: Vec<Model>,
+    #[serde(skip)]
+    pub resolved_models: std::sync::Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     #[serde(default = "default_log_level")]
     pub log_level: String,
     #[serde(default = "default_resource_group")]
     pub resource_group: String,
+    #[serde(default = "default_refresh_interval_secs")]
+    pub refresh_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -33,6 +37,8 @@ pub struct ConfigFile {
     pub models: Vec<Model>,
     #[serde(default)]
     pub resource_group: Option<String>,
+    #[serde(default)]
+    pub refresh_interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -47,7 +53,8 @@ pub struct Credentials {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Model {
     pub name: String,
-    pub deployment_id: String,
+    pub deployment_id: Option<String>,
+    pub aicore_model_name: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -56,6 +63,10 @@ fn default_port() -> u16 {
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_refresh_interval_secs() -> u64 {
+    300 // 5 minutes
 }
 
 fn default_resource_group() -> String {
@@ -95,6 +106,36 @@ impl Config {
             .with_context(|| format!("Failed to parse config file: {config_file_path}"))?;
 
         Self::from_file_and_env(file_config)
+    }
+
+    pub fn get_deployment_id(&self, model_name: &str) -> Option<&str> {
+        self.models
+            .iter()
+            .find(|m| m.name == model_name)?
+            .deployment_id
+            .as_deref()
+    }
+
+    pub fn get_aicore_model_name(&self, model_name: &str) -> Option<&str> {
+        self.models
+            .iter()
+            .find(|m| m.name == model_name)?
+            .aicore_model_name
+            .as_deref()
+    }
+
+    pub fn get_model_names(&self) -> Vec<&str> {
+        self.models.iter().map(|m| m.name.as_str()).collect()
+    }
+
+    pub async fn get_resolved_deployment_id(&self, model_name: &str) -> Option<String> {
+        let resolved = self.resolved_models.read().await;
+        resolved.get(model_name).cloned()
+    }
+
+    pub async fn get_available_models(&self) -> Vec<String> {
+        let resolved = self.resolved_models.read().await;
+        resolved.keys().cloned().collect()
     }
 
     fn from_file_and_env(file_config: ConfigFile) -> Result<Self> {
@@ -169,15 +210,13 @@ impl Config {
             .or(file_config.resource_group)
             .unwrap_or_else(default_resource_group);
 
-        let models = if file_config.models.is_empty() {
-            HashMap::new()
-        } else {
-            file_config
-                .models
-                .into_iter()
-                .map(|m| (m.name, m.deployment_id))
-                .collect()
-        };
+        let refresh_interval_secs = env::var("REFRESH_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .or(file_config.refresh_interval_secs)
+            .unwrap_or_else(default_refresh_interval_secs);
+
+        let models = file_config.models;
 
         Ok(Config {
             uaa_token_url,
@@ -187,8 +226,10 @@ impl Config {
             api_key,
             port,
             models,
+            resolved_models: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             log_level,
             resource_group,
+            refresh_interval_secs,
         })
     }
 }
@@ -224,7 +265,10 @@ models:
         assert_eq!(config_file.log_level, Some("DEBUG".to_string()));
         assert_eq!(config_file.models.len(), 2);
         assert_eq!(config_file.models[0].name, "gpt-4");
-        assert_eq!(config_file.models[0].deployment_id, "dep-123");
+        assert_eq!(
+            config_file.models[0].deployment_id,
+            Some("dep-123".to_string())
+        );
 
         let creds = config_file.credentials.unwrap();
         assert_eq!(
@@ -263,9 +307,11 @@ models:
         assert_eq!(config.uaa_client_id, "test-client-id");
         assert_eq!(config.genai_api_url, "https://api.test.example.com");
         assert_eq!(config.api_key, "test-api-key");
+        assert_eq!(config.models.len(), 1);
+        assert_eq!(config.models[0].name, "test-model");
         assert_eq!(
-            config.models.get("test-model"),
-            Some(&"test-deployment".to_string())
+            config.models[0].deployment_id,
+            Some("test-deployment".to_string())
         );
     }
 
@@ -317,16 +363,20 @@ credentials:
             }),
             models: vec![Model {
                 name: "model1".to_string(),
-                deployment_id: "dep1".to_string(),
+                deployment_id: Some("dep1".to_string()),
+                aicore_model_name: None,
             }],
             resource_group: Some("test-group".to_string()),
+            refresh_interval_secs: None,
         };
 
         let config = Config::from_file_and_env(config_file).expect("Failed to create config");
 
         assert_eq!(config.port, 3000);
         assert_eq!(config.uaa_token_url, "https://example.com/oauth/token");
-        assert_eq!(config.models.get("model1"), Some(&"dep1".to_string()));
+        assert_eq!(config.models.len(), 1);
+        assert_eq!(config.models[0].name, "model1");
+        assert_eq!(config.models[0].deployment_id, Some("dep1".to_string()));
         assert_eq!(config.resource_group, "test-group");
     }
 

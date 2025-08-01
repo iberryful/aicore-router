@@ -5,8 +5,10 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::{
+    client::AiCoreClient,
     commands::CommandHandler,
     config::Config,
+    resolver::DeploymentResolver,
     routes::{AppState, create_router},
     token::{OAuthConfig, TokenManager},
 };
@@ -123,6 +125,20 @@ impl Cli {
             client_secret: config.uaa_client_secret.clone(),
         });
         let client = reqwest::Client::new();
+
+        // Create AI Core client for deployment resolution
+        let aicore_client = AiCoreClient::from_config(config.clone());
+
+        // Create and start deployment resolver
+        tracing::info!(
+            "Initializing deployment resolver with refresh interval: {}s",
+            config.refresh_interval_secs
+        );
+        let resolver = DeploymentResolver::new(&config, aicore_client);
+        resolver
+            .start()
+            .await
+            .context("Failed to start deployment resolver")?;
 
         let state = AppState {
             config: config.clone(),

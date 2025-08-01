@@ -97,10 +97,10 @@ async fn execute_proxy_request(
 }
 
 pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
-    let model_data: Vec<serde_json::Value> = state
-        .config
-        .models
-        .keys()
+    let model_names = state.config.get_available_models().await;
+
+    let model_data: Vec<serde_json::Value> = model_names
+        .into_iter()
         .map(|model_name| {
             json!({
                 "id": model_name,
