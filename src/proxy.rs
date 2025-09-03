@@ -412,11 +412,12 @@ fn prepare_body(body: &mut Value, family: &LlmFamily, stream: bool, model: &str)
         }
         LlmFamily::OpenAi => {
             if let Some(obj) = body.as_object_mut() {
-                // For GPT-5 models, replace max_tokens with max_completion_tokens
-                if model.starts_with("gpt-5")
-                    && let Some(max_tokens) = obj.remove("max_tokens")
-                {
-                    obj.insert("max_completion_tokens".to_string(), max_tokens);
+                // For GPT-5 models, replace max_tokens with max_completion_tokens and drop temperature
+                if model.starts_with("gpt-5") {
+                    if let Some(max_tokens) = obj.remove("max_tokens") {
+                        obj.insert("max_completion_tokens".to_string(), max_tokens);
+                    }
+                    obj.remove("temperature");
                 }
 
                 // Add stream_options to include usage stats for streaming requests
