@@ -71,38 +71,34 @@ pub struct DeploymentList {
 
 impl Deployment {
     pub fn get_model_info(&self) -> (Option<String>, Option<String>) {
-        if let Some(details) = &self.details {
-            if let Some(resources) = &details.resources {
-                if let Some(backend_details) = resources.get("backendDetails") {
-                    if let Some(model) = backend_details.get("model") {
-                        let name = model
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        let version = model
-                            .get("version")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        return (name, version);
-                    }
-                }
-            }
+        if let Some(details) = &self.details
+            && let Some(resources) = &details.resources
+            && let Some(backend_details) = resources.get("backendDetails")
+            && let Some(model) = backend_details.get("model")
+        {
+            let name = model
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let version = model
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            return (name, version);
         }
         (None, None)
     }
 
     pub fn get_aicore_model_name(&self) -> Option<String> {
-        if let Some(details) = &self.details {
-            if let Some(resources) = &details.resources {
-                if let Some(backend_details) = resources.get("backendDetails") {
-                    if let Some(model) = backend_details.get("model") {
-                        return model
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                }
-            }
+        if let Some(details) = &self.details
+            && let Some(resources) = &details.resources
+            && let Some(backend_details) = resources.get("backendDetails")
+            && let Some(model) = backend_details.get("model")
+        {
+            return model
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
         }
         None
     }
@@ -286,10 +282,10 @@ impl AiCoreClient {
         let mut mapping = std::collections::HashMap::new();
 
         for deployment in &deployments.resources {
-            if deployment.status == "RUNNING" {
-                if let Some(model_name) = deployment.get_aicore_model_name() {
-                    mapping.insert(model_name, deployment.id.clone());
-                }
+            if deployment.status == "RUNNING"
+                && let Some(model_name) = deployment.get_aicore_model_name()
+            {
+                mapping.insert(model_name, deployment.id.clone());
             }
         }
 

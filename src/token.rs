@@ -65,10 +65,10 @@ impl TokenManager {
 
         {
             let tokens = self.tokens.read().await;
-            if let Some(token_info) = tokens.get(&token_key) {
-                if token_info.is_valid() {
-                    return Ok(Some(token_info.token.clone()));
-                }
+            if let Some(token_info) = tokens.get(&token_key)
+                && token_info.is_valid()
+            {
+                return Ok(Some(token_info.token.clone()));
             }
         }
 

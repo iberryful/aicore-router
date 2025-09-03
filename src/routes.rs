@@ -64,10 +64,10 @@ fn extract_model_from_body(body: &Value) -> Result<String, AppError> {
 }
 
 fn ensure_model_in_body(body: &mut Value, model: &str) {
-    if let Some(obj) = body.as_object_mut() {
-        if !obj.contains_key("model") {
-            obj.insert("model".to_string(), json!(model));
-        }
+    if let Some(obj) = body.as_object_mut()
+        && !obj.contains_key("model")
+    {
+        obj.insert("model".to_string(), json!(model));
     }
 }
 

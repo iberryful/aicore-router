@@ -120,7 +120,7 @@ impl<'a> ProxyRequestBuilder<'a> {
 
         // Step 5: Prepare request body
         let mut body = self.params.body;
-        prepare_body(&mut body, &family, stream)?;
+        prepare_body(&mut body, &family, stream, &normalized_model)?;
 
         // Step 6: Build target URL
         let url = build_url(
@@ -281,34 +281,29 @@ impl ProxyRequest {
                                 let line = buffer[..line_end].trim().to_string();
                                 buffer.drain(..line_end + 1);
 
-                                if let Some(data) = line.strip_prefix("data: ") {
-                                    if !data.is_empty() {
-                                        // Log streaming data at debug level
-                                        tracing::debug!("Stream data: {}", data);
+                                if let Some(data) = line.strip_prefix("data: ")
+                                    && !data.is_empty()
+                                {
+                                    // Log streaming data at debug level
+                                    tracing::debug!("Stream data: {}", data);
 
-                                        // Extract token stats if available
-                                        if let Some(stats) = extract_token_stats(data, &family) {
-                                            token_stats = stats
-                                        }
-
-                                        let mut output = String::new();
-
-                                        if is_claude {
-                                            if let Ok(parsed) = serde_json::from_str::<Value>(data)
-                                            {
-                                                if let Some(event_type) =
-                                                    parsed.get("type").and_then(|v| v.as_str())
-                                                {
-                                                    output.push_str(&format!(
-                                                        "event: {event_type}\n"
-                                                    ));
-                                                }
-                                            }
-                                        }
-
-                                        output.push_str(&format!("data: {data}\n\n"));
-                                        let _ = tx.send(Ok(axum::body::Bytes::from(output))).await;
+                                    // Extract token stats if available
+                                    if let Some(stats) = extract_token_stats(data, &family) {
+                                        token_stats = stats
                                     }
+
+                                    let mut output = String::new();
+
+                                    if is_claude
+                                        && let Ok(parsed) = serde_json::from_str::<Value>(data)
+                                        && let Some(event_type) =
+                                            parsed.get("type").and_then(|v| v.as_str())
+                                    {
+                                        output.push_str(&format!("event: {event_type}\n"));
+                                    }
+
+                                    output.push_str(&format!("data: {data}\n\n"));
+                                    let _ = tx.send(Ok(axum::body::Bytes::from(output))).await;
                                 }
                             }
                         }
@@ -396,7 +391,7 @@ fn extract_stream_flag(body: &Value, family: &LlmFamily, action: &Option<String>
     }
 }
 
-fn prepare_body(body: &mut Value, family: &LlmFamily, stream: bool) -> Result<()> {
+fn prepare_body(body: &mut Value, family: &LlmFamily, stream: bool, model: &str) -> Result<()> {
     match family {
         LlmFamily::Claude => {
             if let Some(obj) = body.as_object_mut() {
@@ -417,6 +412,13 @@ fn prepare_body(body: &mut Value, family: &LlmFamily, stream: bool) -> Result<()
         }
         LlmFamily::OpenAi => {
             if let Some(obj) = body.as_object_mut() {
+                // For GPT-5 models, replace max_tokens with max_completion_tokens
+                if model.starts_with("gpt-5")
+                    && let Some(max_tokens) = obj.remove("max_tokens")
+                {
+                    obj.insert("max_completion_tokens".to_string(), max_tokens);
+                }
+
                 // Add stream_options to include usage stats for streaming requests
                 if stream {
                     match obj.get_mut("stream_options") {
