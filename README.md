@@ -81,7 +81,7 @@ credentials:
   uaa_token_url: https://your-tenant.authentication.sap.hana.ondemand.com/oauth/token
   uaa_client_id: your-client-id
   uaa_client_secret: your-client-secret
-  genai_api_url: https://api.ai.prod.sap.com
+  aicore_api_url: https://api.ai.prod.sap.com
   resource_group: your-resource-group
   api_key: your-api-key
 
@@ -93,10 +93,11 @@ refresh_interval_secs: 600
 # Models are now discovered automatically from your AI Core deployments.
 # You can still define them here to override or add custom mappings.
 models:
-  - name: gpt-4
-    deployment_id: deployment-id-from-aicore
+  - name: gpt-4 ## will find gpt-4 model from aicore
   - name: claude-sonnet-4
     deployment_id: another-deployment-id
+  - name: claude-sonnet-4-5
+    aicore_model_name: anthropic--claude-4-sonnet
   - name: gemini-pro
     deployment_id: gemini-deployment-id
 ```
@@ -187,7 +188,7 @@ All of the following must be set in the config file:
 | `credentials.uaa_token_url` | SAP UAA OAuth token endpoint |
 | `credentials.uaa_client_id` | OAuth client ID |
 | `credentials.uaa_client_secret` | OAuth client secret |
-| `credentials.genai_api_url` | SAP AI Core API base URL |
+| `credentials.aicore_api_url` | SAP AI Core API base URL |
 | `credentials.resource_group` | AI Core resource group |
 | `credentials.api_key` | API key for accessing the router |
 

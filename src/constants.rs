@@ -10,7 +10,7 @@ pub mod models {
     pub const GEMINI_PREFIX: &str = "gemini";
     pub const GPT_PREFIX: &str = "gpt";
     pub const TEXT_PREFIX: &str = "text";
-    pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4";
+    pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-5";
 }
 
 pub mod http {
