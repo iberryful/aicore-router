@@ -136,6 +136,7 @@ impl Cli {
         );
         let model_registry = ModelRegistry::new(
             config.models.clone(),
+            config.fallback_models.clone(),
             aicore_client,
             config.resource_group.clone(),
             config.refresh_interval_secs,

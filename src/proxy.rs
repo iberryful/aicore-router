@@ -344,11 +344,31 @@ fn normalize_model(model: &str, registry: &ModelRegistry) -> Result<String> {
         return Ok(model.to_string());
     }
 
-    // Basic fallback for claude models
-    if model.starts_with(CLAUDE_PREFIX)
-        && registry.find_model_config(DEFAULT_CLAUDE_MODEL).is_some()
+    // Determine family prefix and check for configured fallback
+    let prefix = if model.starts_with(CLAUDE_PREFIX) {
+        CLAUDE_PREFIX
+    } else if model.starts_with(GEMINI_PREFIX) {
+        GEMINI_PREFIX
+    } else if model.starts_with(GPT_PREFIX) {
+        GPT_PREFIX
+    } else if model.starts_with(TEXT_PREFIX) {
+        TEXT_PREFIX
+    } else {
+        // Unknown family, return as-is
+        return Ok(model.to_string());
+    };
+
+    // Try to get configured fallback for this family
+    if let Some(fallback_model) = registry.get_fallback_model(prefix)
+        && registry.find_model_config(fallback_model).is_some()
     {
-        return Ok(DEFAULT_CLAUDE_MODEL.to_string());
+        tracing::info!(
+            "Model '{}' not found, falling back to configured '{}' for {} family",
+            model,
+            fallback_model,
+            prefix
+        );
+        return Ok(fallback_model.to_string());
     }
 
     Ok(model.to_string())

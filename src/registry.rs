@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use crate::client::AiCoreClient;
-use crate::config::Model;
+use crate::config::{FallbackModels, Model};
 
 /// Runtime model registry that manages resolved deployment IDs and handles resolution
 #[derive(Debug, Clone)]
@@ -15,6 +15,8 @@ pub struct ModelRegistry {
     resolved_models: Arc<RwLock<HashMap<String, String>>>,
     /// Original model configurations from config file
     config_models: Vec<Model>,
+    /// Fallback models configuration for each family
+    fallback_models: FallbackModels,
     /// AI Core client for fetching deployments
     client: AiCoreClient,
     /// Resource group for deployment queries
@@ -27,6 +29,7 @@ impl ModelRegistry {
     /// Create a new model registry
     pub fn new(
         config_models: Vec<Model>,
+        fallback_models: FallbackModels,
         client: AiCoreClient,
         resource_group: String,
         refresh_interval_secs: u64,
@@ -34,6 +37,7 @@ impl ModelRegistry {
         Self {
             resolved_models: Arc::new(RwLock::new(HashMap::new())),
             config_models,
+            fallback_models,
             client,
             resource_group,
             refresh_interval: Duration::from_secs(refresh_interval_secs),
@@ -42,6 +46,9 @@ impl ModelRegistry {
 
     /// Start the registry with initial resolution and background refresh
     pub async fn start(&self) -> Result<()> {
+        // Validate fallback models configuration
+        self.validate_fallback_models();
+
         // Initial resolution
         self.refresh_deployments().await?;
 
@@ -52,6 +59,38 @@ impl ModelRegistry {
         });
 
         Ok(())
+    }
+
+    /// Validate that configured fallback models exist in the models list
+    fn validate_fallback_models(&self) {
+        let model_names: Vec<&str> = self.config_models.iter().map(|m| m.name.as_str()).collect();
+
+        if let Some(ref claude_fallback) = self.fallback_models.claude
+            && !model_names.contains(&claude_fallback.as_str())
+        {
+            warn!(
+                "Fallback model '{}' for claude family is not configured in models list",
+                claude_fallback
+            );
+        }
+
+        if let Some(ref openai_fallback) = self.fallback_models.openai
+            && !model_names.contains(&openai_fallback.as_str())
+        {
+            warn!(
+                "Fallback model '{}' for openai family is not configured in models list",
+                openai_fallback
+            );
+        }
+
+        if let Some(ref gemini_fallback) = self.fallback_models.gemini
+            && !model_names.contains(&gemini_fallback.as_str())
+        {
+            warn!(
+                "Fallback model '{}' for gemini family is not configured in models list",
+                gemini_fallback
+            );
+        }
     }
 
     /// Get deployment ID for a resolved model
@@ -77,6 +116,17 @@ impl ModelRegistry {
     /// Find model configuration by name
     pub fn find_model_config(&self, model_name: &str) -> Option<&Model> {
         self.config_models.iter().find(|m| m.name == model_name)
+    }
+
+    /// Get fallback model for a given model prefix/family
+    pub fn get_fallback_model(&self, prefix: &str) -> Option<&str> {
+        use crate::constants::models::*;
+        match prefix {
+            CLAUDE_PREFIX => self.fallback_models.claude.as_deref(),
+            GPT_PREFIX | TEXT_PREFIX => self.fallback_models.openai.as_deref(),
+            GEMINI_PREFIX => self.fallback_models.gemini.as_deref(),
+            _ => None,
+        }
     }
 
     /// Get model names from configuration (not necessarily resolved)

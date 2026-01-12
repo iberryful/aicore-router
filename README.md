@@ -212,6 +212,32 @@ models:
 
 If no models are configured, the router will automatically discover them from your AI Core deployments.
 
+### Fallback Models
+
+You can configure default fallback models for each model family. When a requested model is not found in your configuration, the router will automatically fall back to the configured model for that family.
+
+```yaml
+models:
+  - name: claude-sonnet-4-5
+    deployment_id: dep-claude
+  - name: gpt-4o
+    deployment_id: dep-gpt
+  - name: gemini-1.5-pro
+    deployment_id: dep-gemini
+
+fallback_models:
+  claude: claude-sonnet-4-5    # For models starting with "claude"
+  openai: gpt-4o               # For models starting with "gpt" or "text"
+  gemini: gemini-1.5-pro       # For models starting with "gemini"
+```
+
+**Behavior:**
+- If a requested model exists in config, it's used directly
+- If not found, the router checks for a configured fallback for that model family
+- The fallback is only used if it's also configured in the `models` list
+- All fallback fields are optional - configure only the families you need
+- At startup, the router will log a warning if a configured fallback model doesn't exist in the `models` list
+
 ## Streaming
 
 All endpoints support streaming responses. Set `"stream": true` in your request body for OpenAI and Claude APIs. Gemini streaming is handled via the `streamGenerateContent` action.

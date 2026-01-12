@@ -22,6 +22,8 @@ pub struct Config {
     pub resource_group: String,
     #[serde(default = "default_refresh_interval_secs")]
     pub refresh_interval_secs: u64,
+    #[serde(default)]
+    pub fallback_models: FallbackModels,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -38,6 +40,8 @@ pub struct ConfigFile {
     pub resource_group: Option<String>,
     #[serde(default)]
     pub refresh_interval_secs: Option<u64>,
+    #[serde(default)]
+    pub fallback_models: FallbackModels,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -54,6 +58,22 @@ pub struct Model {
     pub name: String,
     pub deployment_id: Option<String>,
     pub aicore_model_name: Option<String>,
+}
+
+/// Configuration for fallback models per model family.
+/// When a requested model is not found, the router will fall back to the
+/// configured model for that family (if available and configured).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct FallbackModels {
+    /// Fallback model for Claude family (models starting with "claude")
+    #[serde(default)]
+    pub claude: Option<String>,
+    /// Fallback model for OpenAI family (models starting with "gpt" or "text")
+    #[serde(default)]
+    pub openai: Option<String>,
+    /// Fallback model for Gemini family (models starting with "gemini")
+    #[serde(default)]
+    pub gemini: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -125,6 +145,17 @@ impl Config {
 
     pub fn get_model_names(&self) -> Vec<&str> {
         self.models.iter().map(|m| m.name.as_str()).collect()
+    }
+
+    /// Get the fallback model for a given model family prefix
+    pub fn get_fallback_model(&self, prefix: &str) -> Option<&str> {
+        use crate::constants::models::*;
+        match prefix {
+            CLAUDE_PREFIX => self.fallback_models.claude.as_deref(),
+            GPT_PREFIX | TEXT_PREFIX => self.fallback_models.openai.as_deref(),
+            GEMINI_PREFIX => self.fallback_models.gemini.as_deref(),
+            _ => None,
+        }
     }
 
     fn from_file_and_env(file_config: ConfigFile) -> Result<Self> {
@@ -206,6 +237,7 @@ impl Config {
             .unwrap_or_else(default_refresh_interval_secs);
 
         let models = file_config.models;
+        let fallback_models = file_config.fallback_models;
 
         Ok(Config {
             uaa_token_url,
@@ -218,6 +250,7 @@ impl Config {
             log_level,
             resource_group,
             refresh_interval_secs,
+            fallback_models,
         })
     }
 }
@@ -356,6 +389,7 @@ credentials:
             }],
             resource_group: Some("test-group".to_string()),
             refresh_interval_secs: None,
+            fallback_models: FallbackModels::default(),
         };
 
         let config = Config::from_file_and_env(config_file).expect("Failed to create config");
@@ -393,5 +427,105 @@ credentials:
             normalize_oauth_token_url("https://auth.example.com/uaa/oauth/token".to_string()),
             "https://auth.example.com/uaa/oauth/token"
         );
+    }
+
+    #[test]
+    fn test_fallback_models_parsing() {
+        let yaml_content = r#"
+port: 8080
+credentials:
+  uaa_token_url: https://test.example.com/oauth/token
+  uaa_client_id: test-client-id
+  uaa_client_secret: test-client-secret
+  aicore_api_url: https://api.test.example.com
+  api_key: test-api-key
+models:
+  - name: claude-sonnet-4-5
+    deployment_id: dep-claude
+  - name: gpt-4o
+    deployment_id: dep-gpt
+  - name: gemini-1.5-pro
+    deployment_id: dep-gemini
+fallback_models:
+  claude: claude-sonnet-4-5
+  openai: gpt-4o
+  gemini: gemini-1.5-pro
+"#;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config_path = temp_dir.path().join("fallback_config.yaml");
+        fs::write(&config_path, yaml_content).expect("Failed to write config file");
+
+        let config =
+            Config::load(Some(config_path.to_str().unwrap())).expect("Failed to load config");
+
+        assert_eq!(
+            config.fallback_models.claude,
+            Some("claude-sonnet-4-5".to_string())
+        );
+        assert_eq!(config.fallback_models.openai, Some("gpt-4o".to_string()));
+        assert_eq!(
+            config.fallback_models.gemini,
+            Some("gemini-1.5-pro".to_string())
+        );
+    }
+
+    #[test]
+    fn test_fallback_models_partial_config() {
+        let yaml_content = r#"
+port: 8080
+credentials:
+  uaa_token_url: https://test.example.com/oauth/token
+  uaa_client_id: test-client-id
+  uaa_client_secret: test-client-secret
+  aicore_api_url: https://api.test.example.com
+  api_key: test-api-key
+models:
+  - name: claude-sonnet-4-5
+    deployment_id: dep-claude
+fallback_models:
+  claude: claude-sonnet-4-5
+"#;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config_path = temp_dir.path().join("partial_fallback_config.yaml");
+        fs::write(&config_path, yaml_content).expect("Failed to write config file");
+
+        let config =
+            Config::load(Some(config_path.to_str().unwrap())).expect("Failed to load config");
+
+        assert_eq!(
+            config.fallback_models.claude,
+            Some("claude-sonnet-4-5".to_string())
+        );
+        assert_eq!(config.fallback_models.openai, None);
+        assert_eq!(config.fallback_models.gemini, None);
+    }
+
+    #[test]
+    fn test_fallback_models_default_empty() {
+        let yaml_content = r#"
+port: 8080
+credentials:
+  uaa_token_url: https://test.example.com/oauth/token
+  uaa_client_id: test-client-id
+  uaa_client_secret: test-client-secret
+  aicore_api_url: https://api.test.example.com
+  api_key: test-api-key
+models:
+  - name: gpt-4
+    deployment_id: dep-123
+"#;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config_path = temp_dir.path().join("no_fallback_config.yaml");
+        fs::write(&config_path, yaml_content).expect("Failed to write config file");
+
+        let config =
+            Config::load(Some(config_path.to_str().unwrap())).expect("Failed to load config");
+
+        assert_eq!(config.fallback_models.claude, None);
+        assert_eq!(config.fallback_models.openai, None);
+        assert_eq!(config.fallback_models.gemini, None);
     }
 }
