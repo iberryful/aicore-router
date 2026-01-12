@@ -1,10 +1,14 @@
+//! Token management for OAuth authentication with multiple providers.
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+use crate::config::Provider;
 
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
@@ -24,45 +28,50 @@ impl TokenInfo {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct OAuthConfig {
-    pub api_keys: Vec<String>,
-    pub token_url: String,
-    pub client_id: String,
-    pub client_secret: String,
-}
-
+/// Token manager that handles OAuth tokens for multiple providers.
 #[derive(Debug, Clone)]
 pub struct TokenManager {
-    oauth_config: Option<OAuthConfig>,
+    /// Set of valid API keys for request authentication
+    api_keys: HashSet<String>,
+    /// Cached tokens keyed by provider credentials hash
     tokens: Arc<RwLock<HashMap<String, TokenInfo>>>,
+    /// HTTP client for token requests
     client: Client,
 }
 
 impl TokenManager {
-    pub fn with_oauth_config(oauth_config: OAuthConfig) -> Self {
+    /// Create a new token manager with the given API keys.
+    pub fn new(api_keys: Vec<String>) -> Self {
         Self {
-            oauth_config: Some(oauth_config),
+            api_keys: api_keys.into_iter().collect(),
             tokens: Arc::new(RwLock::new(HashMap::new())),
             client: Client::new(),
         }
     }
 
-    pub async fn get_token(&self, api_key: &str) -> Result<Option<String>> {
-        let oauth_config = self
-            .oauth_config
-            .as_ref()
-            .context("TokenManager not configured with OAuth credentials")?;
+    /// Check if an API key is valid.
+    /// The special "internal" key is always valid for internal operations.
+    pub fn is_valid_api_key(&self, api_key: &str) -> bool {
+        api_key == "internal" || self.api_keys.contains(api_key)
+    }
 
-        if !oauth_config.api_keys.contains(&api_key.to_string()) {
+    /// Get an OAuth token for a specific provider.
+    /// Returns None if the API key is invalid.
+    pub async fn get_token_for_provider(
+        &self,
+        api_key: &str,
+        provider: &Provider,
+    ) -> Result<Option<String>> {
+        if !self.is_valid_api_key(api_key) {
             return Ok(None);
         }
 
         let token_key = format!(
             "{}:{}:{}",
-            oauth_config.token_url, oauth_config.client_id, oauth_config.client_secret
+            provider.uaa_token_url, provider.uaa_client_id, provider.uaa_client_secret
         );
 
+        // Check cache first
         {
             let tokens = self.tokens.read().await;
             if let Some(token_info) = tokens.get(&token_key)
@@ -72,14 +81,16 @@ impl TokenManager {
             }
         }
 
+        // Refresh token
         let new_token = self
             .refresh_token(
-                &oauth_config.token_url,
-                &oauth_config.client_id,
-                &oauth_config.client_secret,
+                &provider.uaa_token_url,
+                &provider.uaa_client_id,
+                &provider.uaa_client_secret,
             )
             .await?;
 
+        // Store in cache
         {
             let mut tokens = self.tokens.write().await;
             tokens.insert(token_key, new_token.clone());
@@ -130,11 +141,24 @@ impl TokenManager {
 
         let expires_at = Utc::now() + chrono::Duration::seconds(token_response.expires_in as i64);
 
-        tracing::info!("Token refreshed for client id: {}", client_id);
+        tracing::debug!(
+            "Token refreshed for client id: {} (expires in {}s)",
+            client_id,
+            token_response.expires_in
+        );
 
         Ok(TokenInfo {
             token: token_response.access_token,
             expires_at,
         })
     }
+}
+
+// Keep the old OAuthConfig for backward compatibility during migration
+#[derive(Debug, Clone)]
+pub struct OAuthConfig {
+    pub api_keys: Vec<String>,
+    pub token_url: String,
+    pub client_id: String,
+    pub client_secret: String,
 }

@@ -1,3 +1,5 @@
+//! Model registry that tracks deployments across multiple providers.
+
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -6,21 +8,29 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use crate::client::AiCoreClient;
-use crate::config::{FallbackModels, Model};
+use crate::config::{FallbackModels, Model, Provider};
+use crate::token::TokenManager;
 
-/// Runtime model registry that manages resolved deployment IDs and handles resolution
+/// Resolved deployment information including which provider hosts it
+#[derive(Debug, Clone)]
+pub struct ResolvedDeployment {
+    pub deployment_id: String,
+    pub provider_name: String,
+}
+
+/// Runtime model registry that manages resolved deployment IDs across multiple providers
 #[derive(Debug, Clone)]
 pub struct ModelRegistry {
-    /// Resolved model name to deployment ID mappings
-    resolved_models: Arc<RwLock<HashMap<String, String>>>,
+    /// Resolved model name to deployment info mappings (model -> list of providers that have it)
+    resolved_models: Arc<RwLock<HashMap<String, Vec<ResolvedDeployment>>>>,
     /// Original model configurations from config file
     config_models: Vec<Model>,
     /// Fallback models configuration for each family
     fallback_models: FallbackModels,
-    /// AI Core client for fetching deployments
-    client: AiCoreClient,
-    /// Resource group for deployment queries
-    resource_group: String,
+    /// Providers to query for deployments
+    providers: Vec<Provider>,
+    /// Token manager for authentication
+    token_manager: TokenManager,
     /// Refresh interval for background updates
     refresh_interval: Duration,
 }
@@ -30,16 +40,16 @@ impl ModelRegistry {
     pub fn new(
         config_models: Vec<Model>,
         fallback_models: FallbackModels,
-        client: AiCoreClient,
-        resource_group: String,
+        providers: Vec<Provider>,
+        token_manager: TokenManager,
         refresh_interval_secs: u64,
     ) -> Self {
         Self {
             resolved_models: Arc::new(RwLock::new(HashMap::new())),
             config_models,
             fallback_models,
-            client,
-            resource_group,
+            providers,
+            token_manager,
             refresh_interval: Duration::from_secs(refresh_interval_secs),
         }
     }
@@ -93,10 +103,34 @@ impl ModelRegistry {
         }
     }
 
-    /// Get deployment ID for a resolved model
+    /// Get deployment info for a model on a specific provider
+    pub async fn get_deployment_for_provider(
+        &self,
+        model_name: &str,
+        provider_name: &str,
+    ) -> Option<String> {
+        let resolved = self.resolved_models.read().await;
+        resolved.get(model_name).and_then(|deployments| {
+            deployments
+                .iter()
+                .find(|d| d.provider_name == provider_name)
+                .map(|d| d.deployment_id.clone())
+        })
+    }
+
+    /// Get all providers that have a specific model deployed
+    pub async fn get_providers_for_model(&self, model_name: &str) -> Vec<ResolvedDeployment> {
+        let resolved = self.resolved_models.read().await;
+        resolved.get(model_name).cloned().unwrap_or_default()
+    }
+
+    /// Get deployment ID for a model (returns first available for backward compatibility)
     pub async fn get_deployment_id(&self, model_name: &str) -> Option<String> {
         let resolved = self.resolved_models.read().await;
-        resolved.get(model_name).cloned()
+        resolved
+            .get(model_name)
+            .and_then(|deployments| deployments.first())
+            .map(|d| d.deployment_id.clone())
     }
 
     /// Get all available (resolved) model names
@@ -107,7 +141,7 @@ impl ModelRegistry {
         models
     }
 
-    /// Check if a model is available (has been resolved)
+    /// Check if a model is available (has been resolved) on any provider
     pub async fn is_model_available(&self, model_name: &str) -> bool {
         let resolved = self.resolved_models.read().await;
         resolved.contains_key(model_name)
@@ -149,58 +183,76 @@ impl ModelRegistry {
     }
 
     async fn refresh_deployments(&self) -> Result<()> {
-        info!("Refreshing deployment mappings...");
+        info!(
+            "Refreshing deployment mappings for {} providers...",
+            self.providers.len()
+        );
 
-        // Get all running deployments
-        let aicore_deployments = self
-            .client
-            .build_model_to_deployment_mapping(Some(&self.resource_group))
-            .await?;
+        let mut all_resolved: HashMap<String, Vec<ResolvedDeployment>> = HashMap::new();
 
-        let mut resolved = HashMap::new();
+        // Query each provider for deployments
+        for provider in &self.providers {
+            if !provider.enabled {
+                continue;
+            }
 
-        for model_config in &self.config_models {
-            if let Some(deployment_id) = &model_config.deployment_id {
-                // Direct deployment ID mapping
-                resolved.insert(model_config.name.clone(), deployment_id.clone());
-                info!(
-                    "Model '{}' -> deployment_id: {} (direct)",
-                    model_config.name, deployment_id
-                );
-            } else {
-                // Use aicore_model_name if specified, otherwise use the model name itself
-                let aicore_model_name = model_config
-                    .aicore_model_name
-                    .as_ref()
-                    .unwrap_or(&model_config.name);
+            info!(
+                "Querying provider '{}' (resource_group: {})...",
+                provider.name, provider.resource_group
+            );
 
-                // Resolve from AI Core model name
-                if let Some(deployment_id) = aicore_deployments.get(aicore_model_name) {
-                    resolved.insert(model_config.name.clone(), deployment_id.clone());
-                    info!(
-                        "Model '{}' -> aicore_model_name: '{}' -> deployment_id: {}",
-                        model_config.name, aicore_model_name, deployment_id
-                    );
-                } else {
-                    warn!(
-                        "Model '{}' -> aicore_model_name: '{}' -> no running deployment found",
-                        model_config.name, aicore_model_name
+            // Create a client for this provider
+            let client = AiCoreClient::from_provider(provider.clone(), self.token_manager.clone());
+
+            match client
+                .build_model_to_deployment_mapping(Some(&provider.resource_group))
+                .await
+            {
+                Ok(aicore_deployments) => {
+                    for model_config in &self.config_models {
+                        // Use aicore_model_name if specified, otherwise use the model name itself
+                        let aicore_model_name = model_config
+                            .aicore_model_name
+                            .as_ref()
+                            .unwrap_or(&model_config.name);
+
+                        // Resolve from AI Core model name
+                        if let Some(deployment_id) = aicore_deployments.get(aicore_model_name) {
+                            all_resolved
+                                .entry(model_config.name.clone())
+                                .or_default()
+                                .push(ResolvedDeployment {
+                                    deployment_id: deployment_id.clone(),
+                                    provider_name: provider.name.clone(),
+                                });
+                            info!(
+                                "Provider '{}': Model '{}' -> aicore_model_name: '{}' -> deployment_id: {}",
+                                provider.name, model_config.name, aicore_model_name, deployment_id
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to query provider '{}': {}. Skipping this provider.",
+                        provider.name, e
                     );
                 }
             }
         }
 
-        let resolved_count = resolved.len();
+        let resolved_count = all_resolved.len();
+        let total_deployments: usize = all_resolved.values().map(|v| v.len()).sum();
 
         // Update the resolved models
         {
             let mut resolved_models = self.resolved_models.write().await;
-            *resolved_models = resolved;
+            *resolved_models = all_resolved;
         }
 
         info!(
-            "Deployment refresh complete: {} models resolved",
-            resolved_count
+            "Deployment refresh complete: {} models resolved across {} provider deployments",
+            resolved_count, total_deployments
         );
 
         Ok(())

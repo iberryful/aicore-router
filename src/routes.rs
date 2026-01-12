@@ -9,8 +9,9 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::{
+    balancer::LoadBalancer,
     config::Config,
-    proxy::{ProxyRequest, ProxyRequestParams},
+    proxy::{ProxyExecuteResult, ProxyRequestBuilder, ProxyRequestParams},
     registry::ModelRegistry,
     token::TokenManager,
 };
@@ -20,6 +21,7 @@ pub struct AppState {
     pub config: Config,
     pub model_registry: ModelRegistry,
     pub token_manager: TokenManager,
+    pub load_balancer: LoadBalancer,
     pub client: reqwest::Client,
 }
 
@@ -97,10 +99,82 @@ async fn execute_proxy_request(
         config: &state.config,
         token_manager: &state.token_manager,
         model_registry: &state.model_registry,
+        load_balancer: &state.load_balancer,
     };
 
-    let proxy = ProxyRequest::from_params(params).await?;
-    Ok(proxy.execute(&state.client, &state.config).await?)
+    let builder = ProxyRequestBuilder::new(params);
+
+    // Get providers in round-robin order with fallback
+    let providers = state.load_balancer.get_ordered_providers();
+    if providers.is_empty() {
+        return Err(AppError::Internal(anyhow::anyhow!(
+            "No providers available"
+        )));
+    }
+
+    let mut last_error: Option<AppError> = None;
+
+    // Try each provider in order until one succeeds or all are exhausted
+    for (i, provider) in providers.iter().enumerate() {
+        // Try to build the request for this provider
+        let proxy = match builder.build_for_provider(provider).await {
+            Ok(proxy) => proxy,
+            Err(AppError::ModelNotAvailableOnProvider { model, provider }) => {
+                tracing::debug!(
+                    "Model '{}' not available on provider '{}', trying next",
+                    model,
+                    provider
+                );
+                last_error = Some(AppError::ModelNotAvailableOnProvider { model, provider });
+                continue;
+            }
+            Err(e) => {
+                // Non-recoverable error (auth failure, etc.)
+                return Err(e);
+            }
+        };
+
+        // Execute the request
+        match proxy.execute(&state.client, &state.config).await {
+            Ok(ProxyExecuteResult::Response(response)) => {
+                if i > 0 {
+                    tracing::info!(
+                        "Request succeeded on provider '{}' after {} fallback(s)",
+                        provider.name,
+                        i
+                    );
+                }
+                return Ok(response);
+            }
+            Ok(ProxyExecuteResult::RateLimited) => {
+                tracing::warn!(
+                    "Provider '{}' returned 429, trying next provider",
+                    provider.name
+                );
+                last_error = Some(AppError::RateLimited(provider.name.clone()));
+                continue;
+            }
+            Err(e) => {
+                // Request failed, try next provider
+                tracing::error!(
+                    "Request failed on provider '{}': {}, trying next",
+                    provider.name,
+                    e
+                );
+                last_error = Some(AppError::Internal(e));
+                continue;
+            }
+        }
+    }
+
+    // All providers exhausted
+    match last_error {
+        Some(AppError::RateLimited(_)) => Err(AppError::AllProvidersRateLimited),
+        Some(e) => Err(e),
+        None => Err(AppError::Internal(anyhow::anyhow!(
+            "No providers could handle the request"
+        ))),
+    }
 }
 
 pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
@@ -170,6 +244,12 @@ pub enum AppError {
     MissingApiKey,
     #[error("Invalid API key")]
     InvalidApiKey,
+    #[error("Model '{model}' not available on provider '{provider}'")]
+    ModelNotAvailableOnProvider { model: String, provider: String },
+    #[error("Rate limited by provider: {0}")]
+    RateLimited(String),
+    #[error("All providers are rate limited")]
+    AllProvidersRateLimited,
     #[error("Internal server error")]
     Internal(#[from] anyhow::Error),
 }
@@ -183,6 +263,18 @@ impl IntoResponse for AppError {
                 "API key not found in headers".to_string(),
             ),
             AppError::InvalidApiKey => (StatusCode::UNAUTHORIZED, "Invalid API key".to_string()),
+            AppError::ModelNotAvailableOnProvider { model, provider } => (
+                StatusCode::BAD_REQUEST,
+                format!("Model '{}' not available on provider '{}'", model, provider),
+            ),
+            AppError::RateLimited(provider) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("Rate limited by provider: {}", provider),
+            ),
+            AppError::AllProvidersRateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "All providers are rate limited. Please try again later.".to_string(),
+            ),
             AppError::Internal(err) => {
                 tracing::error!("Internal error: {}", err);
                 (

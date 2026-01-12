@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 use std::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::config::Config;
+use crate::balancer::LoadBalancer;
+use crate::config::{Config, Provider};
 use crate::constants::{api::*, models::*};
 use crate::registry::ModelRegistry;
 use crate::routes::AppError;
@@ -79,6 +80,7 @@ pub struct ProxyRequest {
     pub url: String,
     pub token: String,
     pub model: String,
+    pub resource_group: String,
 }
 
 /// Input parameters for building a ProxyRequest
@@ -92,6 +94,7 @@ pub struct ProxyRequestParams<'a> {
     pub config: &'a Config,
     pub token_manager: &'a TokenManager,
     pub model_registry: &'a ModelRegistry,
+    pub load_balancer: &'a LoadBalancer,
 }
 
 /// Builder for ProxyRequest with step-by-step validation
@@ -104,42 +107,45 @@ impl<'a> ProxyRequestBuilder<'a> {
         Self { params }
     }
 
-    pub async fn build(self) -> Result<ProxyRequest, AppError> {
+    /// Build a proxy request for a specific provider.
+    /// This is used for 429 fallback - try providers in order until one succeeds.
+    pub async fn build_for_provider(&self, provider: &Provider) -> Result<ProxyRequest, AppError> {
         // Step 1: Extract and validate API key
         let api_key = self.extract_api_key()?;
 
-        // Step 2: Get authentication token
-        let token = self.get_auth_token(&api_key).await?;
+        // Step 2: Get authentication token for this provider
+        let token = self.get_auth_token(&api_key, provider).await?;
 
-        // Step 3: Resolve model and deployment
-        let (normalized_model, deployment_id) = self.resolve_model().await?;
+        // Step 3: Resolve model and deployment for this provider
+        let (normalized_model, deployment_id) = self.resolve_model_for_provider(provider).await?;
 
         // Step 4: Determine LLM family and stream flag
         let family = determine_family(&normalized_model);
         let stream = extract_stream_flag(&self.params.body, &family, &self.params.action);
 
         // Step 5: Prepare request body
-        let mut body = self.params.body;
+        let mut body = self.params.body.clone();
         prepare_body(&mut body, &family, stream, &normalized_model)?;
 
-        // Step 6: Build target URL
+        // Step 6: Build target URL using the provider's API URL
         let url = build_url(
             &normalized_model,
             &deployment_id,
             &self.params.action,
-            &self.params.config.genai_api_url,
+            &provider.genai_api_url,
             &family,
             stream,
         )?;
 
         Ok(ProxyRequest {
             family,
-            method: self.params.method,
+            method: self.params.method.clone(),
             body,
             stream,
             url,
             token,
             model: normalized_model,
+            resource_group: provider.resource_group.clone(),
         })
     }
 
@@ -147,33 +153,51 @@ impl<'a> ProxyRequestBuilder<'a> {
         extract_api_key(self.params.headers).ok_or(AppError::MissingApiKey)
     }
 
-    async fn get_auth_token(&self, api_key: &str) -> Result<String, AppError> {
+    async fn get_auth_token(&self, api_key: &str, provider: &Provider) -> Result<String, AppError> {
         self.params
             .token_manager
-            .get_token(api_key)
+            .get_token_for_provider(api_key, provider)
             .await
             .map_err(AppError::Internal)?
             .ok_or(AppError::InvalidApiKey)
     }
 
-    async fn resolve_model(&self) -> Result<(String, String), AppError> {
+    /// Resolve model to deployment ID for a specific provider
+    async fn resolve_model_for_provider(
+        &self,
+        provider: &Provider,
+    ) -> Result<(String, String), AppError> {
         let normalized_model = normalize_model(&self.params.model, self.params.model_registry)
             .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
-        let deployment_id = resolve_deployment_id(&normalized_model, self.params.model_registry)
+        // Try to get deployment for this specific provider
+        if let Some(deployment_id) = self
+            .params
+            .model_registry
+            .get_deployment_for_provider(&normalized_model, &provider.name)
             .await
-            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        {
+            return Ok((normalized_model, deployment_id));
+        }
 
-        Ok((normalized_model, deployment_id))
+        // Model not available on this provider
+        Err(AppError::ModelNotAvailableOnProvider {
+            model: normalized_model,
+            provider: provider.name.clone(),
+        })
     }
 }
 
-impl ProxyRequest {
-    pub async fn from_params(params: ProxyRequestParams<'_>) -> Result<Self, AppError> {
-        ProxyRequestBuilder::new(params).build().await
-    }
+/// Result of executing a proxy request, indicating if fallback should be attempted
+pub enum ProxyExecuteResult {
+    /// Request succeeded or failed with non-retriable error
+    Response(Response),
+    /// Got 429 rate limit - should try next provider
+    RateLimited,
+}
 
-    pub async fn execute(&self, client: &Client, config: &Config) -> Result<Response> {
+impl ProxyRequest {
+    pub async fn execute(&self, client: &Client, _config: &Config) -> Result<ProxyExecuteResult> {
         let start_time = Instant::now();
 
         let mut headers = HeaderMap::new();
@@ -183,7 +207,7 @@ impl ProxyRequest {
         );
         headers.insert(
             "ai-resource-group",
-            HeaderValue::from_str(&config.resource_group)?,
+            HeaderValue::from_str(&self.resource_group)?,
         );
         headers.insert("content-type", HeaderValue::from_static("application/json"));
 
@@ -205,6 +229,18 @@ impl ProxyRequest {
             let elapsed = start_time.elapsed();
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
+
+            // Check for rate limiting - signal to try next provider
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                tracing::warn!(
+                    "Rate limited (429) on model: {}, resource_group: {}, time: {:.2}ms",
+                    self.model,
+                    self.resource_group,
+                    elapsed.as_secs_f64() * 1000.0
+                );
+                return Ok(ProxyExecuteResult::RateLimited);
+            }
+
             tracing::error!("Proxy request failed: {} - {}", status, text);
             tracing::info!(
                 "Proxy done - model: {}, time: {:.2}ms, status: {}, stream: {}",
@@ -213,14 +249,18 @@ impl ProxyRequest {
                 status,
                 self.stream
             );
-            return Ok(Response::builder()
-                .status(status)
-                .header("content-type", "application/json")
-                .body(Body::from(text))?);
+            return Ok(ProxyExecuteResult::Response(
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(Body::from(text))?,
+            ));
         }
 
         if self.stream {
-            self.handle_streaming_response(response, start_time).await
+            Ok(ProxyExecuteResult::Response(
+                self.handle_streaming_response(response, start_time).await?,
+            ))
         } else {
             let result = self.handle_regular_response(response).await;
             let elapsed = start_time.elapsed();
@@ -230,7 +270,7 @@ impl ProxyRequest {
                 elapsed.as_secs_f64() * 1000.0,
                 self.stream
             );
-            result
+            Ok(ProxyExecuteResult::Response(result?))
         }
     }
 
@@ -372,19 +412,6 @@ fn normalize_model(model: &str, registry: &ModelRegistry) -> Result<String> {
     }
 
     Ok(model.to_string())
-}
-
-async fn resolve_deployment_id(model: &str, registry: &ModelRegistry) -> Result<String> {
-    if let Some(deployment_id) = registry.get_deployment_id(model).await {
-        Ok(deployment_id)
-    } else {
-        let available = registry.get_available_models().await.join(", ");
-        Err(anyhow::anyhow!(
-            "Model '{}' not found or not resolved. Available models: {}",
-            model,
-            available
-        ))
-    }
 }
 
 fn determine_family(model: &str) -> LlmFamily {

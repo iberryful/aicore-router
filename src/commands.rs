@@ -1,4 +1,6 @@
-use crate::{client::AiCoreClient, config::Config};
+//! CLI command handlers for administrative operations.
+
+use crate::{client::AiCoreClient, config::Config, token::TokenManager};
 use anyhow::Result;
 
 pub struct CommandHandler {
@@ -8,8 +10,26 @@ pub struct CommandHandler {
 
 impl CommandHandler {
     pub fn new(config: Config) -> Self {
-        let client = AiCoreClient::from_config(config.clone());
+        // Create a token manager for CLI operations
+        let token_manager = TokenManager::new(config.api_keys.clone());
+
+        // Use the first provider for CLI commands
+        let provider = config
+            .providers
+            .first()
+            .expect("At least one provider must be configured");
+
+        let client = AiCoreClient::from_provider(provider.clone(), token_manager);
         Self { client, config }
+    }
+
+    /// Get the default resource group from the first provider
+    fn default_resource_group(&self) -> &str {
+        self.config
+            .providers
+            .first()
+            .map(|p| p.resource_group.as_str())
+            .unwrap_or("default")
     }
 
     pub async fn list_resource_groups(&self) -> Result<()> {
@@ -42,10 +62,10 @@ impl CommandHandler {
     }
 
     pub async fn list_deployments(&self, resource_group: Option<&str>) -> Result<()> {
-        let rg_name = resource_group.unwrap_or(&self.config.resource_group);
+        let rg_name = resource_group.unwrap_or_else(|| self.default_resource_group());
         println!("Fetching deployments for resource group '{rg_name}'...");
 
-        let deployments = self.client.list_deployments(resource_group).await?;
+        let deployments = self.client.list_deployments(Some(rg_name)).await?;
 
         if deployments.resources.is_empty() {
             println!("No deployments found in resource group '{rg_name}'.");

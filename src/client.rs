@@ -3,8 +3,8 @@ use reqwest::Client;
 use serde::Deserialize;
 
 use crate::{
-    config::Config,
-    token::{OAuthConfig, TokenManager},
+    config::{Config, Provider},
+    token::TokenManager,
 };
 
 #[derive(Debug, Deserialize)]
@@ -108,22 +108,7 @@ impl Deployment {
 pub struct AiCoreClientConfig {
     pub genai_api_url: String,
     pub resource_group: String,
-    pub oauth_config: OAuthConfig,
-}
-
-impl From<Config> for AiCoreClientConfig {
-    fn from(config: Config) -> Self {
-        Self {
-            genai_api_url: config.genai_api_url,
-            resource_group: config.resource_group,
-            oauth_config: OAuthConfig {
-                api_keys: config.api_keys,
-                token_url: config.uaa_token_url,
-                client_id: config.uaa_client_id,
-                client_secret: config.uaa_client_secret,
-            },
-        }
-    }
+    pub provider: Provider,
 }
 
 #[derive(Debug, Clone)]
@@ -134,9 +119,7 @@ pub struct AiCoreClient {
 }
 
 impl AiCoreClient {
-    pub fn new(config: AiCoreClientConfig) -> Self {
-        let token_manager = TokenManager::with_oauth_config(config.oauth_config.clone());
-
+    pub fn new(config: AiCoreClientConfig, token_manager: TokenManager) -> Self {
         Self {
             client: Client::new(),
             config,
@@ -144,21 +127,29 @@ impl AiCoreClient {
         }
     }
 
-    pub fn from_config(config: Config) -> Self {
-        Self::new(config.into())
+    /// Create a client for a specific provider
+    pub fn from_provider(provider: Provider, token_manager: TokenManager) -> Self {
+        let config = AiCoreClientConfig {
+            genai_api_url: provider.genai_api_url.clone(),
+            resource_group: provider.resource_group.clone(),
+            provider,
+        };
+        Self::new(config, token_manager)
+    }
+
+    /// Create a client from the first provider in config (for backward compatibility)
+    pub fn from_config(config: Config, token_manager: TokenManager) -> Result<Self> {
+        let provider = config
+            .providers
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No providers configured"))?
+            .clone();
+        Ok(Self::from_provider(provider, token_manager))
     }
 
     async fn get_token(&self) -> Result<String> {
-        // Use the first api_key for internal API calls
-        let api_key = self
-            .config
-            .oauth_config
-            .api_keys
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("No API keys configured"))?;
-
         self.token_manager
-            .get_token(api_key)
+            .get_token_for_provider("internal", &self.config.provider)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Failed to get authentication token"))
     }

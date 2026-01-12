@@ -76,18 +76,29 @@ Edit `~/.aicore/config.yaml` with your settings:
 # AI Core Router Configuration
 log_level: INFO
 
-# OAuth credentials
-credentials:
-  uaa_token_url: https://your-tenant.authentication.sap.hana.ondemand.com/oauth/token
-  uaa_client_id: your-client-id
-  uaa_client_secret: your-client-secret
-  aicore_api_url: https://api.ai.prod.sap.com
-  resource_group: your-resource-group
-
 # API keys for authenticating requests (supports multiple keys)
 api_keys:
   - your-api-key-1
   - your-api-key-2
+
+# Multiple AI Core providers for load balancing
+providers:
+  - name: provider1
+    uaa_token_url: https://tenant1.authentication.sap.hana.ondemand.com/oauth/token
+    uaa_client_id: client-id-1
+    uaa_client_secret: client-secret-1
+    genai_api_url: https://api.ai.prod.sap.com
+    resource_group: resource-group-1
+    weight: 1
+    enabled: true
+  - name: provider2
+    uaa_token_url: https://tenant2.authentication.sap.hana.ondemand.com/oauth/token
+    uaa_client_id: client-id-2
+    uaa_client_secret: client-secret-2
+    genai_api_url: https://api.ai.prod.sap.com
+    resource_group: resource-group-2
+    weight: 1
+    enabled: true
 
 # Server configuration
 port: 8900
@@ -97,13 +108,26 @@ refresh_interval_secs: 600
 # Models are now discovered automatically from your AI Core deployments.
 # You can still define them here to override or add custom mappings.
 models:
-  - name: gpt-4 ## will find gpt-4 model from aicore
-  - name: claude-sonnet-4
-    deployment_id: another-deployment-id
+  - name: gpt-4o  # Auto-discover: uses 'gpt-4o' to find deployment
   - name: claude-sonnet-4-5
-    aicore_model_name: anthropic--claude-4-sonnet
-  - name: gemini-pro
-    deployment_id: gemini-deployment-id
+    aicore_model_name: anthropic--claude-4-sonnet  # Map to AI Core's model name
+  - name: gemini-2.5-pro
+    aicore_model_name: gemini-2.5-pro
+```
+
+### Legacy Single-Provider Configuration
+
+For backward compatibility, you can still use the `credentials` block for a single provider:
+```yaml
+# Legacy single-provider configuration
+credentials:
+  uaa_token_url: https://your-tenant.authentication.sap.hana.ondemand.com/oauth/token
+  uaa_client_id: your-client-id
+  uaa_client_secret: your-client-secret
+  aicore_api_url: https://api.ai.prod.sap.com
+  api_key: your-api-key  # Legacy: use api_keys at root level instead
+
+resource_group: your-resource-group
 ```
 
 ### API Endpoints
@@ -183,18 +207,80 @@ acr resource-group list
 
 ## Configuration Reference
 
+### Provider Configuration
+
+The router supports multiple AI Core providers for load balancing and redundancy. Configure providers in the `providers` array:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Unique identifier for this provider |
+| `uaa_token_url` | Yes | SAP UAA OAuth token endpoint |
+| `uaa_client_id` | Yes | OAuth client ID |
+| `uaa_client_secret` | Yes | OAuth client secret |
+| `genai_api_url` | Yes | SAP AI Core API base URL |
+| `resource_group` | Yes | AI Core resource group |
+| `weight` | No | Load balancing weight (default: 1) |
+| `enabled` | No | Whether this provider is active (default: true) |
+
+```yaml
+providers:
+  - name: primary
+    uaa_token_url: https://tenant1.authentication.sap.hana.ondemand.com/oauth/token
+    uaa_client_id: client-id
+    uaa_client_secret: secret
+    genai_api_url: https://api.ai.prod.sap.com
+    resource_group: default
+    enabled: true
+  - name: secondary
+    uaa_token_url: https://tenant2.authentication.sap.hana.ondemand.com/oauth/token
+    uaa_client_id: client-id-2
+    uaa_client_secret: secret-2
+    genai_api_url: https://api.ai.prod.sap.com
+    resource_group: rg2
+    enabled: true
+```
+
+### Load Balancing
+
+The router supports two load balancing strategies, configured via the `load_balancing` option:
+
+```yaml
+# Options: round_robin (default), fallback
+load_balancing: round_robin
+```
+
+#### Strategies
+
+| Strategy | Description |
+|----------|-------------|
+| `round_robin` | Distribute requests evenly across providers. Each request goes to the next provider in rotation. |
+| `fallback` | Always try the first provider first. Only switch to the next provider if the current one returns 429 (rate limited). |
+
+#### Behavior
+
+Both strategies include automatic failover:
+
+1. **429 Fallback**: If a provider returns HTTP 429 (rate limited), the router automatically retries with the next provider
+2. **Model Availability**: The router checks if the requested model is available on each provider before sending the request
+3. **Exhaustion Handling**: If all providers are rate limited, the router returns a 429 error to the client
+
+**Use `round_robin` when:**
+- You want to spread load evenly across multiple AI Core tenants
+- You want to maximize throughput by utilizing multiple rate limit pools
+
+**Use `fallback` when:**
+- You have a primary provider and want to use others only as backup
+- You want predictable routing (always same provider unless rate limited)
+- You have providers with different capabilities or costs
+
 ### Required Configuration
 
-All of the following must be set in the config file:
+At minimum, you need:
 
-| Config File Path | Description |
-|------------------|-------------|
-| `credentials.uaa_token_url` | SAP UAA OAuth token endpoint |
-| `credentials.uaa_client_id` | OAuth client ID |
-| `credentials.uaa_client_secret` | OAuth client secret |
-| `credentials.aicore_api_url` | SAP AI Core API base URL |
-| `credentials.resource_group` | AI Core resource group |
+| Config Path | Description |
+|-------------|-------------|
 | `api_keys` | List of API keys for accessing the router |
+| `providers` | At least one provider configuration (or legacy `credentials` block) |
 
 ### Optional Configuration
 
@@ -203,6 +289,7 @@ All of the following must be set in the config file:
 | `port` | 8900 | Server port |
 | `log_level` | INFO | Logging level |
 | `refresh_interval_secs` | 600 | Interval for refreshing model deployments |
+| `load_balancing` | round_robin | Load balancing strategy: `round_robin` or `fallback` |
 
 ### API Keys Configuration
 
@@ -224,12 +311,16 @@ The legacy `credentials.api_key` field is still supported for backward compatibi
 
 ### Model Configuration
 
-Models are configured in the YAML config file using the `models` array:
+Models are configured in the YAML config file using the `models` array. The router looks up deployments by `aicore_model_name` (or the model `name` if not specified):
 
 ```yaml
 models:
-  - name: model-name
-    deployment_id: deployment-id
+  # Simple: use model name directly to find deployment
+  - name: gpt-4o
+
+  # Mapped: when AI Core uses a different model name
+  - name: claude-sonnet-4-5
+    aicore_model_name: anthropic--claude-4-sonnet
 ```
 
 If no models are configured, the router will automatically discover them from your AI Core deployments.
@@ -241,11 +332,9 @@ You can configure default fallback models for each model family. When a requeste
 ```yaml
 models:
   - name: claude-sonnet-4-5
-    deployment_id: dep-claude
+    aicore_model_name: anthropic--claude-4-sonnet
   - name: gpt-4o
-    deployment_id: dep-gpt
   - name: gemini-1.5-pro
-    deployment_id: dep-gemini
 
 fallback_models:
   claude: claude-sonnet-4-5    # For models starting with "claude"
@@ -270,6 +359,7 @@ The service returns appropriate HTTP status codes:
 - `200`: Success
 - `400`: Bad Request (invalid model, malformed JSON)
 - `401`: Unauthorized (invalid API key)
+- `429`: Too Many Requests (all providers rate limited)
 - `500`: Internal Server Error
 
 ## License

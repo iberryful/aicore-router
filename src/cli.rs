@@ -5,12 +5,12 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::{
-    client::AiCoreClient,
+    balancer::LoadBalancer,
     commands::CommandHandler,
     config::Config,
     registry::ModelRegistry,
     routes::{AppState, create_router},
-    token::{OAuthConfig, TokenManager},
+    token::TokenManager,
 };
 
 pub struct Cli;
@@ -114,21 +114,31 @@ impl Cli {
         }
 
         tracing::info!("Starting AI Core Router on port {}", config.port);
-        tracing::info!("GenAI API URL: {}", config.genai_api_url);
-        tracing::info!("UAA Token URL: {}", config.uaa_token_url);
-        tracing::info!("UAA Client ID: {}", config.uaa_client_id);
+        tracing::info!("Configured providers: {}", config.providers.len());
+        for provider in &config.providers {
+            tracing::info!(
+                "  Provider '{}': {} (resource_group: {}, enabled: {})",
+                provider.name,
+                provider.genai_api_url,
+                provider.resource_group,
+                provider.enabled
+            );
+        }
         tracing::info!("Configured API keys: {}", config.api_keys.len());
 
-        let token_manager = TokenManager::with_oauth_config(OAuthConfig {
-            api_keys: config.api_keys.clone(),
-            token_url: config.uaa_token_url.clone(),
-            client_id: config.uaa_client_id.clone(),
-            client_secret: config.uaa_client_secret.clone(),
-        });
-        let client = reqwest::Client::new();
+        // Create token manager with API keys
+        let token_manager = TokenManager::new(config.api_keys.clone());
 
-        // Create AI Core client for deployment resolution
-        let aicore_client = AiCoreClient::from_config(config.clone());
+        // Create load balancer with providers and configured strategy
+        let load_balancer =
+            LoadBalancer::new(config.providers.clone(), config.load_balancing.clone());
+        tracing::info!("Load balancing strategy: {:?}", config.load_balancing);
+
+        if load_balancer.is_empty() {
+            return Err(anyhow::anyhow!("No enabled providers configured"));
+        }
+
+        let client = reqwest::Client::new();
 
         // Create and start model registry
         tracing::info!(
@@ -138,8 +148,8 @@ impl Cli {
         let model_registry = ModelRegistry::new(
             config.models.clone(),
             config.fallback_models.clone(),
-            aicore_client,
-            config.resource_group.clone(),
+            config.providers.clone(),
+            token_manager.clone(),
             config.refresh_interval_secs,
         );
         model_registry
@@ -151,6 +161,7 @@ impl Cli {
             config: config.clone(),
             model_registry,
             token_manager,
+            load_balancer,
             client,
         };
 
