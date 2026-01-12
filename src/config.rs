@@ -11,7 +11,7 @@ pub struct Config {
     pub uaa_client_id: String,
     pub uaa_client_secret: String,
     pub genai_api_url: String,
-    pub api_key: String,
+    pub api_keys: Vec<String>,
     #[serde(default = "default_port")]
     pub port: u16,
     #[serde(default)]
@@ -42,6 +42,9 @@ pub struct ConfigFile {
     pub refresh_interval_secs: Option<u64>,
     #[serde(default)]
     pub fallback_models: FallbackModels,
+    /// API keys for authenticating requests (moved from credentials)
+    #[serde(default)]
+    pub api_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -204,16 +207,47 @@ impl Config {
             })
             .context("aicore_api_url is required in config file or GENAI_API_URL env var")?;
 
-        let api_key = env::var("API_KEY")
-            .or_else(|_| {
-                file_config
-                    .credentials
-                    .as_ref()
-                    .and_then(|c| c.api_key.as_ref())
-                    .cloned()
-                    .ok_or(anyhow::anyhow!("api_key not found"))
-            })
-            .context("api_key is required in config file or API_KEY env var")?;
+        // Build api_keys list from multiple sources:
+        // 1. API_KEY env var (single key, for backward compatibility)
+        // 2. API_KEYS env var (comma-separated list)
+        // 3. api_keys from config file root level
+        // 4. credentials.api_key from config file (legacy, for backward compatibility)
+        let mut api_keys: Vec<String> = Vec::new();
+
+        // Add from API_KEY env var (backward compatibility)
+        if let Ok(key) = env::var("API_KEY") {
+            api_keys.push(key);
+        }
+
+        // Add from API_KEYS env var (comma-separated)
+        if let Ok(keys) = env::var("API_KEYS") {
+            api_keys.extend(
+                keys.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            );
+        }
+
+        // Add from config file root level api_keys
+        api_keys.extend(file_config.api_keys);
+
+        // Add from credentials.api_key (legacy backward compatibility)
+        if let Some(ref creds) = file_config.credentials
+            && let Some(ref key) = creds.api_key
+            && !api_keys.contains(key)
+        {
+            api_keys.push(key.clone());
+        }
+
+        // Deduplicate while preserving order
+        let mut seen = std::collections::HashSet::new();
+        api_keys.retain(|k| seen.insert(k.clone()));
+
+        if api_keys.is_empty() {
+            return Err(anyhow::anyhow!(
+                "At least one API key is required. Set via API_KEY/API_KEYS env var or api_keys in config file"
+            ));
+        }
 
         let port = env::var("PORT")
             .ok()
@@ -244,7 +278,7 @@ impl Config {
             uaa_client_id,
             uaa_client_secret,
             genai_api_url,
-            api_key,
+            api_keys,
             port,
             models,
             log_level,
@@ -327,7 +361,7 @@ models:
         assert_eq!(config.uaa_token_url, "https://test.example.com/oauth/token");
         assert_eq!(config.uaa_client_id, "test-client-id");
         assert_eq!(config.genai_api_url, "https://api.test.example.com");
-        assert_eq!(config.api_key, "test-api-key");
+        assert_eq!(config.api_keys, vec!["test-api-key".to_string()]);
         assert_eq!(config.models.len(), 1);
         assert_eq!(config.models[0].name, "test-model");
         assert_eq!(
@@ -390,6 +424,7 @@ credentials:
             resource_group: Some("test-group".to_string()),
             refresh_interval_secs: None,
             fallback_models: FallbackModels::default(),
+            api_keys: vec![],
         };
 
         let config = Config::from_file_and_env(config_file).expect("Failed to create config");
@@ -400,6 +435,8 @@ credentials:
         assert_eq!(config.models[0].name, "model1");
         assert_eq!(config.models[0].deployment_id, Some("dep1".to_string()));
         assert_eq!(config.resource_group, "test-group");
+        // api_key from credentials.api_key should be picked up for backward compatibility
+        assert_eq!(config.api_keys, vec!["key789".to_string()]);
     }
 
     #[test]
@@ -527,5 +564,93 @@ models:
         assert_eq!(config.fallback_models.claude, None);
         assert_eq!(config.fallback_models.openai, None);
         assert_eq!(config.fallback_models.gemini, None);
+    }
+
+    #[test]
+    fn test_multiple_api_keys() {
+        let yaml_content = r#"
+port: 8080
+credentials:
+  uaa_token_url: https://test.example.com/oauth/token
+  uaa_client_id: test-client-id
+  uaa_client_secret: test-client-secret
+  aicore_api_url: https://api.test.example.com
+models:
+  - name: gpt-4
+    deployment_id: dep-123
+api_keys:
+  - key-one
+  - key-two
+  - key-three
+"#;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config_path = temp_dir.path().join("multi_api_keys_config.yaml");
+        fs::write(&config_path, yaml_content).expect("Failed to write config file");
+
+        let config =
+            Config::load(Some(config_path.to_str().unwrap())).expect("Failed to load config");
+
+        assert_eq!(config.api_keys.len(), 3);
+        assert_eq!(config.api_keys[0], "key-one");
+        assert_eq!(config.api_keys[1], "key-two");
+        assert_eq!(config.api_keys[2], "key-three");
+    }
+
+    #[test]
+    fn test_api_keys_deduplication() {
+        let yaml_content = r#"
+port: 8080
+credentials:
+  uaa_token_url: https://test.example.com/oauth/token
+  uaa_client_id: test-client-id
+  uaa_client_secret: test-client-secret
+  aicore_api_url: https://api.test.example.com
+  api_key: duplicate-key
+models:
+  - name: gpt-4
+    deployment_id: dep-123
+api_keys:
+  - duplicate-key
+  - another-key
+"#;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config_path = temp_dir.path().join("dedup_api_keys_config.yaml");
+        fs::write(&config_path, yaml_content).expect("Failed to write config file");
+
+        let config =
+            Config::load(Some(config_path.to_str().unwrap())).expect("Failed to load config");
+
+        // Should deduplicate, keeping the first occurrence
+        assert_eq!(config.api_keys.len(), 2);
+        assert!(config.api_keys.contains(&"duplicate-key".to_string()));
+        assert!(config.api_keys.contains(&"another-key".to_string()));
+    }
+
+    #[test]
+    fn test_legacy_credentials_api_key_backward_compat() {
+        let yaml_content = r#"
+port: 8080
+credentials:
+  uaa_token_url: https://test.example.com/oauth/token
+  uaa_client_id: test-client-id
+  uaa_client_secret: test-client-secret
+  aicore_api_url: https://api.test.example.com
+  api_key: legacy-key
+models:
+  - name: gpt-4
+    deployment_id: dep-123
+"#;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config_path = temp_dir.path().join("legacy_api_key_config.yaml");
+        fs::write(&config_path, yaml_content).expect("Failed to write config file");
+
+        let config =
+            Config::load(Some(config_path.to_str().unwrap())).expect("Failed to load config");
+
+        // Legacy api_key in credentials should still work
+        assert_eq!(config.api_keys, vec!["legacy-key".to_string()]);
     }
 }

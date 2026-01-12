@@ -76,14 +76,18 @@ Edit `~/.aicore/config.yaml` with your settings:
 # AI Core Router Configuration
 log_level: INFO
 
-# OAuth and API credentials
+# OAuth credentials
 credentials:
   uaa_token_url: https://your-tenant.authentication.sap.hana.ondemand.com/oauth/token
   uaa_client_id: your-client-id
   uaa_client_secret: your-client-secret
   aicore_api_url: https://api.ai.prod.sap.com
   resource_group: your-resource-group
-  api_key: your-api-key
+
+# API keys for authenticating requests (supports multiple keys)
+api_keys:
+  - your-api-key-1
+  - your-api-key-2
 
 # Server configuration
 port: 8900
@@ -190,7 +194,7 @@ All of the following must be set in the config file:
 | `credentials.uaa_client_secret` | OAuth client secret |
 | `credentials.aicore_api_url` | SAP AI Core API base URL |
 | `credentials.resource_group` | AI Core resource group |
-| `credentials.api_key` | API key for accessing the router |
+| `api_keys` | List of API keys for accessing the router |
 
 ### Optional Configuration
 
@@ -199,6 +203,24 @@ All of the following must be set in the config file:
 | `port` | 8900 | Server port |
 | `log_level` | INFO | Logging level |
 | `refresh_interval_secs` | 600 | Interval for refreshing model deployments |
+
+### API Keys Configuration
+
+API keys are used to authenticate requests to the router. You can configure multiple API keys to support different users or applications:
+
+```yaml
+api_keys:
+  - user1-api-key
+  - user2-api-key
+  - shared-team-key
+```
+
+**Environment Variables:**
+- `API_KEY`: Single API key (for backward compatibility)
+- `API_KEYS`: Comma-separated list of API keys
+
+**Backward Compatibility:**
+The legacy `credentials.api_key` field is still supported for backward compatibility, but we recommend using the root-level `api_keys` array for new configurations.
 
 ### Model Configuration
 

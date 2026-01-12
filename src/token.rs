@@ -26,7 +26,7 @@ impl TokenInfo {
 
 #[derive(Debug, Clone)]
 pub struct OAuthConfig {
-    pub api_key: String,
+    pub api_keys: Vec<String>,
     pub token_url: String,
     pub client_id: String,
     pub client_secret: String,
@@ -54,7 +54,7 @@ impl TokenManager {
             .as_ref()
             .context("TokenManager not configured with OAuth credentials")?;
 
-        if api_key != oauth_config.api_key {
+        if !oauth_config.api_keys.contains(&api_key.to_string()) {
             return Ok(None);
         }
 

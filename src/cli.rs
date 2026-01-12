@@ -117,9 +117,10 @@ impl Cli {
         tracing::info!("GenAI API URL: {}", config.genai_api_url);
         tracing::info!("UAA Token URL: {}", config.uaa_token_url);
         tracing::info!("UAA Client ID: {}", config.uaa_client_id);
+        tracing::info!("Configured API keys: {}", config.api_keys.len());
 
         let token_manager = TokenManager::with_oauth_config(OAuthConfig {
-            api_key: config.api_key.clone(),
+            api_keys: config.api_keys.clone(),
             token_url: config.uaa_token_url.clone(),
             client_id: config.uaa_client_id.clone(),
             client_secret: config.uaa_client_secret.clone(),

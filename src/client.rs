@@ -117,7 +117,7 @@ impl From<Config> for AiCoreClientConfig {
             genai_api_url: config.genai_api_url,
             resource_group: config.resource_group,
             oauth_config: OAuthConfig {
-                api_key: config.api_key,
+                api_keys: config.api_keys,
                 token_url: config.uaa_token_url,
                 client_id: config.uaa_client_id,
                 client_secret: config.uaa_client_secret,
@@ -149,8 +149,16 @@ impl AiCoreClient {
     }
 
     async fn get_token(&self) -> Result<String> {
+        // Use the first api_key for internal API calls
+        let api_key = self
+            .config
+            .oauth_config
+            .api_keys
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No API keys configured"))?;
+
         self.token_manager
-            .get_token(&self.config.oauth_config.api_key)
+            .get_token(api_key)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Failed to get authentication token"))
     }

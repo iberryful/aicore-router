@@ -92,7 +92,11 @@ mod e2e_tests {
 
     async fn get_api_key_from_config() -> String {
         let config = Config::load(None).expect("Failed to load config.yaml for API key");
-        config.api_key
+        config
+            .api_keys
+            .first()
+            .expect("No API keys configured")
+            .clone()
     }
 
     // Test helper functions
