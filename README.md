@@ -325,6 +325,38 @@ models:
 
 If no models are configured, the router will automatically discover them from your AI Core deployments.
 
+### Model Aliases
+
+You can configure alias patterns to match multiple model name variants to a single configured model. This is useful when clients request dated or variant model names.
+
+```yaml
+models:
+  - name: claude-sonnet-4-5
+    aicore_model_name: anthropic--claude-4-sonnet
+    aliases:
+      - "claude-sonnet-4-5-*"      # Match: claude-sonnet-4-5-20250929, etc.
+      - "claude-4-sonnet"          # Exact alias
+
+  - name: gpt-4o
+    aliases:
+      - "gpt-4o-*"                 # Match: gpt-4o-mini, gpt-4o-2024-*, etc.
+```
+
+**Alias Pattern Syntax:**
+- **Exact match**: `"claude-4-sonnet"` matches only `claude-4-sonnet`
+- **Prefix match**: `"claude-sonnet-4-5-*"` matches any model starting with `claude-sonnet-4-5-`
+
+**Resolution Priority:**
+1. **Exact name match**: Request matches a configured model name directly
+2. **Alias pattern match**: Request matches a configured alias (most specific pattern wins)
+3. **Family fallback**: Falls back to configured default for the model family
+
+**Conflict Resolution:**
+When multiple alias patterns match, the most specific pattern wins. Specificity is determined by the length of the literal prefix before the `*` wildcard.
+
+Example: For request `claude-sonnet-4-5-20250929`:
+- `claude-sonnet-4-5-*` (18 chars) wins over `claude-*` (7 chars)
+
 ### Fallback Models
 
 You can configure default fallback models for each model family. When a requested model is not found in your configuration, the router will automatically fall back to the configured model for that family.

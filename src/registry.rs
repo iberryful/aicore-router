@@ -168,6 +168,31 @@ impl ModelRegistry {
         self.config_models.iter().map(|m| m.name.as_str()).collect()
     }
 
+    /// Find a model config by checking aliases with glob pattern matching.
+    /// Returns the model with the most specific matching pattern.
+    /// Specificity is determined by the length of the literal prefix before the `*`.
+    pub fn find_model_by_alias(&self, requested_model: &str) -> Option<&Model> {
+        let mut best_match: Option<(&Model, usize)> = None;
+
+        for model in &self.config_models {
+            for alias in &model.aliases {
+                if let Some(specificity) = glob_matches(alias, requested_model) {
+                    match &best_match {
+                        None => {
+                            best_match = Some((model, specificity));
+                        }
+                        Some((_, current_specificity)) if specificity > *current_specificity => {
+                            best_match = Some((model, specificity));
+                        }
+                        _ => {} // Keep current best match
+                    }
+                }
+            }
+        }
+
+        best_match.map(|(model, _)| model)
+    }
+
     async fn background_refresh(&self) {
         let mut interval = tokio::time::interval(self.refresh_interval);
 
@@ -256,5 +281,195 @@ impl ModelRegistry {
         );
 
         Ok(())
+    }
+}
+
+/// Check if a glob pattern matches a string.
+/// Only supports trailing `*` wildcard (prefix matching).
+/// Returns the specificity (length of literal prefix) if matches, None otherwise.
+/// Higher specificity = more specific match.
+fn glob_matches(pattern: &str, input: &str) -> Option<usize> {
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        // Pattern ends with *: prefix match
+        if input.starts_with(prefix) {
+            Some(prefix.len()) // Specificity = length of literal part
+        } else {
+            None
+        }
+    } else {
+        // No wildcard: exact match only
+        if pattern == input {
+            Some(pattern.len())
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_glob_matches_trailing_wildcard() {
+        // Prefix match with trailing *
+        assert_eq!(glob_matches("claude-*", "claude-sonnet"), Some(7));
+        assert_eq!(
+            glob_matches("claude-sonnet-4-5-*", "claude-sonnet-4-5-20250929"),
+            Some(18)
+        );
+        assert_eq!(glob_matches("gpt-4o-*", "gpt-4o-mini"), Some(7));
+
+        // Non-matching prefix
+        assert_eq!(glob_matches("claude-*", "gpt-4"), None);
+        assert_eq!(
+            glob_matches("claude-sonnet-4-5-*", "claude-sonnet-4-0"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_glob_matches_exact() {
+        // Exact match (no wildcard)
+        assert_eq!(glob_matches("claude-sonnet", "claude-sonnet"), Some(13));
+        assert_eq!(glob_matches("gpt-4o", "gpt-4o"), Some(6));
+
+        // Non-matching exact
+        assert_eq!(glob_matches("claude-sonnet", "claude-sonnet-4"), None);
+        assert_eq!(glob_matches("gpt-4o", "gpt-4o-mini"), None);
+    }
+
+    #[test]
+    fn test_glob_matches_empty_pattern() {
+        // Edge case: wildcard only matches anything
+        assert_eq!(glob_matches("*", "anything"), Some(0));
+        assert_eq!(glob_matches("*", ""), Some(0));
+
+        // Empty pattern only matches empty string
+        assert_eq!(glob_matches("", ""), Some(0));
+        assert_eq!(glob_matches("", "something"), None);
+    }
+
+    #[test]
+    fn test_glob_specificity() {
+        // More specific patterns have higher specificity
+        let specific = glob_matches("claude-sonnet-4-5-*", "claude-sonnet-4-5-20250929");
+        let general = glob_matches("claude-*", "claude-sonnet-4-5-20250929");
+
+        assert!(specific.is_some());
+        assert!(general.is_some());
+        assert!(specific.unwrap() > general.unwrap());
+        assert_eq!(specific.unwrap(), 18);
+        assert_eq!(general.unwrap(), 7);
+    }
+
+    fn create_test_registry(models: Vec<Model>) -> ModelRegistry {
+        ModelRegistry::new(
+            models,
+            FallbackModels::default(),
+            vec![],
+            TokenManager::new(vec!["test".to_string()]),
+            600,
+        )
+    }
+
+    #[test]
+    fn test_find_model_by_alias_exact() {
+        let models = vec![Model {
+            name: "claude-sonnet-4-5".to_string(),
+            aicore_model_name: None,
+            aliases: vec!["claude-4-sonnet".to_string()],
+        }];
+        let registry = create_test_registry(models);
+
+        let found = registry.find_model_by_alias("claude-4-sonnet");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn test_find_model_by_alias_wildcard() {
+        let models = vec![Model {
+            name: "claude-sonnet-4-5".to_string(),
+            aicore_model_name: None,
+            aliases: vec!["claude-sonnet-4-5-*".to_string()],
+        }];
+        let registry = create_test_registry(models);
+
+        let found = registry.find_model_by_alias("claude-sonnet-4-5-20250929");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn test_find_model_by_alias_most_specific_wins() {
+        let models = vec![
+            Model {
+                name: "claude-general".to_string(),
+                aicore_model_name: None,
+                aliases: vec!["claude-*".to_string()],
+            },
+            Model {
+                name: "claude-sonnet-4-5".to_string(),
+                aicore_model_name: None,
+                aliases: vec!["claude-sonnet-4-5-*".to_string()],
+            },
+        ];
+        let registry = create_test_registry(models);
+
+        // Should match the more specific pattern
+        let found = registry.find_model_by_alias("claude-sonnet-4-5-20250929");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "claude-sonnet-4-5");
+
+        // Should match the general pattern for non-specific requests
+        let found2 = registry.find_model_by_alias("claude-opus");
+        assert!(found2.is_some());
+        assert_eq!(found2.unwrap().name, "claude-general");
+    }
+
+    #[test]
+    fn test_find_model_by_alias_no_match() {
+        let models = vec![Model {
+            name: "claude-sonnet-4-5".to_string(),
+            aicore_model_name: None,
+            aliases: vec!["claude-sonnet-4-5-*".to_string()],
+        }];
+        let registry = create_test_registry(models);
+
+        let found = registry.find_model_by_alias("gpt-4o-mini");
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_find_model_by_alias_multiple_aliases() {
+        let models = vec![Model {
+            name: "claude-sonnet-4-5".to_string(),
+            aicore_model_name: None,
+            aliases: vec![
+                "claude-sonnet-4-5-*".to_string(),
+                "claude-4-sonnet".to_string(),
+                "sonnet-4.5".to_string(),
+            ],
+        }];
+        let registry = create_test_registry(models);
+
+        // Test all aliases match the same model
+        assert_eq!(
+            registry
+                .find_model_by_alias("claude-sonnet-4-5-20250929")
+                .map(|m| &m.name),
+            Some(&"claude-sonnet-4-5".to_string())
+        );
+        assert_eq!(
+            registry
+                .find_model_by_alias("claude-4-sonnet")
+                .map(|m| &m.name),
+            Some(&"claude-sonnet-4-5".to_string())
+        );
+        assert_eq!(
+            registry.find_model_by_alias("sonnet-4.5").map(|m| &m.name),
+            Some(&"claude-sonnet-4-5".to_string())
+        );
     }
 }

@@ -126,6 +126,11 @@ pub struct Model {
     /// The model name as it appears in AI Core deployments.
     /// If not specified, the `name` field is used to look up deployments.
     pub aicore_model_name: Option<String>,
+    /// Alias patterns that should resolve to this model.
+    /// Supports trailing wildcard (*) for prefix matching.
+    /// Example: ["claude-sonnet-4-5-*", "claude-4-sonnet"]
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 /// Configuration for fallback models per model family.
@@ -532,6 +537,7 @@ credentials:
             models: vec![Model {
                 name: "model1".to_string(),
                 aicore_model_name: Some("aicore-model-1".to_string()),
+                aliases: vec![],
             }],
             resource_group: Some("test-group".to_string()),
             refresh_interval_secs: None,

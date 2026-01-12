@@ -79,7 +79,9 @@ pub struct ProxyRequest {
     pub stream: bool,
     pub url: String,
     pub token: String,
-    pub model: String,
+    pub model: String,          // Resolved/normalized model name
+    pub original_model: String, // Original requested model name
+    pub provider_name: String,  // Provider handling this request
     pub resource_group: String,
 }
 
@@ -145,6 +147,8 @@ impl<'a> ProxyRequestBuilder<'a> {
             url,
             token,
             model: normalized_model,
+            original_model: self.params.model.clone(),
+            provider_name: provider.name.clone(),
             resource_group: provider.resource_group.clone(),
         })
     }
@@ -233,9 +237,10 @@ impl ProxyRequest {
             // Check for rate limiting - signal to try next provider
             if status == StatusCode::TOO_MANY_REQUESTS {
                 tracing::warn!(
-                    "Rate limited (429) on model: {}, resource_group: {}, time: {:.2}ms",
+                    "Rate limited (429) on original_model: {}, resolved_model: {}, provider: {}, time: {:.2}ms",
+                    self.original_model,
                     self.model,
-                    self.resource_group,
+                    self.provider_name,
                     elapsed.as_secs_f64() * 1000.0
                 );
                 return Ok(ProxyExecuteResult::RateLimited);
@@ -243,8 +248,10 @@ impl ProxyRequest {
 
             tracing::error!("Proxy request failed: {} - {}", status, text);
             tracing::info!(
-                "Proxy done - model: {}, time: {:.2}ms, status: {}, stream: {}",
+                "Proxy done - original_model: {}, resolved_model: {}, provider: {}, time: {:.2}ms, status: {}, stream: {}",
+                self.original_model,
                 self.model,
+                self.provider_name,
                 elapsed.as_secs_f64() * 1000.0,
                 status,
                 self.stream
@@ -265,8 +272,10 @@ impl ProxyRequest {
             let result = self.handle_regular_response(response).await;
             let elapsed = start_time.elapsed();
             tracing::info!(
-                "Proxy done - model: {}, time: {:.2}ms, status: 200, stream: {}",
+                "Proxy done - original_model: {}, resolved_model: {}, provider: {}, time: {:.2}ms, status: 200, stream: {}",
+                self.original_model,
                 self.model,
+                self.provider_name,
                 elapsed.as_secs_f64() * 1000.0,
                 self.stream
             );
@@ -304,6 +313,8 @@ impl ProxyRequest {
             tokio::sync::mpsc::channel::<Result<axum::body::Bytes, reqwest::Error>>(1024);
         let is_claude = matches!(self.family, LlmFamily::Claude);
         let model = self.model.clone();
+        let original_model = self.original_model.clone();
+        let provider_name = self.provider_name.clone();
         let family = self.family.clone();
 
         tokio::spawn(async move {
@@ -359,8 +370,10 @@ impl ProxyRequest {
             // Log completion when streaming is done
             let elapsed = start_time.elapsed();
             tracing::info!(
-                "Proxy done - model: {}, time: {:.2}ms, status: 200, stream: true, {}",
+                "Proxy done - original_model: {}, resolved_model: {}, provider: {}, time: {:.2}ms, status: 200, stream: true, {}",
+                original_model,
                 model,
+                provider_name,
                 elapsed.as_secs_f64() * 1000.0,
                 token_stats
             );
@@ -379,12 +392,22 @@ impl ProxyRequest {
 }
 
 fn normalize_model(model: &str, registry: &ModelRegistry) -> Result<String> {
-    // Simple normalization - if the model exists in config, use it
+    // 1. Exact match - if the model exists in config, use it directly
     if registry.find_model_config(model).is_some() {
         return Ok(model.to_string());
     }
 
-    // Determine family prefix and check for configured fallback
+    // 2. Alias pattern match - find by configured alias patterns
+    if let Some(matched_model) = registry.find_model_by_alias(model) {
+        tracing::debug!(
+            "Model '{}' matched alias pattern for configured model '{}'",
+            model,
+            matched_model.name
+        );
+        return Ok(matched_model.name.clone());
+    }
+
+    // 3. Family fallback - determine family prefix and check for configured fallback
     let prefix = if model.starts_with(CLAUDE_PREFIX) {
         CLAUDE_PREFIX
     } else if model.starts_with(GEMINI_PREFIX) {
