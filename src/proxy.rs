@@ -468,6 +468,7 @@ fn prepare_body(body: &mut Value, family: &LlmFamily, stream: bool, model: &str)
                 obj.insert("anthropic_version".to_string(), json!(ANTHROPIC_VERSION));
                 obj.remove("stream");
                 obj.remove("model");
+                obj.remove("context_management");
 
                 if obj.contains_key("thinking") && obj.contains_key("temperature") {
                     obj.remove("temperature");
