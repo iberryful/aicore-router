@@ -25,6 +25,10 @@ pub struct Config {
     /// Load balancing strategy for distributing requests across providers
     #[serde(default)]
     pub load_balancing: LoadBalancingStrategy,
+    /// Optional maximum request body size in bytes.
+    /// If not set, Axum's default (2 MiB) applies.
+    #[serde(skip_serializing, skip_deserializing)]
+    pub request_body_limit: Option<usize>,
 }
 
 /// A single AI Core provider configuration
@@ -85,6 +89,9 @@ pub struct ConfigFile {
     /// Load balancing strategy
     #[serde(default)]
     pub load_balancing: LoadBalancingStrategy,
+    /// Optional maximum request body size in bytes.
+    #[serde(default)]
+    pub request_body_limit: Option<usize>,
 }
 
 /// Provider configuration as read from config file
@@ -383,6 +390,11 @@ impl Config {
         let models = file_config.models;
         let fallback_models = file_config.fallback_models;
         let load_balancing = file_config.load_balancing;
+        // REQUEST_BODY_LIMIT can override the file value. Accepts plain number of bytes.
+        let request_body_limit = env::var("REQUEST_BODY_LIMIT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .or(file_config.request_body_limit);
 
         Ok(Config {
             providers,
@@ -393,6 +405,7 @@ impl Config {
             refresh_interval_secs,
             fallback_models,
             load_balancing,
+            request_body_limit,
         })
     }
 }
@@ -408,6 +421,7 @@ mod tests {
         let yaml_content = r#"
 log_level: DEBUG
 port: 9000
+request_body_limit: 2097152
 credentials:
   uaa_token_url: https://test.example.com/oauth/token
   uaa_client_id: test-client-id
@@ -440,6 +454,7 @@ models:
         );
         assert_eq!(creds.uaa_client_id, Some("test-client-id".to_string()));
         assert_eq!(creds.api_key, Some("test-api-key".to_string()));
+        assert_eq!(config_file.request_body_limit, Some(2_097_152));
     }
 
     #[test]
@@ -485,6 +500,7 @@ models:
             config.models[0].aicore_model_name,
             Some("test-aicore-model".to_string())
         );
+        assert_eq!(config.request_body_limit, None);
     }
 
     #[test]
@@ -544,6 +560,7 @@ credentials:
             fallback_models: FallbackModels::default(),
             api_keys: vec![],
             load_balancing: LoadBalancingStrategy::default(),
+            request_body_limit: None,
         };
 
         let config = Config::from_file_and_env(config_file).expect("Failed to create config");
@@ -846,4 +863,5 @@ models:
 
         assert_eq!(config.api_keys, vec!["shared-api-key".to_string()]);
     }
+
 }

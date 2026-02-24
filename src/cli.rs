@@ -3,6 +3,7 @@ use clap::{Arg, Command};
 use std::net::SocketAddr;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{EnvFilter, fmt};
+use axum::extract::DefaultBodyLimit;
 
 use crate::{
     balancer::LoadBalancer,
@@ -165,9 +166,22 @@ impl Cli {
             client,
         };
 
-        let app = create_router(state)
+        // Build base app with common layers
+        let base_app = create_router(state)
             .layer(CorsLayer::permissive())
             .layer(TraceLayer::new_for_http());
+
+        // Apply configurable body limit if provided; otherwise use Axum's default (2 MiB for Json)
+        let app = match config.request_body_limit {
+            Some(limit) => {
+                tracing::info!("Request body limit set to {} bytes", limit);
+                base_app.layer(DefaultBodyLimit::max(limit))
+            }
+            None => {
+                tracing::info!("Request body limit not set; using Axum default (2 MiB for Json)");
+                base_app
+            }
+        };
 
         let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
         let listener = tokio::net::TcpListener::bind(addr)

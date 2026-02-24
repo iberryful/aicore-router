@@ -103,6 +103,8 @@ providers:
 # Server configuration
 port: 8900
 refresh_interval_secs: 600
+# Optional: maximum accepted request body size in bytes
+request_body_limit: 2097152
 
 # Model mappings (optional)
 # Models are now discovered automatically from your AI Core deployments.
@@ -143,6 +145,7 @@ curl -X POST http://localhost:8900/v1/chat/completions \
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": true
   }'
+```
 
 #### Claude API
 ```bash
@@ -290,6 +293,7 @@ At minimum, you need:
 | `log_level` | INFO | Logging level |
 | `refresh_interval_secs` | 600 | Interval for refreshing model deployments |
 | `load_balancing` | round_robin | Load balancing strategy: `round_robin` or `fallback` |
+| `request_body_limit` | Axum default (2 MiB) | Maximum request body size in bytes. Can be overridden via REQUEST_BODY_LIMIT environment variable. |
 
 ### API Keys Configuration
 
