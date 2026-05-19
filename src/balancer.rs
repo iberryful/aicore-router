@@ -9,6 +9,34 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::{LoadBalancingStrategy, Provider};
 
+/// An iterator over providers in load-balanced order (zero-allocation).
+pub struct OrderedProviders<'a> {
+    providers: &'a [Provider],
+    start: usize,
+    index: usize,
+    len: usize,
+}
+
+impl<'a> Iterator for OrderedProviders<'a> {
+    type Item = &'a Provider;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.len {
+            return None;
+        }
+        let item = &self.providers[(self.start + self.index) % self.len];
+        self.index += 1;
+        Some(item)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for OrderedProviders<'_> {}
+
 /// Load balancer that distributes requests across multiple providers.
 #[derive(Debug, Clone)]
 pub struct LoadBalancer {
@@ -31,77 +59,31 @@ impl LoadBalancer {
         }
     }
 
-    /// Get the load balancing strategy.
-    pub fn strategy(&self) -> &LoadBalancingStrategy {
-        &self.strategy
-    }
-
-    /// Get the next provider using round-robin selection.
-    /// Returns None if no providers are available.
-    pub fn next(&self) -> Option<&Provider> {
-        if self.providers.is_empty() {
-            return None;
-        }
-
-        let index = self.current_index.fetch_add(1, Ordering::SeqCst) % self.providers.len();
-        self.providers.get(index)
-    }
-
-    /// Get all providers in order, starting from a specific index.
-    /// This is used for fallback - try providers in order until one succeeds.
-    pub fn get_providers_from(&self, start_index: usize) -> Vec<&Provider> {
-        if self.providers.is_empty() {
-            return Vec::new();
-        }
-
-        let len = self.providers.len();
-        (0..len)
-            .map(|i| &self.providers[(start_index + i) % len])
-            .collect()
-    }
-
-    /// Get the next index without incrementing (peek).
-    pub fn current_index(&self) -> usize {
-        self.current_index.load(Ordering::SeqCst) % self.providers.len().max(1)
-    }
-
     /// Get providers ordered according to the configured strategy.
     ///
     /// - `RoundRobin`: Returns providers starting from the current round-robin position,
     ///   then advances the index for the next request.
     /// - `Fallback`: Always returns providers in their original order (first provider first),
     ///   does not advance any index.
-    pub fn get_ordered_providers(&self) -> Vec<&Provider> {
-        match self.strategy {
-            LoadBalancingStrategy::RoundRobin => {
-                let start = self.current_index.fetch_add(1, Ordering::SeqCst);
-                self.get_providers_from(start)
+    pub fn get_ordered_providers(&self) -> OrderedProviders<'_> {
+        let len = self.providers.len();
+        let start = match self.strategy {
+            LoadBalancingStrategy::RoundRobin if len > 0 => {
+                self.current_index.fetch_add(1, Ordering::Relaxed) % len
             }
-            LoadBalancingStrategy::Fallback => {
-                // Always start from the first provider
-                self.providers.iter().collect()
-            }
+            _ => 0,
+        };
+        OrderedProviders {
+            providers: &self.providers,
+            start,
+            index: 0,
+            len,
         }
-    }
-
-    /// Get the number of enabled providers.
-    pub fn len(&self) -> usize {
-        self.providers.len()
     }
 
     /// Check if there are no enabled providers.
     pub fn is_empty(&self) -> bool {
         self.providers.is_empty()
-    }
-
-    /// Get a provider by name.
-    pub fn get_by_name(&self, name: &str) -> Option<&Provider> {
-        self.providers.iter().find(|p| p.name == name)
-    }
-
-    /// Get all enabled providers.
-    pub fn providers(&self) -> &[Provider] {
-        &self.providers
     }
 }
 
@@ -123,23 +105,6 @@ mod tests {
     }
 
     #[test]
-    fn test_round_robin() {
-        let providers = vec![
-            create_test_provider("provider1", true),
-            create_test_provider("provider2", true),
-            create_test_provider("provider3", true),
-        ];
-
-        let balancer = LoadBalancer::new(providers, LoadBalancingStrategy::RoundRobin);
-
-        // Should cycle through providers in order
-        assert_eq!(balancer.next().unwrap().name, "provider1");
-        assert_eq!(balancer.next().unwrap().name, "provider2");
-        assert_eq!(balancer.next().unwrap().name, "provider3");
-        assert_eq!(balancer.next().unwrap().name, "provider1"); // wrap around
-    }
-
-    #[test]
     fn test_disabled_providers_excluded() {
         let providers = vec![
             create_test_provider("provider1", true),
@@ -149,10 +114,10 @@ mod tests {
 
         let balancer = LoadBalancer::new(providers, LoadBalancingStrategy::RoundRobin);
 
-        assert_eq!(balancer.len(), 2);
-        assert_eq!(balancer.next().unwrap().name, "provider1");
-        assert_eq!(balancer.next().unwrap().name, "provider3");
-        assert_eq!(balancer.next().unwrap().name, "provider1");
+        let ordered: Vec<&Provider> = balancer.get_ordered_providers().collect();
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].name, "provider1");
+        assert_eq!(ordered[1].name, "provider3");
     }
 
     #[test]
@@ -166,13 +131,11 @@ mod tests {
         let balancer = LoadBalancer::new(providers, LoadBalancingStrategy::RoundRobin);
 
         // First call starts at index 0
-        let ordered = balancer.get_ordered_providers();
-        let names: Vec<&str> = ordered.iter().map(|p| p.name.as_str()).collect();
+        let names: Vec<&str> = balancer.get_ordered_providers().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["provider1", "provider2", "provider3"]);
 
         // Second call starts at index 1
-        let ordered = balancer.get_ordered_providers();
-        let names: Vec<&str> = ordered.iter().map(|p| p.name.as_str()).collect();
+        let names: Vec<&str> = balancer.get_ordered_providers().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["provider2", "provider3", "provider1"]);
     }
 
@@ -186,19 +149,12 @@ mod tests {
 
         let balancer = LoadBalancer::new(providers, LoadBalancingStrategy::Fallback);
 
-        // First call always starts from provider1
-        let ordered = balancer.get_ordered_providers();
-        let names: Vec<&str> = ordered.iter().map(|p| p.name.as_str()).collect();
+        // Always starts from provider1
+        let names: Vec<&str> = balancer.get_ordered_providers().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["provider1", "provider2", "provider3"]);
 
         // Second call also starts from provider1 (no rotation)
-        let ordered = balancer.get_ordered_providers();
-        let names: Vec<&str> = ordered.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["provider1", "provider2", "provider3"]);
-
-        // Third call - still from provider1
-        let ordered = balancer.get_ordered_providers();
-        let names: Vec<&str> = ordered.iter().map(|p| p.name.as_str()).collect();
+        let names: Vec<&str> = balancer.get_ordered_providers().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["provider1", "provider2", "provider3"]);
     }
 
@@ -207,32 +163,6 @@ mod tests {
         let balancer = LoadBalancer::new(vec![], LoadBalancingStrategy::RoundRobin);
 
         assert!(balancer.is_empty());
-        assert!(balancer.next().is_none());
-        assert!(balancer.get_ordered_providers().is_empty());
-    }
-
-    #[test]
-    fn test_get_by_name() {
-        let providers = vec![
-            create_test_provider("provider1", true),
-            create_test_provider("provider2", true),
-        ];
-
-        let balancer = LoadBalancer::new(providers, LoadBalancingStrategy::RoundRobin);
-
-        assert!(balancer.get_by_name("provider1").is_some());
-        assert!(balancer.get_by_name("provider2").is_some());
-        assert!(balancer.get_by_name("nonexistent").is_none());
-    }
-
-    #[test]
-    fn test_strategy_getter() {
-        let providers = vec![create_test_provider("provider1", true)];
-
-        let rr_balancer = LoadBalancer::new(providers.clone(), LoadBalancingStrategy::RoundRobin);
-        assert_eq!(rr_balancer.strategy(), &LoadBalancingStrategy::RoundRobin);
-
-        let fb_balancer = LoadBalancer::new(providers, LoadBalancingStrategy::Fallback);
-        assert_eq!(fb_balancer.strategy(), &LoadBalancingStrategy::Fallback);
+        assert_eq!(balancer.get_ordered_providers().len(), 0);
     }
 }

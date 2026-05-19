@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde::Deserialize;
 
 use crate::{
-    config::{Config, Provider},
+    config::Provider,
     token::TokenManager,
 };
 
@@ -90,73 +90,37 @@ impl Deployment {
     }
 
     pub fn get_aicore_model_name(&self) -> Option<String> {
-        if let Some(details) = &self.details
-            && let Some(resources) = &details.resources
-            && let Some(backend_details) = resources.get("backendDetails")
-            && let Some(model) = backend_details.get("model")
-        {
-            return model
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        }
-        None
+        self.get_model_info().0
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct AiCoreClientConfig {
-    pub genai_api_url: String,
-    pub resource_group: String,
-    pub provider: Provider,
 }
 
 #[derive(Debug, Clone)]
 pub struct AiCoreClient {
     client: Client,
-    config: AiCoreClientConfig,
+    provider: Provider,
     token_manager: TokenManager,
 }
 
 impl AiCoreClient {
-    pub fn new(config: AiCoreClientConfig, token_manager: TokenManager) -> Self {
+    /// Create a client for a specific provider
+    pub fn from_provider(provider: Provider, token_manager: TokenManager) -> Self {
         Self {
             client: Client::new(),
-            config,
+            provider,
             token_manager,
         }
     }
 
-    /// Create a client for a specific provider
-    pub fn from_provider(provider: Provider, token_manager: TokenManager) -> Self {
-        let config = AiCoreClientConfig {
-            genai_api_url: provider.genai_api_url.clone(),
-            resource_group: provider.resource_group.clone(),
-            provider,
-        };
-        Self::new(config, token_manager)
-    }
-
-    /// Create a client from the first provider in config (for backward compatibility)
-    pub fn from_config(config: Config, token_manager: TokenManager) -> Result<Self> {
-        let provider = config
-            .providers
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("No providers configured"))?
-            .clone();
-        Ok(Self::from_provider(provider, token_manager))
-    }
-
     async fn get_token(&self) -> Result<String> {
         self.token_manager
-            .get_token_for_provider("internal", &self.config.provider)
+            .get_token_for_provider("internal", &self.provider)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Failed to get authentication token"))
     }
 
     pub async fn list_resource_groups(&self) -> Result<ResourceGroupList> {
         let token = self.get_token().await?;
-        let url = format!("{}/v2/admin/resourceGroups", self.config.genai_api_url);
+        let url = format!("{}/v2/admin/resourceGroups", self.provider.genai_api_url);
 
         let response = self
             .client
@@ -187,7 +151,7 @@ impl AiCoreClient {
 
     pub async fn list_deployments(&self, resource_group: Option<&str>) -> Result<DeploymentList> {
         let token = self.get_token().await?;
-        let url = format!("{}/v2/lm/deployments", self.config.genai_api_url);
+        let url = format!("{}/v2/lm/deployments", self.provider.genai_api_url);
 
         let mut request = self
             .client
@@ -195,7 +159,7 @@ impl AiCoreClient {
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json");
 
-        let rg = resource_group.unwrap_or(&self.config.resource_group);
+        let rg = resource_group.unwrap_or(&self.provider.resource_group);
         request = request.header("AI-Resource-Group", rg);
 
         let response = request
@@ -221,73 +185,5 @@ impl AiCoreClient {
         Ok(deployments)
     }
 
-    pub async fn get_deployment(
-        &self,
-        deployment_id: &str,
-        resource_group: Option<&str>,
-    ) -> Result<Deployment> {
-        let token = self.get_token().await?;
-        let url = format!(
-            "{}/v2/lm/deployments/{}",
-            self.config.genai_api_url, deployment_id
-        );
 
-        let mut request = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {token}"))
-            .header("Content-Type", "application/json");
-
-        let rg = resource_group.unwrap_or(&self.config.resource_group);
-        request = request.header("AI-Resource-Group", rg);
-
-        let response = request
-            .send()
-            .await
-            .context("Failed to request deployment")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!(
-                "Failed to get deployment: {} - {}",
-                status,
-                text
-            ));
-        }
-
-        let deployment: Deployment = response
-            .json()
-            .await
-            .context("Failed to parse deployment response")?;
-
-        Ok(deployment)
-    }
-
-    pub fn get_config(&self) -> &AiCoreClientConfig {
-        &self.config
-    }
-
-    pub fn get_client(&self) -> &Client {
-        &self.client
-    }
-
-    pub async fn build_model_to_deployment_mapping(
-        &self,
-        resource_group: Option<&str>,
-    ) -> Result<std::collections::HashMap<String, String>> {
-        let deployments = self.list_deployments(resource_group).await?;
-
-        let mut mapping = std::collections::HashMap::new();
-
-        for deployment in &deployments.resources {
-            if deployment.status == "RUNNING"
-                && let Some(model_name) = deployment.get_aicore_model_name()
-            {
-                mapping.insert(model_name, deployment.id.clone());
-            }
-        }
-
-        Ok(mapping)
-    }
 }
