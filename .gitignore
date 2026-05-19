@@ -4,3 +4,4 @@ Cargo.lock
 .env
 config.yaml
 .claude
+.DS_Store
