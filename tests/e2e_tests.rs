@@ -96,6 +96,7 @@ mod e2e_tests {
             .api_keys
             .first()
             .expect("No API keys configured")
+            .key
             .clone()
     }
 
