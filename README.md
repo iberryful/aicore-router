@@ -9,12 +9,17 @@ A high-performance Rust-based proxy service for SAP AI Core, providing unified a
 - **Multi-Model Support**: OpenAI GPT, Claude (Anthropic), and Gemini (Google) APIs
 - **Streaming Support**: Real-time streaming responses for all supported models
 - **Dynamic Model Resolution**: Automatic discovery and mapping of models from AI Core deployments
-- **CLI Administration**: Command-line tools to inspect deployments and resource groups
-- **Token Usage Statistics**: Logs token usage for all streaming responses
-- **OAuth Token Management**: Automatic token refresh with SAP UAA
+- **Multi-Provider Load Balancing**: Round-robin or fallback strategies across multiple AI Core tenants with automatic 429 retry
+- **Model Aliases**: Wildcard pattern matching to route variant model names to configured deployments
+- **Extended Context**: `[1m]` model suffix auto-enables 1M context window for Claude models
+- **Token Quotas**: Per-API-key daily/monthly token limits with 429 rejection and Retry-After headers
+- **Request Logging**: SQLite-based request logging with token usage, configurable retention, and CLI usage reports
+- **Cost Estimation**: Per-model pricing config with `--cost` flag for estimated spend breakdown
+- **Terminal UI Dashboard**: Real-time TUI with metrics, active requests, and log viewer (`--tui` flag)
+- **CLI Administration**: Inspect deployments, resource groups, configure tools, view usage, and run diagnostics
+- **OAuth Token Management**: Automatic token refresh with SAP UAA and per-provider caching
 - **High Performance**: Built with Rust and async/await for maximum throughput
-- **Simple Configuration**: YAML config file only
-- **Cloud Ready**: Easy deployment with configuration management
+- **Simple Configuration**: Single YAML config file with CLI flag overrides
 
 ## Installation
 
@@ -77,9 +82,17 @@ Edit `~/.aicore/config.yaml` with your settings:
 log_level: INFO
 
 # API keys for authenticating requests (supports multiple keys)
+# Simple string format or object format with per-key quota overrides
 api_keys:
   - your-api-key-1
-  - your-api-key-2
+  - key: your-api-key-2
+    daily_token_limit: 0  # unlimited
+
+# Token quota defaults (optional)
+quotas:
+  enabled: true
+  daily_token_limit: 1000000
+  monthly_token_limit: 20000000
 
 # Multiple AI Core providers for load balancing
 providers:
@@ -101,33 +114,18 @@ providers:
     enabled: true
 
 # Server configuration
-port: 8900
-refresh_interval_secs: 600
+bind: "127.0.0.1:8900"
+refresh_interval_secs: 300
 
 # Model mappings (optional)
 # Models are now discovered automatically from your AI Core deployments.
 # You can still define them here to override or add custom mappings.
 models:
   - name: gpt-4o  # Auto-discover: uses 'gpt-4o' to find deployment
-  - name: claude-sonnet-4-5
-    aicore_model_name: anthropic--claude-4-sonnet  # Map to AI Core's model name
+  - name: claude-sonnet-4-6
+    aicore_model_name: anthropic--claude-4.6-sonnet  # Map to AI Core's model name
   - name: gemini-2.5-pro
     aicore_model_name: gemini-2.5-pro
-```
-
-### Legacy Single-Provider Configuration
-
-For backward compatibility, you can still use the `credentials` block for a single provider:
-```yaml
-# Legacy single-provider configuration
-credentials:
-  uaa_token_url: https://your-tenant.authentication.sap.hana.ondemand.com/oauth/token
-  uaa_client_id: your-client-id
-  uaa_client_secret: your-client-secret
-  aicore_api_url: https://api.ai.prod.sap.com
-  api_key: your-api-key  # Legacy: use api_keys at root level instead
-
-resource_group: your-resource-group
 ```
 
 ### API Endpoints
@@ -143,6 +141,7 @@ curl -X POST http://localhost:8900/v1/chat/completions \
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": true
   }'
+```
 
 #### Claude API
 ```bash
@@ -150,10 +149,10 @@ curl -X POST http://localhost:8900/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: $your_api_key" \
   -d '{
-    "model": "claude-sonnet-4",
+    "model": "claude-sonnet-4-6",
     "messages": [{"role": "user", "content": "Hello!"}],
     "max_tokens": 1000,
-    "stream: true
+    "stream": true
   }'
 ```
 
@@ -191,18 +190,129 @@ cargo test
 
 The AI Core Router includes a command-line interface (CLI) for administrative tasks.
 
+### Running the Server
+
+```bash
+# Start with default config (~/.aicore/config.yaml)
+acr
+
+# Custom bind address and config
+acr -b 0.0.0.0:9000 --config ./my-config.yaml
+
+# Override log level
+acr --log-level debug
+
+# Enable request logging
+acr --log-requests
+
+# Enable terminal UI dashboard (requires --features tui)
+acr --tui
+```
+
+### Diagnostics
+
+Print diagnostic information about the configuration:
+```bash
+acr diagnose
+```
+
 ### List Deployments
 
 List all deployments in a resource group:
 ```bash
-acr deployments list -r <your-resource-group>
+acr deployments -r <your-resource-group>
 ```
 
 ### List Resource Groups
 
 List all available resource groups:
 ```bash
-acr resource-group list
+acr resource-groups
+```
+
+### Token Usage
+
+Show per-key, per-model token usage statistics from the request database:
+```bash
+# Summary: today, this week, this month
+acr usage
+
+# Filter by API key
+acr usage <your-api-key>
+
+# Daily breakdown for past 7 days
+acr usage --daily 7
+
+# Weekly breakdown for past 4 weeks
+acr usage --weekly 4
+
+# Monthly breakdown for past 3 months
+acr usage --monthly 3
+```
+
+Requires request logging to be enabled via `--log-requests` flag or config:
+```yaml
+log_requests:
+  enabled: true                  # or use --log-requests flag
+  db_path: ~/.aicore/requests.db # default
+  retention_days: 30             # auto-cleanup on startup, 0 = keep forever
+```
+
+### Cost Estimation
+
+Add `--cost` to any usage command to display estimated costs alongside token counts:
+```bash
+# Today's usage with cost
+acr usage --cost
+
+# Daily breakdown with cost
+acr usage --daily 7 --cost
+
+# Filter by key with cost
+acr usage <your-api-key> --monthly 3 --cost
+```
+
+Cost estimation uses per-model pricing configured in the `models` section:
+```yaml
+models:
+  - name: claude-sonnet-4-6
+    aicore_model_name: anthropic--claude-4.6-sonnet
+    pricing:
+      input: 3.00        # $ per 1M input tokens
+      output: 15.00      # $ per 1M output tokens
+      cache_read: 0.30   # $ per 1M cache read tokens
+      cache_write: 3.75  # $ per 1M cache write tokens
+
+  - name: gpt-5-mini
+    pricing:
+      input: 0.25
+      output: 2.00
+      # cache_read/cache_write omitted — cost marked as partial (*)
+```
+
+**Rules:**
+- All pricing fields are optional — omitted fields contribute $0 to the estimate
+- If a model has token usage for a field with no rate configured, cost is flagged with `*` (partial)
+- Models with no `pricing` section show `N/A` in the cost column
+- The total cost row sums all models that have pricing configured
+
+### Manage Logs
+
+Clean up old request logs:
+```bash
+# Use retention_days from config (default: 30)
+acr logs clean
+
+# Override with specific number of days
+acr logs clean --days 7
+```
+
+### Configure Tools
+
+Auto-configure coding tools to use this router:
+```bash
+acr configure claude-code
+acr configure opencode
 ```
 
 ## Configuration Reference
@@ -280,16 +390,17 @@ At minimum, you need:
 | Config Path | Description |
 |-------------|-------------|
 | `api_keys` | List of API keys for accessing the router |
-| `providers` | At least one provider configuration (or legacy `credentials` block) |
+| `providers` | At least one provider configuration |
 
 ### Optional Configuration
 
 | Config File Path | Default | Description |
 |------------------|---------|-------------|
-| `port` | 8900 | Server port |
+| `bind` | `127.0.0.1:8900` | Bind address (IP or IP:PORT) |
 | `log_level` | INFO | Logging level |
-| `refresh_interval_secs` | 600 | Interval for refreshing model deployments |
+| `refresh_interval_secs` | 300 | Interval for refreshing model deployments |
 | `load_balancing` | round_robin | Load balancing strategy: `round_robin` or `fallback` |
+| `openai_api_version` | 2025-04-01-preview | Azure OpenAI API version used in query parameters |
 
 ### API Keys Configuration
 
@@ -302,12 +413,34 @@ api_keys:
   - shared-team-key
 ```
 
-**Environment Variables:**
-- `API_KEY`: Single API key (for backward compatibility)
-- `API_KEYS`: Comma-separated list of API keys
+### Token Quotas
 
-**Backward Compatibility:**
-The legacy `credentials.api_key` field is still supported for backward compatibility, but we recommend using the root-level `api_keys` array for new configurations.
+You can enforce per-API-key token usage limits with daily and monthly budgets. When a key exceeds its quota, requests are rejected with HTTP 429 and a `Retry-After` header.
+
+```yaml
+# Global quota defaults (apply to all keys unless overridden)
+quotas:
+  enabled: true
+  daily_token_limit: 1000000     # 1M tokens/day
+  monthly_token_limit: 20000000  # 20M tokens/month
+
+# API keys with optional per-key quota overrides
+api_keys:
+  - user-key-1                            # inherits global limits
+  - key: admin-key
+    daily_token_limit: 0                  # 0 = unlimited (overrides global)
+    monthly_token_limit: 0
+  - key: limited-key
+    daily_token_limit: 500000             # per-key override
+    monthly_token_limit: 10000000
+```
+
+**Rules:**
+- `0` = explicitly unlimited (overrides global default)
+- Omitted per-key limit = inherits global default
+- Omitted `quotas` section or `enabled: false` = no throttling (all keys unlimited)
+- Quotas reset at midnight UTC (daily) and 1st of month UTC (monthly)
+- Usage is persisted to SQLite and survives restarts (requires `--log-requests` or `log_requests.enabled: true`)
 
 ### Model Configuration
 
@@ -319,8 +452,8 @@ models:
   - name: gpt-4o
 
   # Mapped: when AI Core uses a different model name
-  - name: claude-sonnet-4-5
-    aicore_model_name: anthropic--claude-4-sonnet
+  - name: claude-sonnet-4-6
+    aicore_model_name: anthropic--claude-4.6-sonnet
 ```
 
 If no models are configured, the router will automatically discover them from your AI Core deployments.
@@ -331,11 +464,11 @@ You can configure alias patterns to match multiple model name variants to a sing
 
 ```yaml
 models:
-  - name: claude-sonnet-4-5
-    aicore_model_name: anthropic--claude-4-sonnet
+  - name: claude-sonnet-4-6
+    aicore_model_name: anthropic--claude-4.6-sonnet
     aliases:
-      - "claude-sonnet-4-5-*"      # Match: claude-sonnet-4-5-20250929, etc.
-      - "claude-4-sonnet"          # Exact alias
+      - "claude-sonnet-4-6-*"      # Match: claude-sonnet-4-6-20260101, etc.
+      - "claude-4.6-sonnet"        # Exact alias
 
   - name: gpt-4o
     aliases:
@@ -344,7 +477,7 @@ models:
 
 **Alias Pattern Syntax:**
 - **Exact match**: `"claude-4-sonnet"` matches only `claude-4-sonnet`
-- **Prefix match**: `"claude-sonnet-4-5-*"` matches any model starting with `claude-sonnet-4-5-`
+- **Prefix match**: `"claude-sonnet-4-6-*"` matches any model starting with `claude-sonnet-4-6-`
 
 **Resolution Priority:**
 1. **Exact name match**: Request matches a configured model name directly
@@ -354,8 +487,24 @@ models:
 **Conflict Resolution:**
 When multiple alias patterns match, the most specific pattern wins. Specificity is determined by the length of the literal prefix before the `*` wildcard.
 
-Example: For request `claude-sonnet-4-5-20250929`:
-- `claude-sonnet-4-5-*` (18 chars) wins over `claude-*` (7 chars)
+Example: For request `claude-sonnet-4-6-20260101`:
+- `claude-sonnet-4-6-*` (18 chars) wins over `claude-*` (7 chars)
+
+### Extended Context Window
+
+For Claude models that support 1M token context, append `[1m]` to the model name. The router will strip the suffix and automatically inject the required Anthropic beta header:
+
+```bash
+curl -X POST http://localhost:8900/v1/messages \
+  -H "x-api-key: $your_api_key" \
+  -d '{
+    "model": "claude-sonnet-4-6[1m]",
+    "messages": [{"role": "user", "content": "Analyze this large codebase..."}],
+    "max_tokens": 8192
+  }'
+```
+
+This is equivalent to manually setting the `Anthropic-Beta: context-1m-2025-08-07` header.
 
 ### Fallback Models
 
@@ -363,15 +512,15 @@ You can configure default fallback models for each model family. When a requeste
 
 ```yaml
 models:
-  - name: claude-sonnet-4-5
-    aicore_model_name: anthropic--claude-4-sonnet
+  - name: claude-sonnet-4-6
+    aicore_model_name: anthropic--claude-4.6-sonnet
   - name: gpt-4o
-  - name: gemini-1.5-pro
+  - name: gemini-2.5-pro
 
 fallback_models:
-  claude: claude-sonnet-4-5    # For models starting with "claude"
+  claude: claude-sonnet-4-6    # For models starting with "claude"
   openai: gpt-4o               # For models starting with "gpt" or "text"
-  gemini: gemini-1.5-pro       # For models starting with "gemini"
+  gemini: gemini-2.5-pro       # For models starting with "gemini"
 ```
 
 **Behavior:**
