@@ -136,7 +136,7 @@ impl<'a> ProxyRequestBuilder<'a> {
         let token = self.get_auth_token(&api_key, provider).await?;
 
         // Step 3: Resolve model and deployment for this provider
-        let (normalized_model, deployment_id, has_extended_context) =
+        let (normalized_model, deployment_id) =
             self.resolve_model_for_provider(provider).await?;
 
         // Step 4: Determine LLM family and stream flag
@@ -157,9 +157,9 @@ impl<'a> ProxyRequestBuilder<'a> {
         // Step 6b: Auto-enable each Claude model's maximum context window. Inject
         // the unlocking beta only when the model needs one (Sonnet 4 / 4.5 →
         // context-1m-2025-08-07; native-1M and 200k-only models get nothing).
-        // The client-side `[1m]` suffix is silently accepted (already stripped
-        // by `normalize_model`) for backward compatibility but no longer gates
-        // injection; capability-driven injection makes it a no-op.
+        // The client-side `[1m]` suffix is silently accepted as a backward-compat
+        // no-op — `normalize_model` strips it; capability-driven injection above
+        // is what actually enables max context.
         if matches!(family, LlmFamily::Claude)
             && let Some(beta) = crate::constants::get_extended_context_beta(&normalized_model)
         {
@@ -172,16 +172,6 @@ impl<'a> ProxyRequestBuilder<'a> {
                 );
                 anthropic_beta.push(feature);
             }
-        }
-        if has_extended_context
-            && matches!(family, LlmFamily::Claude)
-            && crate::constants::get_extended_context_beta(&normalized_model).is_none()
-        {
-            tracing::debug!(
-                "Client appended `[1m]` to model '{}' but its max context is already \
-                 native or has no extended-context beta — suffix accepted as no-op.",
-                normalized_model
-            );
         }
 
         // Step 7: For Claude, add anthropic_beta to body if any features were extracted
@@ -231,14 +221,13 @@ impl<'a> ProxyRequestBuilder<'a> {
     }
 
     /// Resolve model to deployment ID for a specific provider.
-    /// Returns (normalized_model, deployment_id, has_extended_context).
+    /// Returns (normalized_model, deployment_id).
     async fn resolve_model_for_provider(
         &self,
         provider: &Provider,
-    ) -> Result<(String, String, bool), AppError> {
-        let (normalized_model, has_extended_context) =
-            normalize_model(&self.params.model, self.params.model_registry)
-                .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    ) -> Result<(String, String), AppError> {
+        let normalized_model = normalize_model(&self.params.model, self.params.model_registry)
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
         // Try to get deployment for this specific provider
         if let Some(deployment_id) = self
@@ -247,7 +236,7 @@ impl<'a> ProxyRequestBuilder<'a> {
             .get_deployment_for_provider(&normalized_model, &provider.name)
             .await
         {
-            return Ok((normalized_model, deployment_id, has_extended_context));
+            return Ok((normalized_model, deployment_id));
         }
 
         // Model not available on this provider
@@ -608,21 +597,21 @@ impl ProxyRequest {
     }
 }
 
-/// Returns (resolved_model_name, has_extended_context).
-/// When the requested model ends with `[1m]`, the suffix is stripped before resolution
-/// and `has_extended_context` is set to true so the caller can inject the 1M context beta.
-fn normalize_model(model: &str, registry: &ModelRegistry) -> Result<(String, bool)> {
-    // Strip [1m] suffix if present
-    let (base_model, has_extended_context) =
-        if let Some(base) = model.strip_suffix(EXTENDED_CONTEXT_SUFFIX) {
-            (base, true)
-        } else {
-            (model, false)
-        };
+/// Resolve a client-supplied model name to a configured model name.
+///
+/// Strips the cosmetic `[1m]` suffix if present (silently accepted as a no-op
+/// for backward compat — capability-driven beta injection is what actually
+/// enables max context now), then resolves via:
+/// 1. Exact match against configured `models[].name`
+/// 2. Alias pattern match against configured `models[].aliases`
+/// 3. Family-fallback (claude/gemini/gpt/text) to a configured default
+/// 4. Pass-through unchanged
+fn normalize_model(model: &str, registry: &ModelRegistry) -> Result<String> {
+    let base_model = model.strip_suffix(EXTENDED_CONTEXT_SUFFIX).unwrap_or(model);
 
     // 1. Exact match - if the model exists in config, use it directly
     if registry.find_model_config(base_model).is_some() {
-        return Ok((base_model.to_string(), has_extended_context));
+        return Ok(base_model.to_string());
     }
 
     // 2. Alias pattern match - find by configured alias patterns
@@ -632,7 +621,7 @@ fn normalize_model(model: &str, registry: &ModelRegistry) -> Result<(String, boo
             base_model,
             matched_model.name
         );
-        return Ok((matched_model.name.clone(), has_extended_context));
+        return Ok(matched_model.name.clone());
     }
 
     // 3. Family fallback - determine family prefix and check for configured fallback
@@ -645,8 +634,9 @@ fn normalize_model(model: &str, registry: &ModelRegistry) -> Result<(String, boo
     } else if base_model.starts_with(TEXT_PREFIX) {
         TEXT_PREFIX
     } else {
-        // Unknown family, return as-is
-        return Ok((base_model.to_string(), has_extended_context));
+        // Unknown family, return as-is — `determine_family` will reject it later
+        // if it's not in any supported family.
+        return Ok(base_model.to_string());
     };
 
     // Try to get configured fallback for this family
@@ -659,10 +649,10 @@ fn normalize_model(model: &str, registry: &ModelRegistry) -> Result<(String, boo
             fallback_model,
             prefix
         );
-        return Ok((fallback_model.to_string(), has_extended_context));
+        return Ok(fallback_model.to_string());
     }
 
-    Ok((base_model.to_string(), has_extended_context))
+    Ok(base_model.to_string())
 }
 
 /// OpenAI o-series reasoning models: `o1`, `o3`, `o3-mini`, `o4-mini`, future `o5`/etc.
@@ -890,6 +880,8 @@ mod tests {
 
     #[test]
     fn test_normalize_model_with_1m_suffix() {
+        // The `[1m]` suffix is silently stripped (no error, no flag returned).
+        // Capability-driven beta injection is what actually enables max context.
         let models = vec![Model {
             name: "claude-opus-4-7".to_string(),
             aicore_model_name: None,
@@ -898,9 +890,8 @@ mod tests {
         }];
         let registry = create_test_registry(models);
 
-        let (name, extended) = normalize_model("claude-opus-4-7[1m]", &registry).unwrap();
+        let name = normalize_model("claude-opus-4-7[1m]", &registry).unwrap();
         assert_eq!(name, "claude-opus-4-7");
-        assert!(extended);
     }
 
     #[test]
@@ -913,9 +904,8 @@ mod tests {
         }];
         let registry = create_test_registry(models);
 
-        let (name, extended) = normalize_model("claude-opus-4-7", &registry).unwrap();
+        let name = normalize_model("claude-opus-4-7", &registry).unwrap();
         assert_eq!(name, "claude-opus-4-7");
-        assert!(!extended);
     }
 
     #[test]
@@ -928,10 +918,9 @@ mod tests {
         }];
         let registry = create_test_registry(models);
 
-        // Alias match with [1m] suffix
-        let (name, extended) = normalize_model("claude-opus-4-7-20250101[1m]", &registry).unwrap();
+        // Alias match with [1m] suffix — suffix stripped, then alias resolves.
+        let name = normalize_model("claude-opus-4-7-20250101[1m]", &registry).unwrap();
         assert_eq!(name, "claude-opus-4-7");
-        assert!(extended);
     }
 
     #[test]
@@ -954,14 +943,15 @@ mod tests {
             600,
         );
 
-        // Unknown claude model with [1m] should fall back to configured claude fallback
-        let (name, extended) = normalize_model("claude-unknown-model[1m]", &registry).unwrap();
+        // Unknown claude model with [1m] should strip the suffix and fall back.
+        let name = normalize_model("claude-unknown-model[1m]", &registry).unwrap();
         assert_eq!(name, "claude-sonnet-4-5");
-        assert!(extended);
     }
 
     #[test]
     fn test_normalize_model_1m_suffix_non_claude() {
+        // The suffix-strip is universal (not Claude-only); a non-Claude model name
+        // with `[1m]` is still cleaned. The suffix is a no-op for these families.
         let models = vec![Model {
             name: "gpt-4o".to_string(),
             aicore_model_name: None,
@@ -970,9 +960,8 @@ mod tests {
         }];
         let registry = create_test_registry(models);
 
-        let (name, extended) = normalize_model("gpt-4o[1m]", &registry).unwrap();
+        let name = normalize_model("gpt-4o[1m]", &registry).unwrap();
         assert_eq!(name, "gpt-4o");
-        assert!(extended);
     }
 
     // -------------------------------------------------------------------------
