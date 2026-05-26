@@ -650,3 +650,34 @@ impl IntoResponse for AppError {
         response
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_model_operation_accepts_well_formed_input() {
+        let (model, action) = parse_model_operation("gemini-2.5-flash:generateContent").unwrap();
+        assert_eq!(model, "gemini-2.5-flash");
+        assert_eq!(action, "generateContent");
+    }
+
+    #[test]
+    fn parse_model_operation_rejects_missing_action() {
+        assert!(parse_model_operation("gemini-2.5-flash").is_err());
+    }
+
+    #[test]
+    fn parse_model_operation_rejects_empty_components() {
+        assert!(parse_model_operation(":generateContent").is_err());
+        assert!(parse_model_operation("gemini-2.5-flash:").is_err());
+        assert!(parse_model_operation(":").is_err());
+    }
+
+    #[test]
+    fn parse_model_operation_rejects_multiple_colons() {
+        // A second colon would split unevenly; reject up front rather than
+        // ambiguously assigning it to the model or action.
+        assert!(parse_model_operation("foo:bar:baz").is_err());
+    }
+}
