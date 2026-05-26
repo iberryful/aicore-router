@@ -147,8 +147,7 @@ impl<'a> ProxyRequestBuilder<'a> {
         let token = self.get_auth_token(&api_key, provider).await?;
 
         // Step 3: Resolve model and deployment for this provider
-        let (normalized_model, deployment_id) =
-            self.resolve_model_for_provider(provider).await?;
+        let (normalized_model, deployment_id) = self.resolve_model_for_provider(provider).await?;
 
         // Step 4: Determine LLM family and stream flag.
         // Route-driven override takes priority — used by routes that are tied
@@ -369,8 +368,41 @@ impl ProxyRequest {
         }
 
         if self.stream {
+            // Peek the upstream's first chunks: if a rate-limit / throttling
+            // signal arrives before any forwardable data, surface as
+            // `RateLimited` so the existing 429-retry loop in
+            // `routes::execute_proxy_request` fails over to the next
+            // provider — the client never sees the failure. See
+            // `transforms::stream_classify` for per-family detection rules.
+            let mut byte_stream: futures::stream::BoxStream<
+                'static,
+                reqwest::Result<axum::body::Bytes>,
+            > = Box::pin(response.bytes_stream());
+            let peek_timeout = Duration::from_secs(crate::constants::api::STREAM_PEEK_TIMEOUT_SECS);
+            let (outcome, prebuffered) =
+                peek_classify_stream(&mut byte_stream, &self.family, peek_timeout).await;
+            match outcome {
+                PeekOutcome::RateLimited => {
+                    tracing::warn!(
+                        "Rate-limited mid-stream on original_model: {}, resolved_model: {}, provider: {}, time: {:.2}ms (failing over)",
+                        self.original_model,
+                        self.model,
+                        self.provider_name,
+                        start_time.elapsed().as_secs_f64() * 1000.0
+                    );
+                    return Ok(ProxyExecuteResult::RateLimited);
+                }
+                PeekOutcome::Transport(e) => {
+                    return Err(anyhow::anyhow!("upstream stream error during peek: {}", e));
+                }
+                PeekOutcome::Committed | PeekOutcome::PeekTimeout | PeekOutcome::StreamEnded => {}
+            }
+
             let response = self.handle_streaming_response(
-                response,
+                PreparedStream {
+                    stream: byte_stream,
+                    prebuffered,
+                },
                 start_time,
                 metrics,
                 #[cfg(feature = "db")]
@@ -447,7 +479,7 @@ impl ProxyRequest {
 
     fn handle_streaming_response(
         &self,
-        response: reqwest::Response,
+        prepared: PreparedStream,
         start_time: Instant,
         metrics: &MetricsService,
         #[cfg(feature = "db")] db_context: Option<DbContext>,
@@ -461,16 +493,67 @@ impl ProxyRequest {
         let provider_name = self.provider_name.clone();
         let family = self.family;
         let metrics = metrics.clone();
+        let PreparedStream {
+            mut stream,
+            prebuffered,
+        } = prepared;
 
         tokio::spawn(async move {
-            let mut stream = response.bytes_stream();
-            let mut byte_buf: Vec<u8> = Vec::new();
+            // Seed `byte_buf` with whatever the peek phase pulled from the
+            // upstream stream — those bytes were not consumed destructively
+            // and the same line-extraction logic below picks them up first.
+            let mut byte_buf: Vec<u8> = prebuffered;
             let mut token_stats = TokenStats::default();
             let mut client_gone = false;
             let mut stream_error = false;
             let chunk_timeout = Duration::from_secs(STREAMING_TIMEOUT_SECS);
 
+            // Drain whatever the peek phase already buffered before pulling
+            // any new chunks — otherwise a tiny initial response (rate-limit
+            // signals replaced post-peek by a normal event, etc.) could be
+            // mistaken for an idle stall.
             loop {
+                while let Some(pos) = byte_buf.iter().position(|&b| b == b'\n') {
+                    let line_bytes = byte_buf[..pos].to_vec();
+                    byte_buf.drain(..pos + 1);
+
+                    let line = match String::from_utf8(line_bytes) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!("Non-UTF-8 line in stream, skipping: {}", e);
+                            continue;
+                        }
+                    };
+                    let line = line.trim();
+
+                    if let Some(data) = line.strip_prefix(STREAM_DATA_PREFIX)
+                        && !data.is_empty()
+                    {
+                        if let Some(stats) = extract_token_stats(data, &family) {
+                            token_stats = stats
+                        }
+
+                        let mut output = String::new();
+
+                        if is_claude
+                            && let Ok(parsed) = serde_json::from_str::<Value>(data)
+                            && let Some(event_type) = parsed.get("type").and_then(|v| v.as_str())
+                        {
+                            output.push_str(&format!("event: {event_type}\n"));
+                        }
+
+                        output.push_str(&format!("{STREAM_DATA_PREFIX}{data}\n\n"));
+                        if tx.send(Ok(axum::body::Bytes::from(output))).await.is_err() {
+                            tracing::debug!("Client disconnected during streaming");
+                            client_gone = true;
+                            break;
+                        }
+                    }
+                }
+                if client_gone {
+                    break;
+                }
+
                 let chunk_result = match tokio::time::timeout(chunk_timeout, stream.next()).await {
                     Ok(Some(result)) => result,
                     Ok(None) => break, // Stream ended normally
@@ -486,52 +569,6 @@ impl ProxyRequest {
                 match chunk_result {
                     Ok(chunk) => {
                         byte_buf.extend_from_slice(&chunk);
-
-                        // Process complete lines from the byte buffer.
-                        // Only convert to String after finding a newline boundary,
-                        // so partial multi-byte UTF-8 sequences stay safely in byte_buf.
-                        while let Some(pos) = byte_buf.iter().position(|&b| b == b'\n') {
-                            let line_bytes = byte_buf[..pos].to_vec();
-                            byte_buf.drain(..pos + 1);
-
-                            let line = match String::from_utf8(line_bytes) {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    tracing::warn!("Non-UTF-8 line in stream, skipping: {}", e);
-                                    continue;
-                                }
-                            };
-                            let line = line.trim();
-
-                            if let Some(data) = line.strip_prefix(STREAM_DATA_PREFIX)
-                                && !data.is_empty()
-                            {
-                                // Extract token stats if available
-                                if let Some(stats) = extract_token_stats(data, &family) {
-                                    token_stats = stats
-                                }
-
-                                let mut output = String::new();
-
-                                if is_claude
-                                    && let Ok(parsed) = serde_json::from_str::<Value>(data)
-                                    && let Some(event_type) =
-                                        parsed.get("type").and_then(|v| v.as_str())
-                                {
-                                    output.push_str(&format!("event: {event_type}\n"));
-                                }
-
-                                output.push_str(&format!("{STREAM_DATA_PREFIX}{data}\n\n"));
-                                if tx.send(Ok(axum::body::Bytes::from(output))).await.is_err() {
-                                    tracing::debug!("Client disconnected during streaming");
-                                    client_gone = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if client_gone {
-                            break;
-                        }
                     }
                     Err(e) => {
                         tracing::error!("Stream error: {}", e);
@@ -722,12 +759,15 @@ fn prepare_body(body: &mut Value, family: &LlmFamily, stream: bool, model: &str)
         LlmFamily::Claude => crate::transforms::anthropic::prepare(body, model),
         LlmFamily::Gemini => crate::transforms::gemini::prepare(body),
         LlmFamily::OpenAi => crate::transforms::openai::prepare(body, stream),
-        // Responses API: transparent passthrough. The client's body is what AI Core /
-        // Azure OpenAI's `/responses` endpoint expects (input, max_output_tokens,
-        // previous_response_id, tools, instructions, etc.). Chat Completions transforms
-        // (max_tokens→max_completion_tokens, stream_options.include_usage merge,
-        // Codex-preamble normalization) do NOT apply to this API shape.
-        LlmFamily::OpenAiResponses => Ok(()),
+        // Responses API: filter `tools[]` to types AI Core / Azure currently
+        // accepts (`function`-only allowlist, mirrors what the upstream itself
+        // enforces — last verified 2026-05-26 against gpt-5.5) and reset
+        // `tool_choice` if it pointed at a dropped tool. Codex CLI v0.130+
+        // injects `custom` / `web_search` / `tool_search` / etc. that AI Core
+        // 400s on with no client-side flag to suppress.
+        // Re-probe AI Core periodically; if newer types become accepted,
+        // broaden `ALLOWED_TOOL_TYPES` in `transforms::openai_responses`.
+        LlmFamily::OpenAiResponses => crate::transforms::openai_responses::prepare(body),
     }
 }
 
@@ -800,6 +840,95 @@ fn extract_gemini_tokens(usage_metadata: &Value, streaming: bool) -> Option<Toke
             .and_then(|v| v.as_u64()),
         cache_write: None,
     })
+}
+
+/// Outcome of [`peek_classify_stream`] — describes what we learned from
+/// reading the upstream's first SSE chunks before committing to forwarding
+/// the response.
+enum PeekOutcome {
+    /// First parseable `data:` line was a normal event — proceed with the
+    /// existing forwarder.
+    Committed,
+    /// First parseable `data:` line signalled a rate-limit / throttling
+    /// failure. Caller should surface this as
+    /// [`ProxyExecuteResult::RateLimited`] so the existing retry loop in
+    /// `routes::execute_proxy_request` fails over to the next provider.
+    RateLimited,
+    /// Upstream stream ended before any `data:` line arrived. Proceed with
+    /// the forwarder anyway — it'll exit cleanly.
+    StreamEnded,
+    /// Peek window elapsed before any `data:` line arrived. Proceed with
+    /// the forwarder; the per-chunk timeout inside the forwarder
+    /// (`STREAMING_TIMEOUT_SECS`) is the real watchdog.
+    PeekTimeout,
+    /// Transport-level error reading from the upstream stream.
+    Transport(reqwest::Error),
+}
+
+/// Bundle of (remaining stream, bytes consumed during the peek) that the
+/// streaming forwarder needs to resume processing where the peek phase
+/// left off. They always travel together, so packaging them avoids the
+/// `too_many_arguments` lint on `handle_streaming_response`.
+struct PreparedStream {
+    stream: futures::stream::BoxStream<'static, reqwest::Result<axum::body::Bytes>>,
+    prebuffered: Vec<u8>,
+}
+
+/// Read upstream chunks until we either see a `data:` line we can classify
+/// (committing the stream forward to the client) or recognise a rate-limit
+/// signal that warrants a provider fallback. The buffered bytes (everything
+/// pulled from the stream during the peek) are returned so the caller can
+/// hand them to the forwarder, which re-parses them as-if it had read them
+/// itself.
+async fn peek_classify_stream(
+    stream: &mut futures::stream::BoxStream<'static, reqwest::Result<axum::body::Bytes>>,
+    family: &LlmFamily,
+    timeout: Duration,
+) -> (PeekOutcome, Vec<u8>) {
+    use crate::transforms::stream_classify::{EventDisposition, classify_first_event};
+    let mut buf: Vec<u8> = Vec::new();
+    // Position in `buf` where the next non-destructive line scan resumes —
+    // we re-walk only newly-arrived bytes, never the prefix the forwarder
+    // is going to re-process.
+    let mut scan_cursor = 0usize;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return (PeekOutcome::PeekTimeout, buf);
+        }
+        let next = match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(chunk))) => chunk,
+            Ok(Some(Err(e))) => return (PeekOutcome::Transport(e), buf),
+            Ok(None) => return (PeekOutcome::StreamEnded, buf),
+            Err(_) => return (PeekOutcome::PeekTimeout, buf),
+        };
+        buf.extend_from_slice(&next);
+
+        // Walk all complete lines newly visible in `buf` (non-destructive
+        // — bytes stay in `buf` for the forwarder).
+        while let Some(rel) = buf[scan_cursor..].iter().position(|&b| b == b'\n') {
+            let end = scan_cursor + rel;
+            let line_bytes = &buf[scan_cursor..end];
+            scan_cursor = end + 1;
+            let Ok(line) = std::str::from_utf8(line_bytes) else {
+                continue;
+            };
+            let line = line.trim();
+            let Some(data) = line.strip_prefix(STREAM_DATA_PREFIX) else {
+                continue;
+            };
+            if data.is_empty() {
+                continue;
+            }
+            match classify_first_event(data, family) {
+                EventDisposition::RateLimited => return (PeekOutcome::RateLimited, buf),
+                EventDisposition::Content => return (PeekOutcome::Committed, buf),
+                EventDisposition::Metadata => continue,
+            }
+        }
+    }
 }
 
 fn extract_token_stats(data: &str, family: &LlmFamily) -> Option<TokenStats> {
@@ -1274,5 +1403,140 @@ mod tests {
         .unwrap();
         assert!(url.ends_with("/responses?api-version=2025-04-01-preview"));
         assert!(!url.contains("/compact"));
+    }
+
+    /// Build a synthetic `BoxStream` from a list of pre-baked chunks for
+    /// driving `peek_classify_stream` in tests. Each chunk is delivered as
+    /// `Ok(Bytes)`; no transport errors are simulated.
+    fn synthetic_stream(
+        chunks: Vec<&'static str>,
+    ) -> futures::stream::BoxStream<'static, reqwest::Result<axum::body::Bytes>> {
+        let items: Vec<reqwest::Result<axum::body::Bytes>> = chunks
+            .into_iter()
+            .map(|c| Ok(axum::body::Bytes::from(c)))
+            .collect();
+        Box::pin(futures::stream::iter(items))
+    }
+
+    #[tokio::test]
+    async fn peek_flags_responses_rate_limit_event() {
+        let mut s = synthetic_stream(vec![
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"too_many_requests\",\"code\":\"too_many_requests\"}}\n\n",
+        ]);
+        let (outcome, _buf) =
+            peek_classify_stream(&mut s, &LlmFamily::OpenAiResponses, Duration::from_secs(2)).await;
+        assert!(matches!(outcome, PeekOutcome::RateLimited));
+    }
+
+    #[tokio::test]
+    async fn peek_commits_on_normal_responses_event() {
+        // A content-bearing event (`.delta`) should commit immediately —
+        // no need to keep peeking past it.
+        let mut s = synthetic_stream(vec![
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+        ]);
+        let (outcome, buf) =
+            peek_classify_stream(&mut s, &LlmFamily::OpenAiResponses, Duration::from_secs(2)).await;
+        assert!(matches!(outcome, PeekOutcome::Committed));
+        // Bytes are preserved so the forwarder can reprocess them.
+        assert!(
+            std::str::from_utf8(&buf)
+                .unwrap()
+                .contains("output_text.delta")
+        );
+    }
+
+    #[tokio::test]
+    async fn peek_skips_metadata_and_rate_limits_on_trailing_error() {
+        // Captured wire order from gpt-5.5 throttling:
+        // response.created -> response.failed -> error{too_many_requests}.
+        // Peek must skip the first two and surface the rate-limit signal
+        // from the trailing `error` event so the proxy fails over before
+        // any bytes reach the client.
+        let mut s = synthetic_stream(vec![
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r_1\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":null}}\n\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"too_many_requests\",\"code\":\"too_many_requests\"}}\n\n",
+        ]);
+        let (outcome, _buf) =
+            peek_classify_stream(&mut s, &LlmFamily::OpenAiResponses, Duration::from_secs(2)).await;
+        assert!(matches!(outcome, PeekOutcome::RateLimited));
+    }
+
+    #[tokio::test]
+    async fn peek_skips_metadata_and_commits_on_content() {
+        // Healthy stream: metadata events followed by a content delta.
+        let mut s = synthetic_stream(vec![
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r_1\"}}\n\n",
+            "data: {\"type\":\"response.in_progress\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+        ]);
+        let (outcome, _buf) =
+            peek_classify_stream(&mut s, &LlmFamily::OpenAiResponses, Duration::from_secs(2)).await;
+        assert!(matches!(outcome, PeekOutcome::Committed));
+    }
+
+    #[tokio::test]
+    async fn peek_handles_split_chunks() {
+        // Rate-limit JSON split mid-token across two chunks.
+        let mut s = synthetic_stream(vec![
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"too_many_",
+            "requests\",\"code\":\"too_many_requests\"}}\n",
+        ]);
+        let (outcome, _buf) =
+            peek_classify_stream(&mut s, &LlmFamily::OpenAiResponses, Duration::from_secs(2)).await;
+        assert!(matches!(outcome, PeekOutcome::RateLimited));
+    }
+
+    #[tokio::test]
+    async fn peek_skips_blank_and_comment_lines_before_data() {
+        // SSE keepalives / comments are common; peek should walk past them
+        // and eventually classify a real `data:` payload.
+        let mut s = synthetic_stream(vec![
+            ": keepalive\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+        ]);
+        let (outcome, _buf) =
+            peek_classify_stream(&mut s, &LlmFamily::OpenAiResponses, Duration::from_secs(2)).await;
+        assert!(matches!(outcome, PeekOutcome::Committed));
+    }
+
+    #[tokio::test]
+    async fn peek_returns_stream_ended_on_empty_upstream() {
+        let mut s = synthetic_stream(vec![]);
+        let (outcome, _buf) =
+            peek_classify_stream(&mut s, &LlmFamily::OpenAiResponses, Duration::from_secs(2)).await;
+        assert!(matches!(outcome, PeekOutcome::StreamEnded));
+    }
+
+    #[tokio::test]
+    async fn peek_flags_claude_throttling() {
+        let mut s = synthetic_stream(vec![
+            "data: {\"type\":\"error\",\"message\":\"ThrottlingException: Rate exceeded\"}\n\n",
+        ]);
+        let (outcome, _buf) =
+            peek_classify_stream(&mut s, &LlmFamily::Claude, Duration::from_secs(2)).await;
+        assert!(matches!(outcome, PeekOutcome::RateLimited));
+    }
+
+    #[tokio::test]
+    async fn peek_flags_gemini_resource_exhausted() {
+        let mut s = synthetic_stream(vec![
+            "data: {\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\"}}\n\n",
+        ]);
+        let (outcome, _buf) =
+            peek_classify_stream(&mut s, &LlmFamily::Gemini, Duration::from_secs(2)).await;
+        assert!(matches!(outcome, PeekOutcome::RateLimited));
+    }
+
+    #[tokio::test]
+    async fn peek_flags_openai_chat_rate_limit() {
+        let mut s = synthetic_stream(vec![
+            "data: {\"error\":{\"code\":\"rate_limit_exceeded\"}}\n\n",
+        ]);
+        let (outcome, _buf) =
+            peek_classify_stream(&mut s, &LlmFamily::OpenAi, Duration::from_secs(2)).await;
+        assert!(matches!(outcome, PeekOutcome::RateLimited));
     }
 }

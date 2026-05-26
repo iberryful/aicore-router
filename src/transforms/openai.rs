@@ -2,9 +2,8 @@
 //! Completions API** (`/chat/completions`) and **embeddings**.
 //!
 //! The **Responses API** (`/v1/responses`, used by Codex CLI v0.130+) is a
-//! different shape and bypasses this module entirely — its request body is
-//! forwarded transparently. See `proxy::prepare_body`'s
-//! `LlmFamily::OpenAiResponses` arm.
+//! different shape handled by `transforms::openai_responses` — see
+//! `proxy::prepare_body`'s `LlmFamily::OpenAiResponses` arm.
 //!
 //! Source-of-truth references:
 //! * Chat Completions API (`max_completion_tokens`, `stream_options.include_usage`,

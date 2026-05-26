@@ -421,8 +421,9 @@ pub async fn handle_openai_embeddings(
 
 /// OpenAI Responses API (`/v1/responses`). The route uniquely determines the
 /// API shape (Responses, not Chat Completions) regardless of model name, so we
-/// pass `force_family = Some(OpenAiResponses)`. The request body is forwarded
-/// transparently — `transforms::openai::prepare` does not run on this path.
+/// pass `force_family = Some(OpenAiResponses)`. The request body is filtered
+/// to the function-tools allowlist by `transforms::openai_responses` —
+/// `transforms::openai::prepare` does not run on this path.
 pub async fn handle_openai_responses(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,

@@ -641,7 +641,10 @@ mod tests {
         strip_cache_control_scope(obj);
 
         let cc = obj["tools"][0]["cache_control"].as_object().unwrap();
-        assert!(!cc.contains_key("scope"), "scope must be stripped from tool cache_control");
+        assert!(
+            !cc.contains_key("scope"),
+            "scope must be stripped from tool cache_control"
+        );
         assert_eq!(cc["type"], json!("ephemeral"));
     }
 

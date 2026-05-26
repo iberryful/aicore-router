@@ -7,5 +7,7 @@
 pub mod anthropic;
 pub mod gemini;
 pub mod openai;
+pub mod openai_responses;
+pub mod stream_classify;
 
 pub use anthropic::extract_anthropic_beta;
