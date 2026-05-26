@@ -42,6 +42,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/models", get(get_models))
         .route("/v1/chat/completions", post(handle_openai_chat))
         .route("/litellm/v1/chat/completions", post(handle_openai_chat))
+        .route("/v1/embeddings", post(handle_openai_embeddings))
         .route(
             "/openai/deployments/{model}/chat/completions",
             post(handle_azure_openai),
@@ -378,6 +379,29 @@ pub async fn handle_openai_chat(
         None,
         &client_ip,
         "/v1/chat/completions",
+    )
+    .await
+}
+
+/// OpenAI-canonical embeddings endpoint. The model name comes from the request
+/// body (`text-embedding-*` family); routing to the Azure OpenAI embeddings URL
+/// is handled by `proxy::build_url` based on the `text-` prefix.
+pub async fn handle_openai_embeddings(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, AppError> {
+    let model = extract_model_from_body(&body)?;
+    let client_ip = addr.ip().to_string();
+    execute_proxy_request(
+        &state,
+        &headers,
+        body,
+        &model,
+        None,
+        &client_ip,
+        "/v1/embeddings",
     )
     .await
 }

@@ -14,8 +14,8 @@ use axum::http::HeaderMap;
 use serde_json::{Map, Value, json};
 
 use crate::constants::api::{
-    ALLOWED_BETA_FEATURES, ANTHROPIC_BETA_HEADER, ANTHROPIC_DEFAULT_MAX_TOKENS, ANTHROPIC_VERSION,
-    BUDGET_RESERVE_MARGIN, MIN_BUDGET_TOKENS_FOR_THINKING,
+    ANTHROPIC_BETA_HEADER, ANTHROPIC_DEFAULT_MAX_TOKENS, ANTHROPIC_TO_BEDROCK_BETA_REMAP,
+    ANTHROPIC_VERSION, BUDGET_RESERVE_MARGIN, MIN_BUDGET_TOKENS_FOR_THINKING,
 };
 use crate::constants::models::CLAUDE_OPUS_4_7;
 
@@ -59,8 +59,13 @@ pub fn prepare(body: &mut Value, model: &str) -> Result<()> {
     Ok(())
 }
 
-/// Extract `anthropic-beta` header values and map to Bedrock-supported equivalents.
-/// Unknown features are silently dropped. Returns an empty vec if the header is absent.
+/// Parse the `Anthropic-Beta` header into a list of beta features for the Bedrock
+/// request body, applying the Anthropic→Bedrock name remap where necessary.
+///
+/// **Transparent passthrough:** unknown beta names are emitted unchanged so
+/// Bedrock can accept them as Anthropic adds new features. Only names in
+/// [`ANTHROPIC_TO_BEDROCK_BETA_REMAP`] are rewritten. Returns an empty vec if
+/// the header is absent or non-UTF-8.
 pub fn extract_anthropic_beta(headers: &HeaderMap) -> Vec<String> {
     let header_value = match headers.get(ANTHROPIC_BETA_HEADER) {
         Some(v) => match v.to_str() {
@@ -71,16 +76,17 @@ pub fn extract_anthropic_beta(headers: &HeaderMap) -> Vec<String> {
     };
 
     let mut features = Vec::new();
-    for feature in header_value.split(',') {
-        let feature = feature.trim().to_lowercase();
-        for &(anthropic_name, bedrock_name) in ALLOWED_BETA_FEATURES {
-            if feature == anthropic_name {
-                let bedrock_feature = bedrock_name.to_string();
-                if !features.contains(&bedrock_feature) {
-                    features.push(bedrock_feature);
-                }
-                break;
-            }
+    for raw in header_value.split(',') {
+        let feature = raw.trim().to_lowercase();
+        if feature.is_empty() {
+            continue;
+        }
+        let mapped = ANTHROPIC_TO_BEDROCK_BETA_REMAP
+            .iter()
+            .find_map(|&(anthropic, bedrock)| (feature == anthropic).then_some(bedrock.to_string()))
+            .unwrap_or(feature);
+        if !features.contains(&mapped) {
+            features.push(mapped);
         }
     }
     features
@@ -141,9 +147,16 @@ fn inject_cache_ttl(obj: &mut Map<String, Value>) {
     });
 }
 
-/// Walk every `cache_control` object inside a Claude request body — both top-level
-/// `system` content and each `messages[].content` block — and apply `f` to each.
-/// Centralizes the traversal so individual transforms focus on the per-block edit.
+/// Walk every `cache_control` object inside a Claude request body — top-level
+/// `system` content, every `messages[].content` block, and every entry in
+/// `tools[]` — and apply `f` to each. Centralizes the traversal so individual
+/// transforms focus on the per-block edit.
+///
+/// Per Anthropic's prompt-caching docs, `cache_control` is valid on tool
+/// definitions in the `tools` array (the first cacheable block in the
+/// `tools → system → messages` hierarchy), in addition to system and message
+/// content blocks. Bedrock rejects unknown sibling fields like `cache_control.scope`
+/// on tool definitions (verified empirically), so the walker must include `tools`.
 fn for_each_cache_control<F: FnMut(&mut Map<String, Value>)>(
     obj: &mut Map<String, Value>,
     mut f: F,
@@ -155,6 +168,14 @@ fn for_each_cache_control<F: FnMut(&mut Map<String, Value>)>(
         for message in messages.iter_mut() {
             if let Some(content) = message.get_mut("content") {
                 visit_cache_control_in_content(content, &mut f);
+            }
+        }
+    }
+    // Tool definitions can carry `cache_control` directly on the tool object.
+    if let Some(Value::Array(tools)) = obj.get_mut("tools") {
+        for tool in tools.iter_mut() {
+            if let Some(Value::Object(cc)) = tool.get_mut("cache_control") {
+                f(cc);
             }
         }
     }
@@ -241,6 +262,13 @@ fn clamp_thinking(obj: &mut Map<String, Value>) {
 
 /// Reports whether the resolved client-facing model name is Claude Opus 4.7.
 /// Receives the normalized name (e.g. `claude-opus-4-7`), not the AI Core internal name.
+///
+/// **TODO**: revisit gate when Opus 4.8+ ships. Bedrock deprecates
+/// `temperature` / `top_p` / `top_k` at the model level for 4.7 (verified via
+/// empirical probe against AI Core); future versions will likely keep the same
+/// constraint and will silently bypass the strip in `apply_opus_4_7_overrides`
+/// if not added here. hai-proxy and LiteLLM both have the same exact-match
+/// shape and will need the same update.
 fn is_opus_4_7(model: &str) -> bool {
     model == CLAUDE_OPUS_4_7
 }
@@ -463,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_anthropic_beta_maps_known_features() {
+    fn extract_anthropic_beta_remaps_known_features() {
         let mut headers = HeaderMap::new();
         headers.insert(
             ANTHROPIC_BETA_HEADER,
@@ -472,20 +500,41 @@ mod tests {
                 .unwrap(),
         );
         let beta = extract_anthropic_beta(&headers);
-        // `advanced-tool-use-*` maps to `tool-search-tool-2025-10-19` (per ALLOWED_BETA_FEATURES)
+        // `advanced-tool-use-*` is remapped to its Bedrock-equivalent name.
         assert!(beta.contains(&"context-1m-2025-08-07".to_string()));
         assert!(beta.contains(&"tool-search-tool-2025-10-19".to_string()));
     }
 
     #[test]
-    fn extract_anthropic_beta_drops_unknown_features() {
+    fn extract_anthropic_beta_passes_through_unknown_features() {
+        // Per the transparent-proxy principle: features not in the remap table
+        // are emitted unchanged. Bedrock decides what it supports.
         let mut headers = HeaderMap::new();
         headers.insert(
             ANTHROPIC_BETA_HEADER,
-            "made-up-feature-2099".parse().unwrap(),
+            "made-up-future-beta-2099-01-01".parse().unwrap(),
         );
-        assert!(extract_anthropic_beta(&headers).is_empty());
+        let beta = extract_anthropic_beta(&headers);
+        assert_eq!(beta, vec!["made-up-future-beta-2099-01-01".to_string()]);
     }
+
+    #[test]
+    fn extract_anthropic_beta_deduplicates_after_remap() {
+        // Both names map to the same Bedrock name; result should appear once.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ANTHROPIC_BETA_HEADER,
+            "advanced-tool-use-2025-11-20, tool-search-tool-2025-10-19"
+                .parse()
+                .unwrap(),
+        );
+        let beta = extract_anthropic_beta(&headers);
+        assert_eq!(beta, vec!["tool-search-tool-2025-10-19".to_string()]);
+    }
+
+    // (note: previous "extract_anthropic_beta_drops_unknown_features" test was
+    // removed — the function now passes through unknown betas. See
+    // `extract_anthropic_beta_passes_through_unknown_features` above.)
 
     #[test]
     fn clamp_thinking_disables_when_max_tokens_too_small() {
@@ -571,6 +620,66 @@ mod tests {
             .as_object()
             .unwrap();
         assert!(!cc.contains_key("ttl"));
+    }
+
+    // -------------------------------------------------------------------------
+    // tools[] cache_control coverage
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn strip_cache_control_scope_removes_scope_from_tools() {
+        let mut body = json!({
+            "tools": [{
+                "name": "weather",
+                "description": "Get the weather",
+                "input_schema": {"type": "object", "properties": {}},
+                "cache_control": {"type": "ephemeral", "scope": "session"}
+            }],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let obj = body.as_object_mut().unwrap();
+        strip_cache_control_scope(obj);
+
+        let cc = obj["tools"][0]["cache_control"].as_object().unwrap();
+        assert!(!cc.contains_key("scope"), "scope must be stripped from tool cache_control");
+        assert_eq!(cc["type"], json!("ephemeral"));
+    }
+
+    #[test]
+    fn inject_cache_ttl_writes_to_tool_cache_control() {
+        let mut body = json!({
+            "tools": [{
+                "name": "weather",
+                "description": "Get the weather",
+                "input_schema": {"type": "object", "properties": {}},
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let obj = body.as_object_mut().unwrap();
+        inject_cache_ttl(obj);
+
+        assert_eq!(obj["tools"][0]["cache_control"]["ttl"], json!("1h"));
+    }
+
+    #[test]
+    fn prepare_strips_and_extends_ttl_on_tool_cache_control() {
+        // End-to-end through prepare(): a tool with both scope (must be stripped)
+        // and no ttl (must be injected).
+        let mut body = json!({
+            "tools": [{
+                "name": "weather",
+                "description": "Get the weather",
+                "input_schema": {"type": "object", "properties": {}},
+                "cache_control": {"type": "ephemeral", "scope": "session"}
+            }],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        prepare(&mut body, "claude-sonnet-4-6").unwrap();
+
+        let cc = body["tools"][0]["cache_control"].as_object().unwrap();
+        assert!(!cc.contains_key("scope"));
+        assert_eq!(cc["ttl"], json!("1h"));
     }
 
     #[test]

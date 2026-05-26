@@ -47,6 +47,12 @@ fn strip_function_response_ids(obj: &mut Map<String, Value>) {
 /// Convert `thinkingConfig.thinkingBudget: 0` → `-1`. Some clients send `0` to mean
 /// "dynamic / model decides", but Google's API treats `0` as "thinking disabled".
 /// The `-1` value is the documented dynamic-budget sentinel.
+///
+/// **Note on transparency**: this rewrites client intent. acr deliberately
+/// trades strict transparency here for the more commonly-meant interpretation
+/// (`0` = dynamic), matching the behavior of Anthropic-style SDKs that
+/// originated the convention. A client that genuinely wants thinking disabled
+/// can pass an explicit `-1` (won't be touched) or omit the block entirely.
 fn fix_thinking_budget(obj: &mut Map<String, Value>) {
     if let Some(config) = obj.get_mut("generationConfig")
         && let Some(thinking_config) = config.get_mut("thinkingConfig")

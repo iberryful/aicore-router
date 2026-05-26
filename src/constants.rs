@@ -37,22 +37,24 @@ pub mod api {
     pub const AI_CLIENT_TYPE_HEADER: &str = "ai-client-type";
     pub const AI_CLIENT_TYPE_VALUE: &str = "aicore-router";
 
-    // Anthropic-Beta header and allowed Bedrock beta features
+    // Anthropic-Beta header and Anthropic→Bedrock beta-name remap
     pub const ANTHROPIC_BETA_HEADER: &str = "anthropic-beta";
 
-    /// Maps Anthropic beta feature names to Bedrock-supported equivalents.
-    /// Features not in this list are silently dropped.
-    pub const ALLOWED_BETA_FEATURES: &[(&str, &str)] = &[
+    /// Maps Anthropic beta feature names to Bedrock-supported equivalents where
+    /// they differ. This is **not** a filter — beta names not present in this
+    /// table are passed through to Bedrock unchanged. Bedrock decides whether
+    /// it supports them; clients adopting future Anthropic betas don't need an
+    /// acr release to use them.
+    pub const ANTHROPIC_TO_BEDROCK_BETA_REMAP: &[(&str, &str)] = &[
         (
             "fine-grained-tool-streaming-2025-05-14",
             "fine-grained-tool-streaming-2025-05-14",
         ),
         ("tool-search-tool-2025-10-19", "tool-search-tool-2025-10-19"),
         ("tool-examples-2025-10-29", "tool-examples-2025-10-29"),
-        (
-            "advanced-tool-use-2025-11-20",
-            "tool-search-tool-2025-10-19",
-        ),
+        // `advanced-tool-use-2025-11-20` is the Anthropic-native name; on Bedrock
+        // the equivalent capability ships under `tool-search-tool-2025-10-19`.
+        ("advanced-tool-use-2025-11-20", "tool-search-tool-2025-10-19"),
         ("context-1m-2025-08-07", "context-1m-2025-08-07"),
     ];
 
@@ -73,56 +75,82 @@ pub mod api {
     pub const STREAMING_TIMEOUT_SECS: u64 = 300;
 }
 
-/// Returns the known context window size (input tokens) for a model, based on its name.
-/// Uses prefix matching to handle versioned model names (e.g. "claude-sonnet-4-5-20250929").
-/// Returns `None` for unrecognized models.
-pub fn get_context_length(model: &str) -> Option<u64> {
-    static CONTEXT_LENGTHS: &[(&str, u64)] = &[
-        // --- Anthropic Claude (via AWS Bedrock) ---
-        // Claude Opus 4.6 / 4.7 and Sonnet 4.6: native 1M context
-        ("claude-opus-4-7", 1_000_000),
-        ("claude-opus-4-6", 1_000_000),
-        ("claude-sonnet-4-6", 1_000_000),
-        // Claude Sonnet 4.5 and older, Haiku: 200k (1M only via [1m] beta)
-        ("claude-opus-4", 200_000),
-        ("claude-sonnet-4", 200_000),
-        ("claude-haiku-4", 200_000),
-        ("claude-3-haiku", 200_000),
-        // --- OpenAI (via Azure) ---
-        // GPT-5.5 / GPT-5.5-pro / GPT-5.4: 1.05M context
-        ("gpt-5.5", 1_050_000),
-        ("gpt-5.4-mini", 400_000),
-        ("gpt-5.4-nano", 400_000),
-        ("gpt-5.4", 1_050_000),
-        // GPT-5 through GPT-5.3: 400k context
-        ("gpt-5", 400_000),
-        // GPT-4.1 family (including mini/nano): ~1M (1,047,576)
-        ("gpt-4.1", 1_047_576),
-        // GPT-4o / GPT-4o-mini: 128k
-        ("gpt-4o", 128_000),
-        // --- OpenAI o-series reasoning ---
-        ("o4-mini", 200_000),
-        ("o3-mini", 200_000),
-        ("o3", 200_000),
-        ("o1", 200_000),
-        // --- Google Gemini (via GCP Vertex AI) ---
-        // All Gemini 2.0+ models: 1M context
-        ("gemini-3", 1_048_576),
-        ("gemini-2.5", 1_048_576),
-        ("gemini-2.0", 1_048_576),
-        // --- Embedding models ---
-        ("text-embedding-3-large", 8_192),
-        ("text-embedding-3-small", 8_192),
-        ("text-embedding", 8_192),
-    ];
+/// Per-model context-window capabilities. `max` is the largest input-token count
+/// the model can accept; `beta` is the `Anthropic-Beta` header value (if any) that
+/// must be set on the request to unlock that maximum. `beta: None` means `max` is
+/// the native default — no header required.
+struct ContextCaps {
+    max: u64,
+    beta: Option<&'static str>,
+}
 
-    // Try prefix matching — entries are ordered so more specific prefixes come first
-    for &(prefix, length) in CONTEXT_LENGTHS {
+/// Prefix-matched table of model context capabilities.
+/// Entries ordered most-specific-first so longer prefixes win.
+static MODEL_CONTEXT_CAPS: &[(&str, ContextCaps)] = &[
+    // --- Anthropic Claude (via AWS Bedrock) ---
+    // Native 1M context (no beta needed):
+    ("claude-opus-4-7",   ContextCaps { max: 1_000_000, beta: None }),
+    ("claude-opus-4-6",   ContextCaps { max: 1_000_000, beta: None }),
+    ("claude-sonnet-4-6", ContextCaps { max: 1_000_000, beta: None }),
+    // 1M via context-1m-2025-08-07 beta (200k native, beta unlocks 1M):
+    ("claude-sonnet-4-5", ContextCaps { max: 1_000_000, beta: Some(api::CONTEXT_1M_BETA) }),
+    ("claude-sonnet-4",   ContextCaps { max: 1_000_000, beta: Some(api::CONTEXT_1M_BETA) }),
+    // 200k models (no extended-context beta available):
+    ("claude-opus-4-5",   ContextCaps { max: 200_000, beta: None }),
+    ("claude-opus-4-1",   ContextCaps { max: 200_000, beta: None }),
+    ("claude-opus-4",     ContextCaps { max: 200_000, beta: None }), // catch-all for older Opus 4 variants
+    ("claude-haiku-4",    ContextCaps { max: 200_000, beta: None }), // includes claude-haiku-4-5
+    ("claude-3-haiku",    ContextCaps { max: 200_000, beta: None }),
+    // --- OpenAI (via Azure) ---
+    // GPT-5.5 / GPT-5.5-pro / GPT-5.4: 1.05M context
+    ("gpt-5.5",      ContextCaps { max: 1_050_000, beta: None }),
+    ("gpt-5.4-mini", ContextCaps { max:   400_000, beta: None }),
+    ("gpt-5.4-nano", ContextCaps { max:   400_000, beta: None }),
+    ("gpt-5.4",      ContextCaps { max: 1_050_000, beta: None }),
+    // GPT-5 through GPT-5.3: 400k context
+    ("gpt-5",   ContextCaps { max: 400_000, beta: None }),
+    // GPT-4.1 family (including mini/nano): ~1M (1,047,576)
+    ("gpt-4.1", ContextCaps { max: 1_047_576, beta: None }),
+    // GPT-4o / GPT-4o-mini: 128k
+    ("gpt-4o",  ContextCaps { max: 128_000, beta: None }),
+    // OpenAI o-series reasoning: all 200k
+    ("o4-mini", ContextCaps { max: 200_000, beta: None }),
+    ("o3-mini", ContextCaps { max: 200_000, beta: None }),
+    ("o3",      ContextCaps { max: 200_000, beta: None }),
+    ("o1",      ContextCaps { max: 200_000, beta: None }),
+    // --- Google Gemini (via GCP Vertex AI) ---
+    // All Gemini 2.0+ models: 1M context
+    ("gemini-3",   ContextCaps { max: 1_048_576, beta: None }),
+    ("gemini-2.5", ContextCaps { max: 1_048_576, beta: None }),
+    ("gemini-2.0", ContextCaps { max: 1_048_576, beta: None }),
+    // --- Embedding models ---
+    ("text-embedding-3-large", ContextCaps { max: 8_192, beta: None }),
+    ("text-embedding-3-small", ContextCaps { max: 8_192, beta: None }),
+    ("text-embedding",         ContextCaps { max: 8_192, beta: None }),
+];
+
+fn get_context_caps(model: &str) -> Option<&'static ContextCaps> {
+    for (prefix, caps) in MODEL_CONTEXT_CAPS {
         if model.starts_with(prefix) {
-            return Some(length);
+            return Some(caps);
         }
     }
     None
+}
+
+/// Returns the maximum context window (in input tokens) the model can accept.
+/// Includes capacity unlocked by an extended-context beta — see
+/// [`get_extended_context_beta`] for whether a header is required to actually
+/// reach the returned value. Returns `None` for unrecognized models.
+pub fn get_context_length(model: &str) -> Option<u64> {
+    get_context_caps(model).map(|c| c.max)
+}
+
+/// Returns the `Anthropic-Beta` header value required to unlock this model's
+/// maximum context window, or `None` when the maximum is native (no beta needed)
+/// or the model is unrecognized.
+pub fn get_extended_context_beta(model: &str) -> Option<&'static str> {
+    get_context_caps(model).and_then(|c| c.beta)
 }
 
 pub mod config {

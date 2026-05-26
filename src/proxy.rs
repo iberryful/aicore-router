@@ -140,7 +140,7 @@ impl<'a> ProxyRequestBuilder<'a> {
             self.resolve_model_for_provider(provider).await?;
 
         // Step 4: Determine LLM family and stream flag
-        let family = determine_family(&normalized_model);
+        let family = determine_family(&normalized_model)?;
         let stream = extract_stream_flag(&self.params.body, &family, &self.params.action);
 
         // Step 5: Prepare request body
@@ -154,16 +154,34 @@ impl<'a> ProxyRequestBuilder<'a> {
             vec![]
         };
 
-        // Step 6b: Auto-inject 1M context beta if model was requested with [1m] suffix
-        if has_extended_context && matches!(family, LlmFamily::Claude) {
-            let feature = CONTEXT_1M_BETA.to_string();
+        // Step 6b: Auto-enable each Claude model's maximum context window. Inject
+        // the unlocking beta only when the model needs one (Sonnet 4 / 4.5 →
+        // context-1m-2025-08-07; native-1M and 200k-only models get nothing).
+        // The client-side `[1m]` suffix is silently accepted (already stripped
+        // by `normalize_model`) for backward compatibility but no longer gates
+        // injection; capability-driven injection makes it a no-op.
+        if matches!(family, LlmFamily::Claude)
+            && let Some(beta) = crate::constants::get_extended_context_beta(&normalized_model)
+        {
+            let feature = beta.to_string();
             if !anthropic_beta.contains(&feature) {
-                tracing::info!(
-                    "Auto-enabling 1M extended context for model '{}'",
+                tracing::debug!(
+                    "Auto-enabling extended-context beta '{}' for model '{}'",
+                    beta,
                     normalized_model
                 );
                 anthropic_beta.push(feature);
             }
+        }
+        if has_extended_context
+            && matches!(family, LlmFamily::Claude)
+            && crate::constants::get_extended_context_beta(&normalized_model).is_none()
+        {
+            tracing::debug!(
+                "Client appended `[1m]` to model '{}' but its max context is already \
+                 native or has no extended-context beta — suffix accepted as no-op.",
+                normalized_model
+            );
         }
 
         // Step 7: For Claude, add anthropic_beta to body if any features were extracted
@@ -647,13 +665,35 @@ fn normalize_model(model: &str, registry: &ModelRegistry) -> Result<(String, boo
     Ok((base_model.to_string(), has_extended_context))
 }
 
-fn determine_family(model: &str) -> LlmFamily {
+/// OpenAI o-series reasoning models: `o1`, `o3`, `o3-mini`, `o4-mini`, future `o5`/etc.
+/// Pattern: `o` followed by one or more digits, optionally a `-<variant>` suffix.
+static O_SERIES_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^o\d+(-[a-z]+)?$").unwrap());
+
+/// Map a normalized model name to one of the three LLM families acr supports.
+///
+/// Strict allowlist: Claude (Anthropic via Bedrock), Gemini (Google via Vertex),
+/// OpenAI (GPT / o-series / text-embedding via Azure). acr is purpose-built for
+/// SAP AI Core's three-family deployment surface; routing requests for other
+/// AI Core backends (Mistral, Cohere, Nova, RPT, Perplexity, etc.) is explicitly
+/// out of scope — those clients should use the AI Core SDK directly.
+fn determine_family(model: &str) -> Result<LlmFamily, AppError> {
     if model.starts_with(CLAUDE_PREFIX) {
-        LlmFamily::Claude
+        Ok(LlmFamily::Claude)
     } else if model.starts_with(GEMINI_PREFIX) {
-        LlmFamily::Gemini
+        Ok(LlmFamily::Gemini)
+    } else if model.starts_with(GPT_PREFIX)
+        || model.starts_with(TEXT_PREFIX)
+        || O_SERIES_RE.is_match(model)
+    {
+        Ok(LlmFamily::OpenAi)
     } else {
-        LlmFamily::OpenAi
+        Err(AppError::BadRequest(format!(
+            "Model '{model}' is not in a family acr supports. acr only routes \
+             Claude (Anthropic), Gemini (Google), and OpenAI GPT / o-series / \
+             text-embedding-* models. Use the SAP AI Core SDK directly for other \
+             backends (Mistral, Cohere, Nova, RPT, Perplexity, etc.)."
+        )))
     }
 }
 
@@ -933,5 +973,57 @@ mod tests {
         let (name, extended) = normalize_model("gpt-4o[1m]", &registry).unwrap();
         assert_eq!(name, "gpt-4o");
         assert!(extended);
+    }
+
+    // -------------------------------------------------------------------------
+    // determine_family — strict allowlist
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn determine_family_routes_known_prefixes() {
+        assert!(matches!(
+            determine_family("claude-sonnet-4-6").unwrap(),
+            LlmFamily::Claude
+        ));
+        assert!(matches!(
+            determine_family("gemini-2.5-pro").unwrap(),
+            LlmFamily::Gemini
+        ));
+        assert!(matches!(
+            determine_family("gpt-5.4").unwrap(),
+            LlmFamily::OpenAi
+        ));
+        assert!(matches!(
+            determine_family("text-embedding-3-small").unwrap(),
+            LlmFamily::OpenAi
+        ));
+    }
+
+    #[test]
+    fn determine_family_o_series_via_regex() {
+        for model in ["o1", "o3", "o3-mini", "o4-mini", "o5", "o6-preview"] {
+            assert!(
+                matches!(determine_family(model).unwrap(), LlmFamily::OpenAi),
+                "{model} should route to OpenAi via o-series regex"
+            );
+        }
+    }
+
+    #[test]
+    fn determine_family_rejects_unsupported_backends() {
+        for model in [
+            "nova-lite",
+            "amazon--nova-pro",
+            "mistralai--mistral-large-instruct",
+            "cohere--command-a-reasoning",
+            "sap-rpt-1-large",
+            "sonar-pro",
+        ] {
+            let err = determine_family(model).unwrap_err();
+            assert!(
+                matches!(err, AppError::BadRequest(_)),
+                "{model} should be rejected with BadRequest, got {err:?}"
+            );
+        }
     }
 }

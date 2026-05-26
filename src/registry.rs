@@ -374,25 +374,43 @@ impl ModelRegistry {
     }
 }
 
-/// Check if a glob pattern matches a string.
-/// Only supports trailing `*` wildcard (prefix matching).
-/// Returns the specificity (length of literal prefix) if matches, None otherwise.
-/// Higher specificity = more specific match.
+/// Check if a glob pattern matches a string. `*` is a wildcard matching any
+/// character sequence (including empty) and may appear anywhere in the pattern;
+/// all other characters match literally.
+///
+/// Returns the specificity (length of the literal portion — sum of segment
+/// lengths between `*`s) when the pattern matches, `None` otherwise. Higher
+/// specificity = more specific match, used to break ties between competing
+/// alias patterns.
+///
+/// Examples:
+/// - `claude-*-sonnet` matches `claude-4.6-sonnet` with specificity 14
+/// - `*-haiku-*` matches `claude-haiku-4-5` with specificity 7
+/// - `claude-*` matches `claude-anything` with specificity 7 (trailing-only is the common case)
+/// - `claude-opus-4-7` exact-matches only `claude-opus-4-7` with specificity 15
 fn glob_matches(pattern: &str, input: &str) -> Option<usize> {
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        // Pattern ends with *: prefix match
-        if input.starts_with(prefix) {
-            Some(prefix.len()) // Specificity = length of literal part
-        } else {
-            None
+    // Fast paths first.
+    if !pattern.contains('*') {
+        return (pattern == input).then_some(pattern.len());
+    }
+    // Convert glob to regex anchored at both ends; escape regex metacharacters
+    // in literal segments so e.g. `claude-4.6-*` doesn't treat `.` as wildcard.
+    let mut re = String::with_capacity(pattern.len() + 4);
+    re.push('^');
+    for (i, segment) in pattern.split('*').enumerate() {
+        if i > 0 {
+            re.push_str(".*");
         }
+        re.push_str(&regex::escape(segment));
+    }
+    re.push('$');
+    let regex = regex::Regex::new(&re).ok()?;
+    if regex.is_match(input) {
+        // Specificity: total literal length (everything except the `*`s).
+        let literal_len: usize = pattern.split('*').map(|s| s.len()).sum();
+        Some(literal_len)
     } else {
-        // No wildcard: exact match only
-        if pattern == input {
-            Some(pattern.len())
-        } else {
-            None
-        }
+        None
     }
 }
 
@@ -451,6 +469,32 @@ mod tests {
         assert!(specific.unwrap() > general.unwrap());
         assert_eq!(specific.unwrap(), 18);
         assert_eq!(general.unwrap(), 7);
+    }
+
+    #[test]
+    fn test_glob_matches_mid_string_wildcard() {
+        // `*` may now appear anywhere in the pattern
+        assert_eq!(
+            glob_matches("claude-*-sonnet", "claude-4.6-sonnet"),
+            Some(14) // "claude-" (7) + "-sonnet" (7) = 14
+        );
+        assert!(glob_matches("claude-*-sonnet", "claude-4-sonnet").is_some());
+        assert!(glob_matches("claude-*-sonnet", "claude-haiku").is_none());
+    }
+
+    #[test]
+    fn test_glob_matches_leading_and_trailing_wildcards() {
+        // `*-haiku-*` matches anything containing `-haiku-`
+        assert_eq!(glob_matches("*-haiku-*", "claude-haiku-4-5"), Some(7));
+        assert!(glob_matches("*-haiku-*", "claude-haiku").is_none()); // no trailing dash
+        assert!(glob_matches("*haiku*", "claude-haiku-4-5").is_some());
+    }
+
+    #[test]
+    fn test_glob_matches_escapes_regex_metachars_in_literal_segments() {
+        // The `.` in `4.6` must match literally, not as regex `.`
+        assert!(glob_matches("claude-4.6-*", "claude-4.6-sonnet").is_some());
+        assert!(glob_matches("claude-4.6-*", "claude-4x6-sonnet").is_none());
     }
 
     fn create_test_registry(models: Vec<Model>) -> ModelRegistry {

@@ -43,6 +43,7 @@ crossterm = { version = "0.28", optional = true }
 shellexpand = "3.1.2"
 comfy-table = "7"
 governor = "0.10.4"
+regex = "1.12.3"
 
 [profile.release]
 strip = true
