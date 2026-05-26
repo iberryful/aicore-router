@@ -825,10 +825,23 @@ fn extract_token_stats(data: &str, family: &LlmFamily) -> Option<TokenStats> {
         }
         LlmFamily::OpenAiResponses => {
             // Responses API streams a sequence of `data: {"type": "...", ...}` events.
-            // Usage only appears on the terminal `response.completed` event at
-            // `response.usage.*`. All earlier events (response.created,
-            // response.in_progress, response.output_item.added, etc.) carry no usage.
-            if parsed.get("type")?.as_str()? != "response.completed" {
+            // Usage appears on the terminal event regardless of completion status:
+            // - `response.completed` — happy path
+            // - `response.incomplete` — stream ended before natural completion
+            //   (e.g., max_output_tokens hit, content_filter, or other truncation
+            //   reasons; usage is still populated)
+            // - `response.failed` — upstream error after stream started; usage is
+            //   still emitted with whatever was consumed before the failure
+            //
+            // Earlier events (response.created, response.in_progress,
+            // response.output_item.added, response.output_text.delta, etc.)
+            // carry no usage. Cross-validated against LiteLLM's
+            // `responses/streaming_iterator.py` terminal-event handling.
+            let event_type = parsed.get("type")?.as_str()?;
+            if !matches!(
+                event_type,
+                "response.completed" | "response.incomplete" | "response.failed"
+            ) {
                 return None;
             }
             let usage = parsed.get("response")?.get("usage")?;
@@ -1108,6 +1121,32 @@ mod tests {
         let stats = extract_token_stats(event, &LlmFamily::OpenAiResponses).unwrap();
         assert_eq!(stats.input_tokens, Some(8));
         assert_eq!(stats.output_tokens, Some(5));
+    }
+
+    #[test]
+    fn extract_token_stats_responses_incomplete_and_failed_also_yield_usage() {
+        // `response.incomplete` (e.g., max_output_tokens hit) and `response.failed`
+        // (upstream error) both carry usage. Verified live against AI Core: a stream
+        // with max_output_tokens=16 terminated as `response.incomplete` with
+        // usage = {input_tokens: 12, output_tokens: 16}. Pre-fix acr logged N/A.
+        for terminal_type in ["response.incomplete", "response.failed"] {
+            let event = format!(
+                r#"{{
+                    "type": "{terminal_type}",
+                    "response": {{
+                        "usage": {{
+                            "input_tokens": 12,
+                            "output_tokens": 16,
+                            "input_tokens_details": {{ "cached_tokens": 0 }}
+                        }}
+                    }}
+                }}"#
+            );
+            let stats = extract_token_stats(&event, &LlmFamily::OpenAiResponses)
+                .unwrap_or_else(|| panic!("usage should extract from {terminal_type}"));
+            assert_eq!(stats.input_tokens, Some(12));
+            assert_eq!(stats.output_tokens, Some(16));
+        }
     }
 
     #[test]
