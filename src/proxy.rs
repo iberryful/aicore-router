@@ -924,9 +924,20 @@ fn build_url(
                 ))
             }
         }
-        LlmFamily::OpenAiResponses => Ok(format!(
-            "{base_url}{INFERENCE_DEPLOYMENTS_PATH}/{deployment_id}{RESPONSES_PATH}?api-version={openai_api_version}"
-        )),
+        LlmFamily::OpenAiResponses => {
+            // `action == Some("compact")` selects the compaction subpath, used by
+            // Codex CLI's auto-compact-remote feature. The compact endpoint is
+            // unary (never streamed) but uses the same body+response shape as the
+            // create endpoint, so token extraction is identical.
+            let path = if action.as_deref() == Some("compact") {
+                RESPONSES_COMPACT_PATH
+            } else {
+                RESPONSES_PATH
+            };
+            Ok(format!(
+                "{base_url}{INFERENCE_DEPLOYMENTS_PATH}/{deployment_id}{path}?api-version={openai_api_version}"
+            ))
+        }
     }
 }
 
@@ -1227,5 +1238,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(url_stream, url_nostream);
+    }
+
+    #[test]
+    fn build_url_responses_with_compact_action_targets_compact_subpath() {
+        let url = build_url(
+            "gpt-5.4",
+            "dccbb05e08654c63",
+            &Some("compact".to_string()),
+            "https://api.example.com",
+            &LlmFamily::OpenAiResponses,
+            false,
+            "2025-04-01-preview",
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://api.example.com/v2/inference/deployments/dccbb05e08654c63/responses/compact?api-version=2025-04-01-preview"
+        );
+    }
+
+    #[test]
+    fn build_url_responses_with_unknown_action_falls_back_to_create() {
+        // Defensive: only the literal "compact" routes to the compact subpath;
+        // any other action string defaults to the create endpoint.
+        let url = build_url(
+            "gpt-5.4",
+            "d1",
+            &Some("not-a-real-action".to_string()),
+            "https://x",
+            &LlmFamily::OpenAiResponses,
+            false,
+            "2025-04-01-preview",
+        )
+        .unwrap();
+        assert!(url.ends_with("/responses?api-version=2025-04-01-preview"));
+        assert!(!url.contains("/compact"));
     }
 }

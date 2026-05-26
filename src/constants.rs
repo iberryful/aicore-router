@@ -32,6 +32,7 @@ pub mod api {
     pub const EMBEDDINGS_PATH: &str = "/embeddings";
     pub const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
     pub const RESPONSES_PATH: &str = "/responses";
+    pub const RESPONSES_COMPACT_PATH: &str = "/responses/compact";
     pub const MODELS_PATH: &str = "/models";
 
     // AI-Client-Type header

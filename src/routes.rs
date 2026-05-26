@@ -43,6 +43,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(handle_openai_chat))
         .route("/litellm/v1/chat/completions", post(handle_openai_chat))
         .route("/v1/embeddings", post(handle_openai_embeddings))
+        .route(
+            "/v1/responses/compact",
+            post(handle_openai_responses_compact),
+        )
         .route("/v1/responses", post(handle_openai_responses))
         .route(
             "/openai/deployments/{model}/chat/completions",
@@ -435,6 +439,36 @@ pub async fn handle_openai_responses(
         None,
         &client_ip,
         "/v1/responses",
+        Some(crate::proxy::LlmFamily::OpenAiResponses),
+    )
+    .await
+}
+
+/// OpenAI Responses-API compaction subpath (`/v1/responses/compact`), used by
+/// Codex CLI's auto-compact-remote feature when a conversation runs up against
+/// the context window. AI Core natively allowlists `responses/compact` on Azure
+/// OpenAI deployments (verified empirically); the request and response shapes
+/// are the same as the create endpoint plus an `instructions` field, and the
+/// response includes the standard `usage` so token tracking works for free.
+///
+/// Sets `action = Some("compact")` to make `proxy::build_url` select the
+/// `responses/compact` URL action instead of the default `responses`.
+pub async fn handle_openai_responses_compact(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, AppError> {
+    let model = extract_model_from_body(&body)?;
+    let client_ip = addr.ip().to_string();
+    execute_proxy_request(
+        &state,
+        &headers,
+        body,
+        &model,
+        Some("compact".to_string()),
+        &client_ip,
+        "/v1/responses/compact",
         Some(crate::proxy::LlmFamily::OpenAiResponses),
     )
     .await
