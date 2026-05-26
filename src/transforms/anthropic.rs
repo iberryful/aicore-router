@@ -60,12 +60,10 @@ pub fn prepare(body: &mut Value, model: &str) -> Result<()> {
 }
 
 /// Parse the `Anthropic-Beta` header into a list of beta features for the Bedrock
-/// request body, applying the Anthropic→Bedrock name remap where necessary.
-///
-/// **Transparent passthrough:** unknown beta names are emitted unchanged so
-/// Bedrock can accept them as Anthropic adds new features. Only names in
-/// [`ANTHROPIC_TO_BEDROCK_BETA_REMAP`] are rewritten. Returns an empty vec if
-/// the header is absent or non-UTF-8.
+/// request body, applying the Anthropic→Bedrock policy in
+/// [`ANTHROPIC_TO_BEDROCK_BETA_REMAP`]: rename, drop (Bedrock-incompatible), or
+/// transparent passthrough for unknown names. Returns an empty vec if the header
+/// is absent or non-UTF-8.
 pub fn extract_anthropic_beta(headers: &HeaderMap) -> Vec<String> {
     let header_value = match headers.get(ANTHROPIC_BETA_HEADER) {
         Some(v) => match v.to_str() {
@@ -81,10 +79,16 @@ pub fn extract_anthropic_beta(headers: &HeaderMap) -> Vec<String> {
         if feature.is_empty() {
             continue;
         }
-        let mapped = ANTHROPIC_TO_BEDROCK_BETA_REMAP
+        // Three-way lookup: Some(other) → rename, None → drop,
+        // missing entry → passthrough unchanged.
+        let mapped = match ANTHROPIC_TO_BEDROCK_BETA_REMAP
             .iter()
-            .find_map(|&(anthropic, bedrock)| (feature == anthropic).then_some(bedrock.to_string()))
-            .unwrap_or(feature);
+            .find(|&&(anthropic, _)| feature == anthropic)
+        {
+            Some((_, None)) => continue,
+            Some((_, Some(bedrock))) => bedrock.to_string(),
+            None => feature,
+        };
         if !features.contains(&mapped) {
             features.push(mapped);
         }
@@ -535,6 +539,28 @@ mod tests {
     // (note: previous "extract_anthropic_beta_drops_unknown_features" test was
     // removed — the function now passes through unknown betas. See
     // `extract_anthropic_beta_passes_through_unknown_features` above.)
+
+    #[test]
+    fn extract_anthropic_beta_drops_blacklisted_features() {
+        // Blacklisted entries (mapped to None) are stripped silently. Other
+        // features in the same header travel through normally — verifying the
+        // drop is per-entry, not all-or-nothing.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ANTHROPIC_BETA_HEADER,
+            "prompt-caching-scope-2026-01-05, context-1m-2025-08-07, prompt-caching-2024-07-31, interleaved-thinking-2025-05-14"
+                .parse()
+                .unwrap(),
+        );
+        let beta = extract_anthropic_beta(&headers);
+        assert_eq!(
+            beta,
+            vec![
+                "context-1m-2025-08-07".to_string(),
+                "interleaved-thinking-2025-05-14".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn clamp_thinking_disables_when_max_tokens_too_small() {

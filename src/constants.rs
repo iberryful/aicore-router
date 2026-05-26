@@ -42,25 +42,42 @@ pub mod api {
     // Anthropic-Beta header and Anthropic→Bedrock beta-name remap
     pub const ANTHROPIC_BETA_HEADER: &str = "anthropic-beta";
 
-    /// Maps Anthropic beta feature names to Bedrock-supported equivalents where
-    /// they differ. This is **not** a filter — beta names not present in this
-    /// table are passed through to Bedrock unchanged. Bedrock decides whether
-    /// it supports them; clients adopting future Anthropic betas don't need an
-    /// acr release to use them.
-    pub const ANTHROPIC_TO_BEDROCK_BETA_REMAP: &[(&str, &str)] = &[
-        (
-            "fine-grained-tool-streaming-2025-05-14",
-            "fine-grained-tool-streaming-2025-05-14",
-        ),
-        ("tool-search-tool-2025-10-19", "tool-search-tool-2025-10-19"),
-        ("tool-examples-2025-10-29", "tool-examples-2025-10-29"),
-        // `advanced-tool-use-2025-11-20` is the Anthropic-native name; on Bedrock
-        // the equivalent capability ships under `tool-search-tool-2025-10-19`.
+    /// Anthropic→Bedrock beta-name policy table.
+    ///
+    /// * `(name, Some("other"))` — rename to a Bedrock-equivalent flag.
+    /// * `(name, None)` — drop. Bedrock rejects with `"invalid beta flag"`.
+    /// * Not in table — passed through (Bedrock decides; lets new Anthropic
+    ///   betas work without an acr release).
+    ///
+    /// **TODO (revisit on every edit):** Bedrock's accepted-beta surface drifts.
+    /// Re-probe every `None` entry — any that now return 200 should move to
+    /// passthrough (delete the row).
+    pub const ANTHROPIC_TO_BEDROCK_BETA_REMAP: &[(&str, Option<&str>)] = &[
+        // Renames.
+        // Same capability, different name on Bedrock.
         (
             "advanced-tool-use-2025-11-20",
-            "tool-search-tool-2025-10-19",
+            Some("tool-search-tool-2025-10-19"),
         ),
-        ("context-1m-2025-08-07", "context-1m-2025-08-07"),
+        // GA on Bedrock via cache_control body fields; the opt-in flag itself
+        // is no longer accepted.
+        ("prompt-caching-2024-07-31", None),
+        // Claude Code 2.1.x sends this by default. acr already strips the
+        // matching `cache_control.scope` body field (see
+        // `transforms::anthropic::strip_cache_control_scope`).
+        ("prompt-caching-scope-2026-01-05", None),
+        // `inject_cache_ttl` already writes `ttl: "1h"` and Bedrock honors it
+        // (responses report `ephemeral_1h_input_tokens`).
+        ("extended-cache-ttl-2025-04-11", None),
+        // Anthropic-hosted features with no Bedrock equivalent.
+        ("redact-thinking-2026-02-12", None),
+        ("mcp-servers-2025-12-04", None),
+        ("skills-2025-10-02", None),
+        // Belong to surfaces acr does not expose (Files API, Message Batches,
+        // Managed Agents — see `routes.rs`).
+        ("files-api-2025-04-14", None),
+        ("message-batches-2024-09-24", None),
+        ("managed-agents-2026-04-01", None),
     ];
 
     /// Beta feature name for 1M extended context window
