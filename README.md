@@ -10,8 +10,8 @@ A high-performance Rust-based proxy service for SAP AI Core, providing unified a
 - **Streaming Support**: Real-time streaming responses for all supported models
 - **Dynamic Model Resolution**: Automatic discovery and mapping of models from AI Core deployments
 - **Multi-Provider Load Balancing**: Round-robin or fallback strategies across multiple AI Core tenants with automatic 429 retry
-- **Model Aliases**: Wildcard pattern matching to route variant model names to configured deployments
-- **Extended Context**: `[1m]` model suffix auto-enables 1M context window for Claude models
+- **Model Aliases**: Wildcard pattern matching (`*` may appear anywhere) to route variant model names to configured deployments
+- **Auto Max-Context**: Each Claude request automatically gets the maximum context window the model is capable of (1M for Sonnet 4+ / Opus 4.6+, with `context-1m-2025-08-07` beta auto-injected where needed)
 - **Token Quotas**: Per-API-key daily/monthly token limits with 429 rejection and Retry-After headers
 - **Request Logging**: SQLite-based request logging with token usage, configurable retention, and CLI usage reports
 - **Cost Estimation**: Per-model pricing config with `--cost` flag for estimated spend breakdown
@@ -509,7 +509,10 @@ models:
 
 **Alias Pattern Syntax:**
 - **Exact match**: `"claude-4-sonnet"` matches only `claude-4-sonnet`
-- **Prefix match**: `"claude-sonnet-4-6-*"` matches any model starting with `claude-sonnet-4-6-`
+- **Wildcard `*`**: matches any sequence of characters (including empty), and may appear **anywhere** in the pattern
+  - Trailing: `"claude-sonnet-4-6-*"` matches `claude-sonnet-4-6-20260101`
+  - Leading or middle: `"claude-*-sonnet"` matches `claude-4.6-sonnet`, `*-haiku-*` matches `claude-haiku-4-5`
+- All other characters (including `.` and `-`) match literally — `claude-4.6-*` won't match `claude-4x6-sonnet`
 
 **Resolution Priority:**
 1. **Exact name match**: Request matches a configured model name directly
@@ -517,26 +520,22 @@ models:
 3. **Family fallback**: Falls back to configured default for the model family
 
 **Conflict Resolution:**
-When multiple alias patterns match, the most specific pattern wins. Specificity is determined by the length of the literal prefix before the `*` wildcard.
+When multiple alias patterns match, the most specific pattern wins. Specificity is the total length of the literal portion (sum of segment lengths between `*`s).
 
 Example: For request `claude-sonnet-4-6-20260101`:
-- `claude-sonnet-4-6-*` (18 chars) wins over `claude-*` (7 chars)
+- `claude-sonnet-4-6-*` (18 chars literal) wins over `claude-*` (7 chars literal)
 
-### Extended Context Window
+### Extended Context Window — automatic
 
-For Claude models that support 1M token context, append `[1m]` to the model name. The router will strip the suffix and automatically inject the required Anthropic beta header:
+acr automatically enables the maximum context window the resolved Claude model is capable of:
 
-```bash
-curl -X POST http://localhost:8900/v1/messages \
-  -H "x-api-key: $your_api_key" \
-  -d '{
-    "model": "claude-sonnet-4-6[1m]",
-    "messages": [{"role": "user", "content": "Analyze this large codebase..."}],
-    "max_tokens": 8192
-  }'
-```
+| Model family | Max context | How |
+|---|---|---|
+| Sonnet 4.6, Opus 4.6, Opus 4.7 | 1M tokens | Native — no header needed |
+| Sonnet 4, Sonnet 4.5 | 1M tokens | acr auto-injects `Anthropic-Beta: context-1m-2025-08-07` |
+| Opus 4 / 4.1 / 4.5, Haiku 4.x, Claude 3 Haiku | 200k tokens | No 1M-context beta available |
 
-This is equivalent to manually setting the `Anthropic-Beta: context-1m-2025-08-07` header.
+The `[1m]` suffix on a model name (e.g. `claude-sonnet-4-5[1m]`) is silently accepted for backward compatibility but no longer functionally required — capability-driven injection makes it a no-op.
 
 ### Fallback Models
 

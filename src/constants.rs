@@ -159,3 +159,57 @@ pub mod config {
     pub const DEFAULT_RESOURCE_GROUP: &str = "default";
     pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 300; // 5 minutes
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_length_returns_max_for_known_models() {
+        assert_eq!(get_context_length("claude-opus-4-7"), Some(1_000_000));
+        assert_eq!(get_context_length("claude-sonnet-4-6"), Some(1_000_000));
+        assert_eq!(get_context_length("claude-sonnet-4-5"), Some(1_000_000));
+        assert_eq!(get_context_length("claude-haiku-4-5"), Some(200_000));
+        assert_eq!(get_context_length("gpt-4o"), Some(128_000));
+        assert_eq!(get_context_length("gemini-2.5-pro"), Some(1_048_576));
+        assert_eq!(get_context_length("nova-lite"), None);
+    }
+
+    #[test]
+    fn context_length_uses_prefix_match_for_versioned_names() {
+        // Versioned/dated model names match the most specific prefix.
+        assert_eq!(
+            get_context_length("claude-sonnet-4-6-20260101"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            get_context_length("claude-haiku-4-5-20260101"),
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn extended_context_beta_returns_beta_only_for_models_that_need_it() {
+        // Models reaching 1M via the beta:
+        assert_eq!(
+            get_extended_context_beta("claude-sonnet-4-5"),
+            Some(api::CONTEXT_1M_BETA)
+        );
+        assert_eq!(
+            get_extended_context_beta("claude-sonnet-4"),
+            Some(api::CONTEXT_1M_BETA)
+        );
+        // Native-1M models — no beta needed:
+        assert_eq!(get_extended_context_beta("claude-sonnet-4-6"), None);
+        assert_eq!(get_extended_context_beta("claude-opus-4-7"), None);
+        assert_eq!(get_extended_context_beta("claude-opus-4-6"), None);
+        // 200k models — no extended-context beta available:
+        assert_eq!(get_extended_context_beta("claude-haiku-4-5"), None);
+        assert_eq!(get_extended_context_beta("claude-opus-4-5"), None);
+        // Non-Claude families:
+        assert_eq!(get_extended_context_beta("gpt-5.4"), None);
+        assert_eq!(get_extended_context_beta("gemini-2.5-pro"), None);
+        // Unknown model:
+        assert_eq!(get_extended_context_beta("nova-lite"), None);
+    }
+}
