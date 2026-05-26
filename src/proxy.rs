@@ -83,6 +83,11 @@ impl TokenStats {
 #[derive(Debug, Clone, Copy)]
 pub enum LlmFamily {
     OpenAi,
+    /// OpenAI Responses API (`/v1/responses`) — different request shape (`input`
+    /// instead of `messages`), different URL action, different SSE event types
+    /// (`response.created` … `response.completed`), different usage-field names
+    /// (`input_tokens` / `output_tokens`). Selected by route, not model name.
+    OpenAiResponses,
     Claude,
     Gemini,
 }
@@ -114,6 +119,12 @@ pub struct ProxyRequestParams<'a> {
     pub token_manager: &'a TokenManager,
     pub model_registry: &'a ModelRegistry,
     pub load_balancer: &'a LoadBalancer,
+    /// Route-determined family override. When set, takes priority over
+    /// `determine_family(model)`. Used when the route uniquely determines the
+    /// family regardless of model name — e.g. `/v1/responses` is OpenAI-only
+    /// (Responses API), so `handle_openai_responses` sets this to
+    /// `Some(LlmFamily::OpenAiResponses)`. Other routes leave it `None`.
+    pub force_family: Option<LlmFamily>,
 }
 
 /// Builder for ProxyRequest with step-by-step validation
@@ -139,8 +150,13 @@ impl<'a> ProxyRequestBuilder<'a> {
         let (normalized_model, deployment_id) =
             self.resolve_model_for_provider(provider).await?;
 
-        // Step 4: Determine LLM family and stream flag
-        let family = determine_family(&normalized_model)?;
+        // Step 4: Determine LLM family and stream flag.
+        // Route-driven override takes priority — used by routes that are tied
+        // to a specific API shape regardless of model name (e.g. /v1/responses).
+        let family = match self.params.force_family {
+            Some(f) => f,
+            None => determine_family(&normalized_model)?,
+        };
         let stream = extract_stream_flag(&self.params.body, &family, &self.params.action);
 
         // Step 5: Prepare request body
@@ -694,7 +710,7 @@ fn extract_stream_flag(body: &Value, family: &LlmFamily, action: &Option<String>
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
         LlmFamily::Gemini => action.as_deref() == Some(STREAM_GENERATE_CONTENT_ACTION),
-        LlmFamily::OpenAi => body
+        LlmFamily::OpenAi | LlmFamily::OpenAiResponses => body
             .get("stream")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
@@ -706,6 +722,12 @@ fn prepare_body(body: &mut Value, family: &LlmFamily, stream: bool, model: &str)
         LlmFamily::Claude => crate::transforms::anthropic::prepare(body, model),
         LlmFamily::Gemini => crate::transforms::gemini::prepare(body),
         LlmFamily::OpenAi => crate::transforms::openai::prepare(body, stream),
+        // Responses API: transparent passthrough. The client's body is what AI Core /
+        // Azure OpenAI's `/responses` endpoint expects (input, max_output_tokens,
+        // previous_response_id, tools, instructions, etc.). Chat Completions transforms
+        // (max_tokens→max_completion_tokens, stream_options.include_usage merge,
+        // Codex-preamble normalization) do NOT apply to this API shape.
+        LlmFamily::OpenAiResponses => Ok(()),
     }
 }
 
@@ -725,6 +747,22 @@ fn extract_openai_tokens(usage: &Value) -> TokenStats {
         output_tokens: usage.get("completion_tokens").and_then(|v| v.as_u64()),
         cache_read: usage
             .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_u64()),
+        cache_write: None,
+    }
+}
+
+/// Extract OpenAI Responses-API token stats from a `usage` JSON object.
+/// Field names differ from Chat Completions: `input_tokens` / `output_tokens` /
+/// `input_tokens_details.cached_tokens`. The Responses API has no cache-write
+/// concept; `output_tokens_details.reasoning_tokens` is not currently tracked.
+fn extract_responses_tokens(usage: &Value) -> TokenStats {
+    TokenStats {
+        input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()),
+        output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()),
+        cache_read: usage
+            .get("input_tokens_details")
             .and_then(|d| d.get("cached_tokens"))
             .and_then(|v| v.as_u64()),
         cache_write: None,
@@ -785,6 +823,17 @@ fn extract_token_stats(data: &str, family: &LlmFamily) -> Option<TokenStats> {
             let usage = parsed.get("usage")?;
             Some(extract_openai_tokens(usage))
         }
+        LlmFamily::OpenAiResponses => {
+            // Responses API streams a sequence of `data: {"type": "...", ...}` events.
+            // Usage only appears on the terminal `response.completed` event at
+            // `response.usage.*`. All earlier events (response.created,
+            // response.in_progress, response.output_item.added, etc.) carry no usage.
+            if parsed.get("type")?.as_str()? != "response.completed" {
+                return None;
+            }
+            let usage = parsed.get("response")?.get("usage")?;
+            Some(extract_responses_tokens(usage))
+        }
         LlmFamily::Gemini => {
             let usage_metadata = parsed.get("usageMetadata")?;
             extract_gemini_tokens(usage_metadata, true)
@@ -813,6 +862,10 @@ fn extract_token_stats_from_body(body: &str, family: &LlmFamily) -> Option<Token
         LlmFamily::OpenAi => {
             let usage = parsed.get("usage")?;
             Some(extract_openai_tokens(usage))
+        }
+        LlmFamily::OpenAiResponses => {
+            let usage = parsed.get("usage")?;
+            Some(extract_responses_tokens(usage))
         }
         LlmFamily::Gemini => {
             let usage_metadata = parsed.get("usageMetadata")?;
@@ -858,6 +911,9 @@ fn build_url(
                 ))
             }
         }
+        LlmFamily::OpenAiResponses => Ok(format!(
+            "{base_url}{INFERENCE_DEPLOYMENTS_PATH}/{deployment_id}{RESPONSES_PATH}?api-version={openai_api_version}"
+        )),
     }
 }
 
@@ -1014,5 +1070,123 @@ mod tests {
                 "{model} should be rejected with BadRequest, got {err:?}"
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // OpenAI Responses API (`/v1/responses`)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn extract_responses_tokens_reads_responses_field_names() {
+        // Empirical shape from a live AI Core probe against gpt-5.4.
+        let usage = json!({
+            "input_tokens": 8,
+            "input_tokens_details": { "cached_tokens": 3 },
+            "output_tokens": 5,
+            "output_tokens_details": { "reasoning_tokens": 0 },
+            "total_tokens": 13
+        });
+        let stats = extract_responses_tokens(&usage);
+        assert_eq!(stats.input_tokens, Some(8));
+        assert_eq!(stats.output_tokens, Some(5));
+        assert_eq!(stats.cache_read, Some(3));
+        assert_eq!(stats.cache_write, None);
+    }
+
+    #[test]
+    fn extract_token_stats_responses_completed_event_yields_usage() {
+        let event = r#"{
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 8,
+                    "output_tokens": 5,
+                    "input_tokens_details": { "cached_tokens": 0 }
+                }
+            }
+        }"#;
+        let stats = extract_token_stats(event, &LlmFamily::OpenAiResponses).unwrap();
+        assert_eq!(stats.input_tokens, Some(8));
+        assert_eq!(stats.output_tokens, Some(5));
+    }
+
+    #[test]
+    fn extract_token_stats_responses_non_completed_events_yield_none() {
+        // Earlier events in the stream don't carry usage.
+        for event_type in [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.output_text.delta",
+        ] {
+            let event = format!(r#"{{"type":"{event_type}","response":{{}}}}"#);
+            assert!(
+                extract_token_stats(&event, &LlmFamily::OpenAiResponses).is_none(),
+                "{event_type} should not produce token stats"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_token_stats_from_body_responses() {
+        // Non-streaming response — usage is at the top level.
+        let body = r#"{
+            "id": "resp_…",
+            "status": "completed",
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 7,
+                "input_tokens_details": { "cached_tokens": 4 }
+            }
+        }"#;
+        let stats = extract_token_stats_from_body(body, &LlmFamily::OpenAiResponses).unwrap();
+        assert_eq!(stats.input_tokens, Some(12));
+        assert_eq!(stats.output_tokens, Some(7));
+        assert_eq!(stats.cache_read, Some(4));
+    }
+
+    #[test]
+    fn build_url_routes_responses_to_responses_endpoint() {
+        let url = build_url(
+            "gpt-5.4",
+            "dccbb05e08654c63",
+            &None,
+            "https://api.example.com",
+            &LlmFamily::OpenAiResponses,
+            false, // stream flag is irrelevant for OpenAI URL building
+            "2025-04-01-preview",
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://api.example.com/v2/inference/deployments/dccbb05e08654c63/responses?api-version=2025-04-01-preview"
+        );
+    }
+
+    #[test]
+    fn build_url_responses_url_independent_of_streaming() {
+        // OpenAI Responses uses the same URL for streaming vs non-streaming
+        // (the request body's `"stream": true` is what triggers SSE).
+        let url_stream = build_url(
+            "gpt-5.4",
+            "d1",
+            &None,
+            "https://x",
+            &LlmFamily::OpenAiResponses,
+            true,
+            "2025-04-01-preview",
+        )
+        .unwrap();
+        let url_nostream = build_url(
+            "gpt-5.4",
+            "d1",
+            &None,
+            "https://x",
+            &LlmFamily::OpenAiResponses,
+            false,
+            "2025-04-01-preview",
+        )
+        .unwrap();
+        assert_eq!(url_stream, url_nostream);
     }
 }

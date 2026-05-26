@@ -1,9 +1,17 @@
-//! OpenAI (via Azure OpenAI on SAP AI Core) request shaping.
+//! OpenAI (via Azure OpenAI on SAP AI Core) request shaping for the **Chat
+//! Completions API** (`/chat/completions`) and **embeddings**.
+//!
+//! The **Responses API** (`/v1/responses`, used by Codex CLI v0.130+) is a
+//! different shape and bypasses this module entirely — its request body is
+//! forwarded transparently. See `proxy::prepare_body`'s
+//! `LlmFamily::OpenAiResponses` arm.
 //!
 //! Source-of-truth references:
 //! * Chat Completions API (`max_completion_tokens`, `stream_options.include_usage`,
 //!   tool-call / tool-response message ordering):
 //!   <https://platform.openai.com/docs/api-reference/chat/create>
+//! * Responses API (handled outside this module):
+//!   <https://platform.openai.com/docs/api-reference/responses>
 //! * Azure OpenAI deployment URL shape:
 //!   <https://learn.microsoft.com/azure/ai-services/openai/reference>
 

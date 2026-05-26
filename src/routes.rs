@@ -43,6 +43,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(handle_openai_chat))
         .route("/litellm/v1/chat/completions", post(handle_openai_chat))
         .route("/v1/embeddings", post(handle_openai_embeddings))
+        .route("/v1/responses", post(handle_openai_responses))
         .route(
             "/openai/deployments/{model}/chat/completions",
             post(handle_azure_openai),
@@ -109,6 +110,10 @@ async fn record_failure_metrics(metrics: &MetricsService) {
 }
 
 #[cfg_attr(not(feature = "db"), allow(unused_variables))]
+// Eight parameters — each is a distinct request-scoped concern (axum-extracted
+// state, request shape, downstream routing). Bundling into a struct would just
+// shift the call-site complexity without reducing it.
+#[allow(clippy::too_many_arguments)]
 async fn execute_proxy_request(
     state: &AppState,
     headers: &HeaderMap,
@@ -117,6 +122,7 @@ async fn execute_proxy_request(
     action: Option<String>,
     client_ip: &str,
     request_path: &str,
+    force_family: Option<crate::proxy::LlmFamily>,
 ) -> Result<Response, AppError> {
     // Check rate limiting before processing
     if let Some(remaining) = state.rate_limiter.is_rate_limited(client_ip).await {
@@ -179,6 +185,7 @@ async fn execute_proxy_request(
         token_manager: &state.token_manager,
         model_registry: &state.model_registry,
         load_balancer: &state.load_balancer,
+        force_family,
     };
 
     let builder = ProxyRequestBuilder::new(params);
@@ -379,6 +386,7 @@ pub async fn handle_openai_chat(
         None,
         &client_ip,
         "/v1/chat/completions",
+        None,
     )
     .await
 }
@@ -402,6 +410,32 @@ pub async fn handle_openai_embeddings(
         None,
         &client_ip,
         "/v1/embeddings",
+        None,
+    )
+    .await
+}
+
+/// OpenAI Responses API (`/v1/responses`). The route uniquely determines the
+/// API shape (Responses, not Chat Completions) regardless of model name, so we
+/// pass `force_family = Some(OpenAiResponses)`. The request body is forwarded
+/// transparently — `transforms::openai::prepare` does not run on this path.
+pub async fn handle_openai_responses(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, AppError> {
+    let model = extract_model_from_body(&body)?;
+    let client_ip = addr.ip().to_string();
+    execute_proxy_request(
+        &state,
+        &headers,
+        body,
+        &model,
+        None,
+        &client_ip,
+        "/v1/responses",
+        Some(crate::proxy::LlmFamily::OpenAiResponses),
     )
     .await
 }
@@ -424,6 +458,7 @@ pub async fn handle_azure_openai(
         None,
         &client_ip,
         "/openai/deployments",
+        None,
     )
     .await
 }
@@ -444,6 +479,7 @@ pub async fn handle_claude_messages(
         None,
         &client_ip,
         "/v1/messages",
+        None,
     )
     .await
 }
@@ -465,6 +501,7 @@ pub async fn handle_gemini_models(
         Some(action),
         &client_ip,
         "/gemini/models",
+        None,
     )
     .await
 }
