@@ -140,9 +140,22 @@ async fn execute_proxy_request(
     if let Some(ref key) = request_api_key
         && key == "internal"
     {
-        let ip: std::net::IpAddr = client_ip.parse().unwrap_or([0, 0, 0, 0].into());
-        if !ip.is_loopback() {
-            return Err(AppError::InvalidApiKey);
+        // Fail closed on parse errors: an unparseable client_ip cannot be
+        // validated as loopback, so refuse to honor the privileged "internal"
+        // key. axum's ConnectInfo always yields a parseable IP, so reaching
+        // this branch implies upstream construction is broken — log and reject.
+        let parsed: Result<std::net::IpAddr, _> = client_ip.parse();
+        match parsed {
+            Ok(ip) if ip.is_loopback() => {}
+            Ok(_) => return Err(AppError::InvalidApiKey),
+            Err(e) => {
+                tracing::warn!(
+                    "Could not parse client IP '{}' while checking 'internal' key: {}",
+                    client_ip,
+                    e
+                );
+                return Err(AppError::InvalidApiKey);
+            }
         }
     }
 
@@ -194,14 +207,10 @@ async fn execute_proxy_request(
 
     let builder = ProxyRequestBuilder::new(params);
 
-    // Get providers in round-robin order with fallback
+    // Get providers in load-balanced order. `LoadBalancer::new` rejects empty
+    // / all-disabled provider lists at startup, so this iterator is non-empty
+    // by construction.
     let providers = state.load_balancer.get_ordered_providers();
-    if providers.len() == 0 {
-        record_failure_metrics(&state.metrics).await;
-        return Err(AppError::Internal(anyhow::anyhow!(
-            "No providers available"
-        )));
-    }
 
     let mut last_error: Option<AppError> = None;
 
@@ -634,14 +643,6 @@ impl IntoResponse for AppError {
         };
         if let Some(secs) = retry_after
             && let Ok(val) = axum::http::HeaderValue::from_str(&secs.to_string())
-        {
-            response.headers_mut().insert("retry-after", val);
-        }
-
-        if let AppError::QuotaExceeded {
-            retry_after_secs, ..
-        } = &self
-            && let Ok(val) = axum::http::HeaderValue::from_str(&retry_after_secs.to_string())
         {
             response.headers_mut().insert("retry-after", val);
         }

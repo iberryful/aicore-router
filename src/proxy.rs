@@ -529,21 +529,8 @@ impl ProxyRequest {
                     if let Some(data) = line.strip_prefix(STREAM_DATA_PREFIX)
                         && !data.is_empty()
                     {
-                        if let Some(stats) = extract_token_stats(data, &family) {
-                            token_stats = stats
-                        }
-
-                        let mut output = String::new();
-
-                        if is_claude
-                            && let Ok(parsed) = serde_json::from_str::<Value>(data)
-                            && let Some(event_type) = parsed.get("type").and_then(|v| v.as_str())
-                        {
-                            output.push_str(&format!("event: {event_type}\n"));
-                        }
-
-                        output.push_str(&format!("{STREAM_DATA_PREFIX}{data}\n\n"));
-                        if tx.send(Ok(axum::body::Bytes::from(output))).await.is_err() {
+                        let bytes = format_sse_event(data, &family, is_claude, &mut token_stats);
+                        if tx.send(Ok(bytes)).await.is_err() {
                             tracing::debug!("Client disconnected during streaming");
                             client_gone = true;
                             break;
@@ -579,7 +566,9 @@ impl ProxyRequest {
                 }
             }
 
-            // Flush any remaining buffered data
+            // Flush any remaining buffered data — a tail without a trailing
+            // newline. Mirrors the main-loop formatting so a final partial
+            // Claude event still gets its `event: <type>` prefix.
             if !client_gone
                 && !byte_buf.is_empty()
                 && let Ok(remaining) = String::from_utf8(byte_buf)
@@ -588,11 +577,8 @@ impl ProxyRequest {
                 if let Some(data) = line.strip_prefix(STREAM_DATA_PREFIX)
                     && !data.is_empty()
                 {
-                    if let Some(stats) = extract_token_stats(data, &family) {
-                        token_stats = stats;
-                    }
-                    let output = format!("{STREAM_DATA_PREFIX}{data}\n\n");
-                    let _ = tx.send(Ok(axum::body::Bytes::from(output))).await;
+                    let bytes = format_sse_event(data, &family, is_claude, &mut token_stats);
+                    let _ = tx.send(Ok(bytes)).await;
                 }
             }
 
@@ -929,6 +915,33 @@ async fn peek_classify_stream(
             }
         }
     }
+}
+
+/// Format a single SSE `data:` payload for the downstream client. Updates
+/// `token_stats` in place when the payload carries usage. For Claude, prefixes
+/// the formatted output with an explicit `event: <type>` line so SSE clients
+/// that key off named events (rather than parsing JSON) see the right event
+/// type — the upstream Bedrock invoke-with-response-stream encoding only
+/// embeds the type as a JSON field.
+fn format_sse_event(
+    data: &str,
+    family: &LlmFamily,
+    is_claude: bool,
+    token_stats: &mut TokenStats,
+) -> axum::body::Bytes {
+    if let Some(stats) = extract_token_stats(data, family) {
+        *token_stats = stats;
+    }
+
+    let mut output = String::new();
+    if is_claude
+        && let Ok(parsed) = serde_json::from_str::<Value>(data)
+        && let Some(event_type) = parsed.get("type").and_then(|v| v.as_str())
+    {
+        output.push_str(&format!("event: {event_type}\n"));
+    }
+    output.push_str(&format!("{STREAM_DATA_PREFIX}{data}\n\n"));
+    axum::body::Bytes::from(output)
 }
 
 fn extract_token_stats(data: &str, family: &LlmFamily) -> Option<TokenStats> {

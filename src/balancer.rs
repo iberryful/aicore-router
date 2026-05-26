@@ -7,6 +7,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use anyhow::{Result, bail};
+
 use crate::config::{LoadBalancingStrategy, Provider};
 
 /// An iterator over providers in load-balanced order (zero-allocation).
@@ -47,16 +49,23 @@ pub struct LoadBalancer {
 
 impl LoadBalancer {
     /// Create a new load balancer with the given providers and strategy.
-    /// Only enabled providers are included.
-    pub fn new(providers: Vec<Provider>, strategy: LoadBalancingStrategy) -> Self {
+    /// Only enabled providers are included; returns an error when none remain
+    /// so the binary refuses to start in a non-functional state.
+    pub fn new(providers: Vec<Provider>, strategy: LoadBalancingStrategy) -> Result<Self> {
         let enabled_providers: Vec<Provider> =
             providers.into_iter().filter(|p| p.enabled).collect();
 
-        Self {
+        if enabled_providers.is_empty() {
+            bail!(
+                "No enabled providers configured. Set at least one provider's `enabled: true` in config."
+            );
+        }
+
+        Ok(Self {
             providers: Arc::new(enabled_providers),
             current_index: Arc::new(AtomicUsize::new(0)),
             strategy,
-        }
+        })
     }
 
     /// Get providers ordered according to the configured strategy.
@@ -68,10 +77,10 @@ impl LoadBalancer {
     pub fn get_ordered_providers(&self) -> OrderedProviders<'_> {
         let len = self.providers.len();
         let start = match self.strategy {
-            LoadBalancingStrategy::RoundRobin if len > 0 => {
+            LoadBalancingStrategy::RoundRobin => {
                 self.current_index.fetch_add(1, Ordering::Relaxed) % len
             }
-            _ => 0,
+            LoadBalancingStrategy::Fallback => 0,
         };
         OrderedProviders {
             providers: &self.providers,
@@ -79,11 +88,6 @@ impl LoadBalancer {
             index: 0,
             len,
         }
-    }
-
-    /// Check if there are no enabled providers.
-    pub fn is_empty(&self) -> bool {
-        self.providers.is_empty()
     }
 }
 
@@ -112,7 +116,7 @@ mod tests {
             create_test_provider("provider3", true),
         ];
 
-        let balancer = LoadBalancer::new(providers, LoadBalancingStrategy::RoundRobin);
+        let balancer = LoadBalancer::new(providers, LoadBalancingStrategy::RoundRobin).unwrap();
 
         let ordered: Vec<&Provider> = balancer.get_ordered_providers().collect();
         assert_eq!(ordered.len(), 2);
@@ -128,7 +132,7 @@ mod tests {
             create_test_provider("provider3", true),
         ];
 
-        let balancer = LoadBalancer::new(providers, LoadBalancingStrategy::RoundRobin);
+        let balancer = LoadBalancer::new(providers, LoadBalancingStrategy::RoundRobin).unwrap();
 
         // First call starts at index 0
         let names: Vec<&str> = balancer
@@ -153,7 +157,7 @@ mod tests {
             create_test_provider("provider3", true),
         ];
 
-        let balancer = LoadBalancer::new(providers, LoadBalancingStrategy::Fallback);
+        let balancer = LoadBalancer::new(providers, LoadBalancingStrategy::Fallback).unwrap();
 
         // Always starts from provider1
         let names: Vec<&str> = balancer
@@ -171,10 +175,15 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_providers() {
-        let balancer = LoadBalancer::new(vec![], LoadBalancingStrategy::RoundRobin);
+    fn test_new_rejects_when_no_enabled_providers() {
+        // Empty list rejected outright.
+        assert!(LoadBalancer::new(vec![], LoadBalancingStrategy::RoundRobin).is_err());
 
-        assert!(balancer.is_empty());
-        assert_eq!(balancer.get_ordered_providers().len(), 0);
+        // A list of disabled providers also rejected — there's nothing to route to.
+        let all_disabled = vec![
+            create_test_provider("provider1", false),
+            create_test_provider("provider2", false),
+        ];
+        assert!(LoadBalancer::new(all_disabled, LoadBalancingStrategy::RoundRobin).is_err());
     }
 }

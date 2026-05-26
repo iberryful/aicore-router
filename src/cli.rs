@@ -278,14 +278,13 @@ impl Cli {
         // Create token manager with API keys
         let token_manager = TokenManager::new(config.api_key_strings());
 
-        // Create load balancer with providers and configured strategy
+        // Create load balancer with providers and configured strategy.
+        // Construction fails fast when no enabled providers remain — the
+        // binary refuses to start in a non-functional state.
         let load_balancer =
-            LoadBalancer::new(config.providers.clone(), config.load_balancing.clone());
+            LoadBalancer::new(config.providers.clone(), config.load_balancing.clone())
+                .context("Failed to construct load balancer")?;
         tracing::info!("Load balancing strategy: {:?}", config.load_balancing);
-
-        if load_balancer.is_empty() {
-            return Err(anyhow::anyhow!("No enabled providers configured"));
-        }
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300)) // 5 min timeout for long LLM responses
