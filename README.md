@@ -21,6 +21,32 @@ A high-performance Rust-based proxy service for SAP AI Core, providing unified a
 - **High Performance**: Built with Rust and async/await for maximum throughput
 - **Simple Configuration**: Single YAML config file with CLI flag overrides
 
+## Supported Backends
+
+acr is purpose-built for **SAP AI Core** and routes only the three foundation-model families that SAP AI Core exposes via the LLM-shaped APIs Claude Code / Cursor / similar IDE tooling expect. AI Core also offers other backends (Mistral, Cohere, Amazon Nova/Titan, Perplexity Sonar, SAP RPT-1, etc.) — those are **out of scope** for acr; route them through the AI Core SDK or your own client.
+
+### Supported
+
+| Client-facing API (acr) | LLM family | AI Core backend | AI Core action / URL shape |
+|---|---|---|---|
+| `/v1/messages`, `/anthropic/v1/messages` | Claude (Anthropic) | `aws-bedrock` | `/v2/inference/deployments/{id}/invoke` (and `/invoke-with-response-stream` for streams) — Bedrock **InvokeModel** API, native Anthropic Messages JSON shape |
+| `/v1/chat/completions`, `/litellm/v1/chat/completions`, `/openai/deployments/{model}/chat/completions` | OpenAI GPT / o-series | `azure-openai` | `/v2/inference/deployments/{id}/chat/completions?api-version=…` — Azure OpenAI Chat Completions |
+| `/openai/deployments/{model}/embedding` | OpenAI `text-embedding-*` | `azure-openai` | `/v2/inference/deployments/{id}/embeddings?api-version=…` |
+| `/v1beta/models/{model}:{action}`, `/gemini/v1beta/models/{model}:{action}` | Gemini (Google) | `gcp-vertexai` | `/v2/inference/deployments/{id}/models/{model}:generateContent` (or `:streamGenerateContent`) — Vertex AI GenerateContent |
+
+### Not supported (use AI Core SDK directly)
+
+`aws-bedrock` Amazon Nova / Titan · `aicore-cohere` Command / reranker · `aicore-mistralai` Mistral · `aicore-nvidia` NV embed · `aicore-sap` RPT-1, ABAP-Codestral, etc. · `perplexity-ai` Sonar · `orchestration` sap-abap-1 · `azure-openai` DALL-E / Whisper / realtime.
+
+### Nuances vs the upstream-published APIs
+
+acr's wire format is the public LLM API shape; the AI Core endpoint behind it has its own quirks. acr smooths these over so clients don't have to:
+
+- **Anthropic via Bedrock InvokeModel.** acr stamps `anthropic_version: bedrock-2023-05-31` and routes to `/invoke`, not the AI Core Converse endpoint (which is also exposed but lags native features). Strips the `cache_control.scope` field that Claude Code 2.1.88+ sends but Bedrock rejects. Always injects `ttl: "1h"` into ephemeral `cache_control` blocks (1h cache vs the 5-min default — major win for IDE/agent sessions). Validates and clamps the `thinking.budget_tokens` against `max_tokens`. For `claude-opus-4-7` strips `temperature` / `top_p` / `top_k` and converts `thinking: enabled` → `thinking: adaptive` (4.7 deprecates explicit sampling at the model level, even outside thinking mode). Translates the `Anthropic-Beta` header into the body's `anthropic_beta` array via a curated allowlist.
+- **OpenAI via Azure.** Renames legacy `max_tokens` → `max_completion_tokens` (canonical since GPT-4o 2024-08-06+, required for o-series and GPT-5). For streaming requests, sets `stream_options.include_usage = true` so the final SSE chunk carries token counts. Normalizes a Codex-CLI bug where a preamble assistant message is inserted between `assistant(tool_calls)` and `tool(response)`.
+- **Gemini via Vertex.** Strips `id` from `functionResponse` parts (AI Core wrapper rejects it). Rewrites `thinkingConfig.thinkingBudget: 0` → `-1` so "let the model decide" doesn't get read as "thinking disabled".
+- **Auto 1M context.** Append `[1m]` to a Claude model name (e.g. `claude-opus-4-7[1m]`) and acr injects the `context-1m-2025-08-07` beta automatically.
+
 ## Installation
 
 ### From release
