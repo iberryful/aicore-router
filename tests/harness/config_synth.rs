@@ -24,7 +24,12 @@ pub const KEY_DEFAULT: &str = "acr-test-default-key-do-not-use-in-prod";
 /// Test API key with `requests_per_minute: 3` for RPM-rejection scenarios.
 pub const KEY_RPM_LIMITED: &str = "acr-test-rpm-limited-key-do-not-use-in-prod";
 
-/// Test API key with `daily_token_limit: 50` for token-quota scenarios.
+/// Test API key with `daily_token_limit: 10` for token-quota scenarios.
+///
+/// 10 is intentionally below the typical token cost of even the smallest
+/// chat round-trip (probed empirically at ~28 tokens for a "reply with one
+/// short word" prompt against gpt-5.5). That ensures the *first* request's
+/// post-completion usage recording flips the second request to 429.
 pub const KEY_TIGHT_TOKENS: &str = "acr-test-tight-tokens-key-do-not-use-in-prod";
 
 pub struct SynthesizedConfig {
@@ -140,7 +145,7 @@ fn render_yaml(user: &Config, port: u16, db_path: &Path) -> String {
     yaml.push_str(&format!("  - key: {}\n", KEY_RPM_LIMITED));
     yaml.push_str("    requests_per_minute: 3\n");
     yaml.push_str(&format!("  - key: {}\n", KEY_TIGHT_TOKENS));
-    yaml.push_str("    daily_token_limit: 50\n\n");
+    yaml.push_str("    daily_token_limit: 10\n\n");
 
     // Permissive global quotas — only the dedicated keys above hit limits.
     yaml.push_str("quotas:\n");

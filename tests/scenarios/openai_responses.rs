@@ -118,8 +118,13 @@ async fn responses_with_filtered_tools_succeeds() {
 }
 
 /// `/v1/responses/compact` is the Codex auto-compact-remote endpoint —
-/// passthrough handler with the `compact` URL action. Returns the same
-/// shape as the create endpoint plus an `instructions` field.
+/// passthrough handler with the `compact` URL action. Returns
+/// `object: "response.compaction"` plus the standard `usage` block.
+///
+/// Note: the compact endpoint does **not** accept `max_output_tokens`
+/// (which the create endpoint requires) — Codex CLI never sends it on
+/// this path. The router is a passthrough; upstream parameter validation
+/// is the source of truth here.
 #[tokio::test]
 async fn responses_compact_endpoint_returns_usage() {
     let acr = shared().await;
@@ -131,7 +136,6 @@ async fn responses_compact_endpoint_returns_usage() {
         "model": model,
         "input": "Summarize: This is a short sample conversation.",
         "instructions": "Compact this conversation.",
-        "max_output_tokens": 32,
     });
     let resp = auth_bearer(
         client().post(format!("{}/v1/responses/compact", acr.base_url())),
@@ -142,6 +146,11 @@ async fn responses_compact_endpoint_returns_usage() {
     .await
     .expect("request");
     let json = read_json_status(resp, 200, "/v1/responses/compact").await;
+    assert_eq!(
+        json.get("object").and_then(|v| v.as_str()),
+        Some("response.compaction"),
+        "compact object mismatch: {json}"
+    );
     assert!(
         json.get("usage").is_some(),
         "compact response missing usage: {json}"

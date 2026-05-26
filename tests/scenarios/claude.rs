@@ -1,5 +1,11 @@
-//! Claude-family scenarios — tool use, vision, anthropic-beta header,
-//! cache_control TTL, long-context auto-injection.
+//! Claude-family scenarios — tool use, vision, cache_control TTL.
+//!
+//! `Anthropic-Beta` header propagation is **not** tested here. The
+//! `transforms::extract_anthropic_beta_*` unit tests cover the remap and
+//! pass-through logic directly; AI Core's beta-flag allowlist is upstream-
+//! controlled and unstable, so a positive e2e assertion (request must
+//! succeed) ends up testing the upstream's allowlist rather than acr's
+//! propagation.
 
 #![cfg(feature = "e2e")]
 
@@ -81,31 +87,6 @@ async fn vision_inline_image_block() {
     .expect("request");
     let (status, body) = read_status_and_body(resp).await;
     assert_eq!(status, 200, "vision: {body}");
-}
-
-#[tokio::test]
-async fn anthropic_beta_header_propagates() {
-    let acr = shared().await;
-    let Some(model) = acr.config.model_for_family("claude") else {
-        skip("no Claude model configured");
-        return;
-    };
-    let body = json!({
-        "model": model,
-        "max_tokens": 16,
-        "messages": [{"role": "user", "content": "Reply with one short word."}],
-    });
-    let resp = auth_bearer(
-        client().post(format!("{}/v1/messages", acr.base_url())),
-        KEY_DEFAULT,
-    )
-    .header("Anthropic-Beta", "prompt-caching-2024-07-31")
-    .json(&body)
-    .send()
-    .await
-    .expect("request");
-    let (status, body) = read_status_and_body(resp).await;
-    assert_eq!(status, 200, "Anthropic-Beta: {body}");
 }
 
 /// `cache_control: { type: "ephemeral" }` on a system block — the router
