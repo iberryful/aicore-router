@@ -149,7 +149,7 @@ impl<'a> ProxyRequestBuilder<'a> {
 
         // Step 6: Extract Anthropic-Beta header and convert to Bedrock beta features
         let mut anthropic_beta = if matches!(family, LlmFamily::Claude) {
-            extract_anthropic_beta(self.params.headers)
+            crate::transforms::extract_anthropic_beta(self.params.headers)
         } else {
             vec![]
         };
@@ -346,16 +346,15 @@ impl ProxyRequest {
         }
 
         if self.stream {
-            let response = self
-                .handle_streaming_response(
-                    response,
-                    start_time,
-                    metrics,
-                    #[cfg(feature = "db")]
-                    db_context,
-                    quota_manager,
-                    api_key_hash,
-                )?;
+            let response = self.handle_streaming_response(
+                response,
+                start_time,
+                metrics,
+                #[cfg(feature = "db")]
+                db_context,
+                quota_manager,
+                api_key_hash,
+            )?;
             // Streaming records metrics when the stream completes (inside spawned task)
             Ok(ProxyExecuteResult::Response {
                 response,
@@ -432,8 +431,7 @@ impl ProxyRequest {
         quota_manager: Option<crate::quota::QuotaManager>,
         api_key_hash: Option<String>,
     ) -> Result<Response> {
-        let (tx, rx) =
-            tokio::sync::mpsc::channel::<Result<axum::body::Bytes, reqwest::Error>>(64);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, reqwest::Error>>(64);
         let is_claude = matches!(self.family, LlmFamily::Claude);
         let model = self.model.clone();
         let original_model = self.original_model.clone();
@@ -522,7 +520,8 @@ impl ProxyRequest {
             }
 
             // Flush any remaining buffered data
-            if !client_gone && !byte_buf.is_empty()
+            if !client_gone
+                && !byte_buf.is_empty()
                 && let Ok(remaining) = String::from_utf8(byte_buf)
             {
                 let line = remaining.trim();
@@ -596,11 +595,12 @@ impl ProxyRequest {
 /// and `has_extended_context` is set to true so the caller can inject the 1M context beta.
 fn normalize_model(model: &str, registry: &ModelRegistry) -> Result<(String, bool)> {
     // Strip [1m] suffix if present
-    let (base_model, has_extended_context) = if let Some(base) = model.strip_suffix(EXTENDED_CONTEXT_SUFFIX) {
-        (base, true)
-    } else {
-        (model, false)
-    };
+    let (base_model, has_extended_context) =
+        if let Some(base) = model.strip_suffix(EXTENDED_CONTEXT_SUFFIX) {
+            (base, true)
+        } else {
+            (model, false)
+        };
 
     // 1. Exact match - if the model exists in config, use it directly
     if registry.find_model_config(base_model).is_some() {
@@ -671,79 +671,12 @@ fn extract_stream_flag(body: &Value, family: &LlmFamily, action: &Option<String>
     }
 }
 
-fn prepare_body(body: &mut Value, family: &LlmFamily, stream: bool, _model: &str) -> Result<()> {
+fn prepare_body(body: &mut Value, family: &LlmFamily, stream: bool, model: &str) -> Result<()> {
     match family {
-        LlmFamily::Claude => {
-            // Validate messages array before body transformation
-            validate_anthropic_messages(body)?;
-
-            if let Some(obj) = body.as_object_mut() {
-                obj.insert("anthropic_version".to_string(), json!(ANTHROPIC_VERSION));
-                obj.remove("stream");
-                obj.remove("model");
-                obj.remove("context_management");
-
-                // Default max_tokens if not provided (Bedrock requires this field)
-                if !obj.contains_key("max_tokens") {
-                    obj.insert("max_tokens".to_string(), json!(ANTHROPIC_DEFAULT_MAX_TOKENS));
-                }
-
-                // Strip unsupported "scope" field from cache_control objects
-                // (Claude Code 2.1.88+ sends this but Bedrock doesn't support it)
-                strip_cache_control_scope(obj);
-
-                // Validate and clamp thinking budget for Bedrock compatibility
-                clamp_thinking(obj);
-            }
-        }
-        LlmFamily::Gemini => {
-            if let Some(obj) = body.as_object_mut() {
-                obj.remove("model");
-                obj.remove("stream");
-
-                // Strip ID from function responses (AI Core rejects them)
-                strip_gemini_function_response_ids(obj);
-
-                // Convert ThinkingBudget 0 to -1 (dynamic) to avoid AI Core errors
-                fix_gemini_thinking_budget(obj);
-            }
-        }
-        LlmFamily::OpenAi => {
-            if let Some(obj) = body.as_object_mut() {
-                // Convert max_tokens to max_completion_tokens for all OpenAI models
-                // (max_completion_tokens is the preferred field since GPT-4o / 2024-08-06+)
-                if obj.contains_key("max_tokens") && !obj.contains_key("max_completion_tokens")
-                    && let Some(max_tokens) = obj.remove("max_tokens")
-                {
-                    obj.insert("max_completion_tokens".to_string(), max_tokens);
-                }
-
-                // Add stream_options to include usage stats for streaming requests
-                if stream {
-                    match obj.get_mut("stream_options") {
-                        Some(existing_options) => {
-                            // Merge include_usage into existing stream_options
-                            if let Some(options_obj) = existing_options.as_object_mut() {
-                                options_obj.insert("include_usage".to_string(), json!(true));
-                            }
-                        }
-                        None => {
-                            // Create new stream_options with include_usage
-                            obj.insert(
-                                "stream_options".to_string(),
-                                json!({"include_usage": true}),
-                            );
-                        }
-                    }
-                }
-
-                // Fix Codex CLI bug: preamble assistant message inserted between
-                // assistant(tool_calls) and tool(response) messages.
-                normalize_openai_messages(obj);
-            }
-        }
+        LlmFamily::Claude => crate::transforms::anthropic::prepare(body, model),
+        LlmFamily::Gemini => crate::transforms::gemini::prepare(body),
+        LlmFamily::OpenAi => crate::transforms::openai::prepare(body, stream),
     }
-    Ok(())
 }
 
 fn extract_content_type(response: &reqwest::Response) -> String {
@@ -772,7 +705,9 @@ fn extract_openai_tokens(usage: &Value) -> TokenStats {
 /// In streaming mode, input_tokens is required (returns None if absent).
 /// In non-streaming mode, input_tokens is optional; output returns None if zero.
 fn extract_gemini_tokens(usage_metadata: &Value, streaming: bool) -> Option<TokenStats> {
-    let input_tokens = usage_metadata.get("promptTokenCount").and_then(|v| v.as_u64());
+    let input_tokens = usage_metadata
+        .get("promptTokenCount")
+        .and_then(|v| v.as_u64());
     if streaming && input_tokens.is_none() {
         return None;
     }
@@ -896,294 +831,6 @@ fn build_url(
     }
 }
 
-/// Extract Anthropic-Beta header and map features to Bedrock-supported equivalents.
-/// Unknown features are silently dropped.
-fn extract_anthropic_beta(headers: &HeaderMap) -> Vec<String> {
-    let header_value = match headers.get(ANTHROPIC_BETA_HEADER) {
-        Some(v) => match v.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return vec![],
-        },
-        None => return vec![],
-    };
-
-    let mut features = Vec::new();
-    for feature in header_value.split(',') {
-        let feature = feature.trim().to_lowercase();
-        for &(anthropic_name, bedrock_name) in ALLOWED_BETA_FEATURES {
-            if feature == anthropic_name {
-                let bedrock_feature = bedrock_name.to_string();
-                if !features.contains(&bedrock_feature) {
-                    features.push(bedrock_feature);
-                }
-                break;
-            }
-        }
-    }
-    features
-}
-
-/// Validate Anthropic messages array is non-empty and messages have content.
-/// The last message may be an empty assistant message (pre-fill pattern).
-fn validate_anthropic_messages(body: &Value) -> Result<()> {
-    let messages = match body.get("messages").and_then(|v| v.as_array()) {
-        Some(msgs) => msgs,
-        None => return Ok(()), // Let Bedrock handle missing field
-    };
-
-    if messages.is_empty() {
-        anyhow::bail!("messages array cannot be empty");
-    }
-
-    for (i, msg) in messages.iter().enumerate() {
-        let content = msg.get("content");
-        let is_empty = match content {
-            None => true,
-            Some(Value::String(s)) => s.is_empty(),
-            Some(Value::Array(a)) => a.is_empty(),
-            Some(Value::Null) => true,
-            _ => false,
-        };
-
-        if is_empty {
-            let is_last = i == messages.len() - 1;
-            let is_assistant = msg.get("role").and_then(|v| v.as_str()) == Some("assistant");
-            if !is_last || !is_assistant {
-                anyhow::bail!(
-                    "message at index {} has empty content (only the last assistant message may be empty)",
-                    i
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Strip unsupported "scope" field from cache_control objects in system and message content.
-/// Claude Code 2.1.88+ adds a "scope" field that Bedrock doesn't support and will reject.
-fn strip_cache_control_scope(obj: &mut serde_json::Map<String, Value>) {
-    // Strip from system content (can be string or array of content blocks)
-    if let Some(system) = obj.get_mut("system") {
-        strip_scope_from_content(system);
-    }
-
-    // Strip from message content blocks
-    if let Some(Value::Array(messages)) = obj.get_mut("messages") {
-        for message in messages.iter_mut() {
-            if let Some(content) = message.get_mut("content") {
-                strip_scope_from_content(content);
-            }
-        }
-    }
-}
-
-fn strip_scope_from_content(content: &mut Value) {
-    match content {
-        Value::Array(blocks) => {
-            for block in blocks.iter_mut() {
-                if let Some(cache_control) = block.get_mut("cache_control")
-                    && let Some(cc_obj) = cache_control.as_object_mut()
-                {
-                    cc_obj.remove("scope");
-                }
-            }
-        }
-        Value::Object(obj) => {
-            if let Some(cache_control) = obj.get_mut("cache_control")
-                && let Some(cc_obj) = cache_control.as_object_mut()
-            {
-                cc_obj.remove("scope");
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Validate and clamp thinking budget for Bedrock compatibility.
-/// - Disables thinking if max_tokens < 1025 (need 1024 for thinking + 1 for output)
-/// - Ensures budget_tokens >= 1024 (Anthropic minimum)
-/// - Clamps budget_tokens < max_tokens (Bedrock constraint)
-fn clamp_thinking(obj: &mut serde_json::Map<String, Value>) {
-    let thinking = match obj.get("thinking") {
-        Some(t) if t.is_object() => t,
-        _ => return,
-    };
-
-    // Only process if thinking is enabled
-    let thinking_type = thinking
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if thinking_type != "enabled" {
-        return;
-    }
-
-    let max_tokens = obj
-        .get("max_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-
-    let min_required = MIN_BUDGET_TOKENS_FOR_THINKING + BUDGET_RESERVE_MARGIN;
-
-    // Disable thinking if max_tokens is too small
-    if max_tokens < min_required {
-        tracing::debug!(
-            "Disabling thinking: max_tokens ({}) < minimum required ({})",
-            max_tokens,
-            min_required
-        );
-        obj.remove("thinking");
-        return;
-    }
-
-    let budget_tokens = thinking
-        .get("budget_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-
-    // Ensure budget_tokens >= 1024
-    let mut new_budget = budget_tokens;
-    if budget_tokens > 0 && budget_tokens < MIN_BUDGET_TOKENS_FOR_THINKING {
-        new_budget = MIN_BUDGET_TOKENS_FOR_THINKING;
-    }
-
-    // Clamp budget_tokens if it exceeds or equals max_tokens (Bedrock constraint)
-    if new_budget >= max_tokens {
-        new_budget = max_tokens - BUDGET_RESERVE_MARGIN;
-    }
-
-    if new_budget != budget_tokens {
-        tracing::debug!(
-            "Clamping thinking budget_tokens: {} -> {} (max_tokens: {})",
-            budget_tokens,
-            new_budget,
-            max_tokens
-        );
-        if let Some(thinking_obj) = obj.get_mut("thinking").and_then(|t| t.as_object_mut()) {
-            thinking_obj.insert("budget_tokens".to_string(), json!(new_budget));
-        }
-    }
-}
-
-/// Strip ID from Gemini function responses (AI Core rejects them).
-fn strip_gemini_function_response_ids(obj: &mut serde_json::Map<String, Value>) {
-    if let Some(Value::Array(contents)) = obj.get_mut("contents") {
-        for content in contents.iter_mut() {
-            if let Some(Value::Array(parts)) = content.get_mut("parts") {
-                for part in parts.iter_mut() {
-                    if let Some(func_response) = part.get_mut("functionResponse")
-                        && let Some(fr_obj) = func_response.as_object_mut()
-                    {
-                        fr_obj.remove("id");
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Convert Gemini ThinkingBudget 0 to -1 (dynamic) to avoid AI Core errors.
-fn fix_gemini_thinking_budget(obj: &mut serde_json::Map<String, Value>) {
-    if let Some(config) = obj.get_mut("generationConfig")
-        && let Some(thinking_config) = config.get_mut("thinkingConfig")
-        && let Some(budget) = thinking_config.get("thinkingBudget")
-        && budget.as_i64() == Some(0)
-    {
-        tracing::debug!("Gemini thinking budget 0 changed to -1 (dynamic)");
-        if let Some(tc_obj) = thinking_config.as_object_mut() {
-            tc_obj.insert("thinkingBudget".to_string(), json!(-1));
-        }
-    }
-}
-
-/// Check if a triple of messages matches the Codex CLI preamble pattern:
-/// assistant(tool_calls) → assistant(content preamble) → tool(response with matching id).
-fn is_preamble_pattern(msg: &Value, preamble: &Value, tool_msg: &Value) -> bool {
-    let is_assistant_with_tool_calls = msg.get("role").and_then(|v| v.as_str()) == Some("assistant")
-        && msg.get("tool_calls").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty());
-    let is_preamble = preamble.get("role").and_then(|v| v.as_str()) == Some("assistant")
-        && preamble.get("content").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
-    let is_tool_response = tool_msg.get("role").and_then(|v| v.as_str()) == Some("tool");
-
-    if !(is_assistant_with_tool_calls && is_preamble && is_tool_response) {
-        return false;
-    }
-    let tool_call_id = tool_msg.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
-    msg.get("tool_calls")
-        .and_then(|v| v.as_array())
-        .is_some_and(|calls| {
-            calls.iter().any(|c| c.get("id").and_then(|v| v.as_str()) == Some(tool_call_id))
-        })
-}
-
-/// Fix Codex CLI bug where a preamble assistant message is inserted between
-/// assistant(tool_calls) and tool(response) messages.
-/// Pattern: assistant(tool_calls) → assistant(content) → tool(response)
-/// Fix: merge preamble content into the first assistant message, remove the duplicate.
-fn normalize_openai_messages(obj: &mut serde_json::Map<String, Value>) {
-    let messages = match obj.get("messages") {
-        Some(Value::Array(msgs)) if msgs.len() >= 3 => msgs,
-        _ => return,
-    };
-
-    // First pass: detect if normalization is needed (avoid cloning if not)
-    let needs_normalization = {
-        let mut found = false;
-        let mut i = 0;
-        while i + 2 < messages.len() {
-            if is_preamble_pattern(&messages[i], &messages[i + 1], &messages[i + 2]) {
-                found = true;
-                break;
-            }
-            i += 1;
-        }
-        found
-    };
-
-    if !needs_normalization {
-        return;
-    }
-
-    // Only clone when we know normalization is needed
-    let messages = match obj.remove("messages") {
-        Some(Value::Array(msgs)) => msgs,
-        _ => return,
-    };
-
-    let mut normalized: Vec<Value> = Vec::with_capacity(messages.len());
-    let mut i = 0;
-
-    while i < messages.len() {
-        if i + 2 < messages.len()
-            && is_preamble_pattern(&messages[i], &messages[i + 1], &messages[i + 2])
-        {
-            let preamble_content = messages[i + 1].get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let mut merged = messages[i].clone();
-
-            let existing_content = messages[i].get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let new_content = if existing_content.is_empty() {
-                preamble_content.to_string()
-            } else {
-                format!("{}\n\n{}", existing_content, preamble_content)
-            };
-            if let Some(obj) = merged.as_object_mut() {
-                obj.insert("content".to_string(), Value::String(new_content));
-            }
-
-            tracing::debug!("Normalized Codex CLI preamble message at index {}", i);
-            normalized.push(merged);
-            i += 2; // Skip the preamble; loop increment will advance past it
-            continue;
-        }
-
-        normalized.push(messages[i].clone());
-        i += 1;
-    }
-
-    obj.insert("messages".to_string(), Value::Array(normalized));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1204,47 +851,46 @@ mod tests {
     #[test]
     fn test_normalize_model_with_1m_suffix() {
         let models = vec![Model {
-            name: "claude-opus-4-6".to_string(),
+            name: "claude-opus-4-7".to_string(),
             aicore_model_name: None,
             aliases: vec![],
             pricing: None,
         }];
         let registry = create_test_registry(models);
 
-        let (name, extended) = normalize_model("claude-opus-4-6[1m]", &registry).unwrap();
-        assert_eq!(name, "claude-opus-4-6");
+        let (name, extended) = normalize_model("claude-opus-4-7[1m]", &registry).unwrap();
+        assert_eq!(name, "claude-opus-4-7");
         assert!(extended);
     }
 
     #[test]
     fn test_normalize_model_without_1m_suffix() {
         let models = vec![Model {
-            name: "claude-opus-4-6".to_string(),
+            name: "claude-opus-4-7".to_string(),
             aicore_model_name: None,
             aliases: vec![],
             pricing: None,
         }];
         let registry = create_test_registry(models);
 
-        let (name, extended) = normalize_model("claude-opus-4-6", &registry).unwrap();
-        assert_eq!(name, "claude-opus-4-6");
+        let (name, extended) = normalize_model("claude-opus-4-7", &registry).unwrap();
+        assert_eq!(name, "claude-opus-4-7");
         assert!(!extended);
     }
 
     #[test]
     fn test_normalize_model_1m_suffix_with_alias_resolution() {
         let models = vec![Model {
-            name: "claude-opus-4-6".to_string(),
+            name: "claude-opus-4-7".to_string(),
             aicore_model_name: None,
-            aliases: vec!["claude-opus-4-6-*".to_string()],
+            aliases: vec!["claude-opus-4-7-*".to_string()],
             pricing: None,
         }];
         let registry = create_test_registry(models);
 
         // Alias match with [1m] suffix
-        let (name, extended) =
-            normalize_model("claude-opus-4-6-20250101[1m]", &registry).unwrap();
-        assert_eq!(name, "claude-opus-4-6");
+        let (name, extended) = normalize_model("claude-opus-4-7-20250101[1m]", &registry).unwrap();
+        assert_eq!(name, "claude-opus-4-7");
         assert!(extended);
     }
 
@@ -1269,8 +915,7 @@ mod tests {
         );
 
         // Unknown claude model with [1m] should fall back to configured claude fallback
-        let (name, extended) =
-            normalize_model("claude-unknown-model[1m]", &registry).unwrap();
+        let (name, extended) = normalize_model("claude-unknown-model[1m]", &registry).unwrap();
         assert_eq!(name, "claude-sonnet-4-5");
         assert!(extended);
     }

@@ -1,0 +1,212 @@
+# =============================================================================
+# AI Core Router - Example Configuration
+# =============================================================================
+# Default location: ~/.aicore/config.yaml
+# Override with: acr --config /path/to/config.yaml
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Log Level
+# -----------------------------------------------------------------------------
+# Options: trace, debug, info, warn, error
+# Can be overridden with: acr --log-level <LEVEL>
+log_level: info
+
+# -----------------------------------------------------------------------------
+# Bind Address
+# -----------------------------------------------------------------------------
+# Address the router listens on. Supports:
+#   - IP:PORT (e.g. "0.0.0.0:9000") — bind to specific address and port
+#   - IP only (e.g. "0.0.0.0") — uses default port 8900
+# Can be overridden with: acr --bind <ADDR>
+bind: "127.0.0.1:8900"
+
+# -----------------------------------------------------------------------------
+# API Keys
+# -----------------------------------------------------------------------------
+# Keys used to authenticate requests to the router.
+# Supports two formats:
+#   - Simple string: just the key value
+#   - Object format: key with optional per-key quota overrides
+api_keys:
+  # Simple format (inherits global quota defaults)
+  - my-api-key-1
+  - my-api-key-2
+
+  # Object format with per-key quota overrides
+  - key: admin-key
+    daily_token_limit: 0        # 0 = unlimited (overrides global default)
+    monthly_token_limit: 0
+    requests_per_minute: 0      # 0 = unlimited (overrides global default)
+
+  - key: limited-user-key
+    daily_token_limit: 500000   # 500K tokens/day
+    monthly_token_limit: 10000000  # 10M tokens/month
+    requests_per_minute: 30     # 30 req/min (override global default)
+
+# -----------------------------------------------------------------------------
+# Token Quotas (Global Defaults)
+# -----------------------------------------------------------------------------
+# Per-API-key limits. When exceeded, requests are rejected with HTTP 429 and
+# a Retry-After header.
+#   - daily_token_limit / monthly_token_limit:
+#       Cumulative *token budgets* enforced against calendar windows
+#       (midnight UTC daily, 1st of month UTC monthly). Requires request logging
+#       (log_requests.enabled: true) since the requests table is the source of truth.
+#   - requests_per_minute:
+#       Instantaneous *request rate* enforced via a token-bucket (governor).
+#       In-memory only; no DB dependency. 0 / null = unlimited.
+quotas:
+  enabled: true
+  daily_token_limit: 1000000      # 1M tokens/day (applies to all keys by default)
+  monthly_token_limit: 20000000   # 20M tokens/month
+  requests_per_minute: 60         # 60 req/min default (per key)
+
+# -----------------------------------------------------------------------------
+# Load Balancing Strategy
+
+# -----------------------------------------------------------------------------
+# Load Balancing Strategy
+# -----------------------------------------------------------------------------
+# How requests are distributed across providers.
+# Options:
+#   - round_robin (default): Distribute requests evenly across providers
+#   - fallback: Always try the first provider; only switch on 429 rate limit
+#
+# Both strategies include automatic failover on 429 (rate limited) responses.
+load_balancing: round_robin
+
+# -----------------------------------------------------------------------------
+# Providers
+# -----------------------------------------------------------------------------
+# Multiple SAP AI Core providers for load balancing and redundancy.
+# Each provider represents an AI Core tenant/resource group with its own
+# OAuth credentials.
+providers:
+  - name: primary
+    uaa_token_url: https://your-tenant.authentication.sap.hana.ondemand.com
+    uaa_client_id: "sb-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx!bXXXXXX|xsuaa_std!bXXXXXX"
+    uaa_client_secret: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx$xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    genai_api_url: https://api.ai.intprod-eu12.eu-central-1.aws.ml.hana.ondemand.com
+    resource_group: default
+    weight: 1       # Load balancing weight (higher = more traffic)
+    enabled: true   # Set to false to temporarily disable this provider
+
+  - name: secondary
+    uaa_token_url: https://another-tenant.authentication.sap.hana.ondemand.com
+    uaa_client_id: "sb-yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy!bYYYYYY|xsuaa_std!bYYYYYY"
+    uaa_client_secret: "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy$yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+    genai_api_url: https://api.ai.internalprod.eu-central-1.aws.ml.hana.ondemand.com
+    resource_group: dev
+    weight: 1
+    enabled: true
+
+# -----------------------------------------------------------------------------
+# Model Mappings
+# -----------------------------------------------------------------------------
+# Define which models the router should resolve from AI Core deployments.
+# Models are discovered automatically by matching against running deployments.
+#
+# Fields:
+#   - name: The model name clients use in requests (required)
+#   - aicore_model_name: The model name in AI Core deployments (optional;
+#                        defaults to 'name' if not specified)
+#   - aliases: Wildcard patterns that resolve to this model (optional)
+#              Supports trailing '*' for prefix matching.
+#   - pricing: Cost per 1M tokens for cost estimation (optional)
+#              Fields: input, output, cache_read, cache_write
+#              Partial pricing is allowed — missing fields are flagged in output.
+models:
+  # Simple: model name matches AI Core deployment name directly
+  - name: gpt-5-mini
+    pricing:
+      input: 0.25
+      output: 2.00
+      # cache_read/cache_write omitted — cost estimate will be flagged as partial
+  - name: gemini-2.5-flash
+    pricing:
+      input: 0.15
+      output: 0.60
+      cache_read: 0.04
+  - name: gemini-2.5-pro
+    pricing:
+      input: 1.25
+      output: 10.00
+      cache_read: 0.31
+
+  # Mapped: client-facing name differs from AI Core deployment name
+  - name: claude-sonnet-4-6
+    aicore_model_name: anthropic--claude-4.6-sonnet
+    aliases:
+      - "claude-4.6-sonnet-*"     # Matches: claude-4.6-sonnet-20260101, etc.
+      - "claude-sonnet-4-6-*"     # Matches: claude-sonnet-4-6-20260101, etc.
+    pricing:
+      input: 3.00
+      output: 15.00
+      cache_read: 0.30
+      cache_write: 3.75
+
+  - name: claude-opus-4-7
+    aicore_model_name: anthropic--claude-4.7-opus
+    aliases:
+      - "claude-4.7-opus-*"       # Versioned dated names
+      - "claude-opus-4-7-*"
+      - "claude-opus-4.7"         # Exact non-versioned variants
+      - "claude-4.7-opus"
+      - "claude-opus-latest"      # Rolling alias — 4.7 owns it
+      - "claude-opus"             # Rolling short alias
+    pricing:                       # Source: llmpricing.dev (May 2026, base tier)
+      input: 5.00
+      output: 25.00
+      cache_read: 0.50
+      cache_write: 6.25
+
+  - name: claude-haiku-4-5
+    aicore_model_name: anthropic--claude-4.5-haiku
+    aliases:
+      - "claude-4.5-haiku-*"
+      - "claude-haiku-4-5-*"
+    pricing:
+      input: 0.80
+      output: 4.00
+      cache_read: 0.08
+      cache_write: 1.00
+
+# -----------------------------------------------------------------------------
+# Fallback Models
+# -----------------------------------------------------------------------------
+# When a requested model is not found in the config, the router falls back
+# to the configured default for that model family.
+# Family detection is by prefix: "claude" -> claude, "gpt"/"text" -> openai,
+# "gemini" -> gemini.
+# The fallback model must also be defined in the 'models' list above.
+fallback_models:
+  claude: claude-sonnet-4-6     # For models starting with "claude"
+  openai: gpt-5-mini            # For models starting with "gpt" or "text"
+  gemini: gemini-2.5-pro        # For models starting with "gemini"
+
+# -----------------------------------------------------------------------------
+# Deployment Refresh Interval
+# -----------------------------------------------------------------------------
+# How often (in seconds) the router re-queries AI Core for deployment changes.
+# Lower values detect new deployments faster but increase API calls.
+# Default: 300 (5 minutes)
+refresh_interval_secs: 300
+
+# -----------------------------------------------------------------------------
+# Request Logging
+# -----------------------------------------------------------------------------
+# Log all requests to a SQLite database for usage tracking and analytics.
+# Enable with this config block or the --log-requests CLI flag.
+# Required for: 'acr usage' command and token quota enforcement.
+log_requests:
+  enabled: true
+  db_path: ~/.aicore/requests.db   # Path to SQLite database
+  retention_days: 30               # Auto-cleanup logs older than N days (0 = keep forever)
+
+# -----------------------------------------------------------------------------
+# Azure OpenAI API Version
+# -----------------------------------------------------------------------------
+# The api-version query parameter sent to Azure OpenAI endpoints.
+# Only change this if your AI Core deployment requires a specific version.
+openai_api_version: "2025-04-01-preview"

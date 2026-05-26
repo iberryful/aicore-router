@@ -1,10 +1,11 @@
 //! Model registry that tracks deployments across multiple providers.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::client::AiCoreClient;
@@ -54,35 +55,51 @@ impl ModelRegistry {
         }
     }
 
-    /// Start the registry with initial resolution and background refresh
-    pub async fn start(&self) -> Result<()> {
-        // Validate fallback models configuration
-        self.validate_fallback_models();
+    /// Start the registry: validate config, do an initial deployment fetch,
+    /// then spawn the background refresh task.
+    ///
+    /// Returns the `JoinHandle` of the background task so the caller can
+    /// observe panics or coordinate shutdown. If the handle is dropped, the
+    /// task continues running (Tokio JoinHandle drop does not abort);
+    /// callers wanting graceful shutdown should call `.abort()` on it.
+    pub async fn start(&self) -> Result<JoinHandle<()>> {
+        // Validate fallback models configuration — fail fast on misconfig
+        // rather than letting bad fallbacks surface as confusing per-request
+        // errors at runtime.
+        self.validate_fallback_models()?;
 
         // Initial resolution
         self.refresh_deployments().await?;
 
         // Start background refresh task
         let registry = self.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             registry.background_refresh().await;
         });
 
-        Ok(())
+        Ok(handle)
     }
 
-    /// Validate that configured fallback models exist in the models list
-    fn validate_fallback_models(&self) {
+    /// Validate that configured fallback models exist in the models list.
+    /// Returns an error listing every misconfigured family so users see all
+    /// problems in one shot rather than fixing them one at a time.
+    fn validate_fallback_models(&self) -> Result<()> {
         let model_names: Vec<&str> = self.config_models.iter().map(|m| m.name.as_str()).collect();
 
-        for (family, fallback) in self.fallback_models.iter() {
-            if !model_names.contains(&fallback) {
-                warn!(
-                    "Fallback model '{}' for {} family is not configured in models list",
-                    fallback, family
-                );
-            }
+        let missing: Vec<String> = self
+            .fallback_models
+            .iter()
+            .filter(|(_, fallback)| !model_names.contains(fallback))
+            .map(|(family, fallback)| format!("{family} -> '{fallback}'"))
+            .collect();
+
+        if !missing.is_empty() {
+            return Err(anyhow!(
+                "fallback model(s) not configured in models list: {}",
+                missing.join(", ")
+            ));
         }
+        Ok(())
     }
 
     /// Get deployment info for a model on a specific provider
@@ -213,10 +230,15 @@ impl ModelRegistry {
                             .get_aicore_model_name()
                             .unwrap_or_else(|| "N/A".to_string());
                         // Find matching config model
-                        let config_model = self.config_models.iter().find(|m| {
-                            let aicore_name = m.aicore_model_name.as_ref().unwrap_or(&m.name);
-                            aicore_name == &deployed_model
-                        }).map(|m| m.name.clone()).unwrap_or_else(|| "-".to_string());
+                        let config_model = self
+                            .config_models
+                            .iter()
+                            .find(|m| {
+                                let aicore_name = m.aicore_model_name.as_ref().unwrap_or(&m.name);
+                                aicore_name == &deployed_model
+                            })
+                            .map(|m| m.name.clone())
+                            .unwrap_or_else(|| "-".to_string());
 
                         table_rows.push((
                             provider.name.clone(),
@@ -261,16 +283,40 @@ impl ModelRegistry {
 
         table_rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.4.cmp(&b.4)));
 
-        let rows: Vec<Vec<String>> = table_rows.iter().map(|(provider, id, status, deployed, config)| {
-            vec![provider.clone(), id.clone(), status.clone(), deployed.clone(), config.clone()]
-        }).collect();
+        let rows: Vec<Vec<String>> = table_rows
+            .iter()
+            .map(|(provider, id, status, deployed, config)| {
+                vec![
+                    provider.clone(),
+                    id.clone(),
+                    status.clone(),
+                    deployed.clone(),
+                    config.clone(),
+                ]
+            })
+            .collect();
 
         let table = CliTable::new(vec![
-            Col { header: "PROVIDER", align: Align::Left },
-            Col { header: "DEPLOYMENT ID", align: Align::Left },
-            Col { header: "STATUS", align: Align::Left },
-            Col { header: "DEPLOYED MODEL", align: Align::Left },
-            Col { header: "CONFIG MODEL", align: Align::Left },
+            Col {
+                header: "PROVIDER",
+                align: Align::Left,
+            },
+            Col {
+                header: "DEPLOYMENT ID",
+                align: Align::Left,
+            },
+            Col {
+                header: "STATUS",
+                align: Align::Left,
+            },
+            Col {
+                header: "DEPLOYED MODEL",
+                align: Align::Left,
+            },
+            Col {
+                header: "CONFIG MODEL",
+                align: Align::Left,
+            },
         ])
         .title("Deployment resolution summary")
         .rows(rows);
@@ -283,7 +329,9 @@ impl ModelRegistry {
         let total_deployments: usize = all_resolved.values().map(|v| v.len()).sum();
 
         // Compute unresolved before moving all_resolved
-        let unresolved: Vec<&str> = self.config_models.iter()
+        let unresolved: Vec<&str> = self
+            .config_models
+            .iter()
             .filter(|m| !all_resolved.contains_key(&m.name))
             .map(|m| m.name.as_str())
             .collect();
@@ -300,7 +348,9 @@ impl ModelRegistry {
         );
 
         if resolved_count == 0 {
-            error!("No models resolved \u{2014} proxy cannot route requests. Check config and deployments.");
+            error!(
+                "No models resolved \u{2014} proxy cannot route requests. Check config and deployments."
+            );
         }
 
         if !unresolved.is_empty() {
@@ -312,7 +362,10 @@ impl ModelRegistry {
             // Warn specifically about unresolved fallback models
             for (family, fb) in self.fallback_models.iter() {
                 if unresolved.contains(&fb) {
-                    warn!("Fallback model '{}' for {} family is unresolved — fallback will not work", fb, family);
+                    warn!(
+                        "Fallback model '{}' for {} family is unresolved — fallback will not work",
+                        fb, family
+                    );
                 }
             }
         }

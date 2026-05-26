@@ -8,7 +8,9 @@ use std::io;
 use std::time::Duration;
 
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -216,7 +218,11 @@ impl TuiApp {
         if content_width == 0 || self.log_buffer.is_empty() {
             return 0;
         }
-        let lines: Vec<Line> = self.log_buffer.iter().map(|entry| self.format_log_line(entry)).collect();
+        let lines: Vec<Line> = self
+            .log_buffer
+            .iter()
+            .map(|entry| self.format_log_line(entry))
+            .collect();
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
         paragraph.line_count(content_width) as u16
     }
@@ -240,7 +246,9 @@ impl TuiApp {
             ),
             Span::styled(
                 entry.message.clone(),
-                Style::default().fg(theme::TEXT_PRIMARY).bg(theme::BACKGROUND),
+                Style::default()
+                    .fg(theme::TEXT_PRIMARY)
+                    .bg(theme::BACKGROUND),
             ),
         ])
     }
@@ -256,13 +264,20 @@ impl TuiApp {
 
         // Always restore terminal state, even if the loop errored
         let _ = disable_raw_mode();
-        let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
         let _ = terminal.show_cursor();
 
         result
     }
 
-    fn run_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    fn run_loop(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> io::Result<()> {
         loop {
             // Drain log messages
             let mut new_logs = false;
@@ -338,7 +353,8 @@ impl TuiApp {
                         }
                         // Cycle API keys
                         KeyCode::Tab => {
-                            self.selected_key_index = (self.selected_key_index + 1) % self.api_keys.len().max(1);
+                            self.selected_key_index =
+                                (self.selected_key_index + 1) % self.api_keys.len().max(1);
                         }
                         KeyCode::BackTab => {
                             if self.selected_key_index == 0 {
@@ -496,19 +512,22 @@ impl TuiApp {
 
         // Row 3: API Key with cycling indicator
         let key_label = if self.api_keys.len() > 1 {
-            format!("Key ({}/{})", self.selected_key_index + 1, self.api_keys.len())
+            format!(
+                "Key ({}/{})",
+                self.selected_key_index + 1,
+                self.api_keys.len()
+            )
         } else {
             "API Key".to_string()
         };
-        let key_value = self.api_keys.get(self.selected_key_index)
+        let key_value = self
+            .api_keys
+            .get(self.selected_key_index)
             .cloned()
             .unwrap_or_else(|| "N/A".to_string());
 
         // Row 3 c2: Requests with symbols
-        let requests_display = format!(
-            "{} / {}",
-            snap.successful_requests, snap.failed_requests
-        );
+        let requests_display = format!("{} / {}", snap.successful_requests, snap.failed_requests);
 
         // Row 4: Quota display + Est. Cost
         let quota_display = self.render_quota_display();
@@ -572,25 +591,37 @@ impl TuiApp {
     fn render_quota_display(&self) -> Cell<'_> {
         let Some(ref qm) = self.quota_manager else {
             return Cell::from(" -- / -- ").style(
-                Style::default().fg(theme::TEXT_SECONDARY).bg(theme::SURFACE),
+                Style::default()
+                    .fg(theme::TEXT_SECONDARY)
+                    .bg(theme::SURFACE),
             );
         };
 
         let Some(key) = self.api_keys.get(self.selected_key_index) else {
             return Cell::from(" N/A ").style(
-                Style::default().fg(theme::TEXT_SECONDARY).bg(theme::SURFACE),
+                Style::default()
+                    .fg(theme::TEXT_SECONDARY)
+                    .bg(theme::SURFACE),
             );
         };
 
         let Some(result) = qm.check_quota_sync(key) else {
             return Cell::from(" ... ").style(
-                Style::default().fg(theme::TEXT_SECONDARY).bg(theme::SURFACE),
+                Style::default()
+                    .fg(theme::TEXT_SECONDARY)
+                    .bg(theme::SURFACE),
             );
         };
 
         use crate::quota::QuotaCheckResult;
         match result {
-            QuotaCheckResult::Allowed { daily_remaining, monthly_remaining, daily_limit, monthly_limit, .. } => {
+            QuotaCheckResult::Allowed {
+                daily_remaining,
+                monthly_remaining,
+                daily_limit,
+                monthly_limit,
+                ..
+            } => {
                 let daily_pct = match (daily_remaining, daily_limit) {
                     (Some(remaining), Some(limit)) if limit > 0 => {
                         Some(((limit - remaining) as f64 / limit as f64) * 100.0)
@@ -604,8 +635,12 @@ impl TuiApp {
                     _ => None,
                 };
 
-                let daily_str = daily_pct.map(|p| format!("{:.0}%", p)).unwrap_or_else(|| "--".to_string());
-                let monthly_str = monthly_pct.map(|p| format!("{:.0}%", p)).unwrap_or_else(|| "--".to_string());
+                let daily_str = daily_pct
+                    .map(|p| format!("{:.0}%", p))
+                    .unwrap_or_else(|| "--".to_string());
+                let monthly_str = monthly_pct
+                    .map(|p| format!("{:.0}%", p))
+                    .unwrap_or_else(|| "--".to_string());
 
                 // Append * when db feature is off (no persistence)
                 #[cfg(feature = "db")]
@@ -618,12 +653,18 @@ impl TuiApp {
                 let color = quota_color(max_pct);
 
                 Cell::from(format!(" {} / {}{} ", daily_str, monthly_str, suffix)).style(
-                    Style::default().fg(color).bg(theme::SURFACE).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(color)
+                        .bg(theme::SURFACE)
+                        .add_modifier(Modifier::BOLD),
                 )
             }
             QuotaCheckResult::Exceeded { limit_type, .. } => {
                 Cell::from(format!(" EXCEEDED ({}) ", limit_type)).style(
-                    Style::default().fg(Color::Red).bg(theme::SURFACE).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Red)
+                        .bg(theme::SURFACE)
+                        .add_modifier(Modifier::BOLD),
                 )
             }
         }
@@ -635,7 +676,9 @@ impl TuiApp {
             Some(usage) if !usage.is_empty() => usage,
             _ => {
                 return Cell::from(" N/A ").style(
-                    Style::default().fg(theme::TEXT_SECONDARY).bg(theme::SURFACE),
+                    Style::default()
+                        .fg(theme::TEXT_SECONDARY)
+                        .bg(theme::SURFACE),
                 );
             }
         };
@@ -645,7 +688,9 @@ impl TuiApp {
         let mut any_partial = false;
 
         for (model_name, counts) in &model_usage {
-            let pricing = self.models.iter()
+            let pricing = self
+                .models
+                .iter()
                 .find(|m| m.name == *model_name)
                 .and_then(|m| m.pricing.as_ref());
 
@@ -660,7 +705,9 @@ impl TuiApp {
 
         if !any_priced {
             return Cell::from(" N/A ").style(
-                Style::default().fg(theme::TEXT_SECONDARY).bg(theme::SURFACE),
+                Style::default()
+                    .fg(theme::TEXT_SECONDARY)
+                    .bg(theme::SURFACE),
             );
         }
 
@@ -687,7 +734,11 @@ impl TuiApp {
 
     fn render_logs(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
         let total = self.log_buffer.len();
-        let lines: Vec<Line> = self.log_buffer.iter().map(|entry| self.format_log_line(entry)).collect();
+        let lines: Vec<Line> = self
+            .log_buffer
+            .iter()
+            .map(|entry| self.format_log_line(entry))
+            .collect();
 
         let title = format!(" \u{1f4cb} Proxy Logs ({total} entries) ");
         let block = Block::default()

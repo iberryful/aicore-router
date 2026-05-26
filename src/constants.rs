@@ -9,6 +9,11 @@ pub mod models {
     pub const GEMINI_PREFIX: &str = "gemini";
     pub const GPT_PREFIX: &str = "gpt";
     pub const TEXT_PREFIX: &str = "text";
+
+    /// Resolved client-facing name for Claude Opus 4.7. Used by `proxy::is_opus_4_7`
+    /// to gate request-shape overrides specific to this model (sampling-param strip,
+    /// adaptive-thinking conversion).
+    pub const CLAUDE_OPUS_4_7: &str = "claude-opus-4-7";
 }
 
 pub mod api {
@@ -42,10 +47,7 @@ pub mod api {
             "fine-grained-tool-streaming-2025-05-14",
             "fine-grained-tool-streaming-2025-05-14",
         ),
-        (
-            "tool-search-tool-2025-10-19",
-            "tool-search-tool-2025-10-19",
-        ),
+        ("tool-search-tool-2025-10-19", "tool-search-tool-2025-10-19"),
         ("tool-examples-2025-10-29", "tool-examples-2025-10-29"),
         (
             "advanced-tool-use-2025-11-20",
@@ -77,9 +79,9 @@ pub mod api {
 pub fn get_context_length(model: &str) -> Option<u64> {
     static CONTEXT_LENGTHS: &[(&str, u64)] = &[
         // --- Anthropic Claude (via AWS Bedrock) ---
-        // Claude Opus 4.6+ and Sonnet 4.6: native 1M context
-        ("claude-opus-4-6", 1_000_000),
+        // Claude Opus 4.6 / 4.7 and Sonnet 4.6: native 1M context
         ("claude-opus-4-7", 1_000_000),
+        ("claude-opus-4-6", 1_000_000),
         ("claude-sonnet-4-6", 1_000_000),
         // Claude Sonnet 4.5 and older, Haiku: 200k (1M only via [1m] beta)
         ("claude-opus-4", 200_000),

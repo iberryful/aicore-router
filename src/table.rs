@@ -3,7 +3,7 @@
 //! All CLI table output should use [`CliTable`] to ensure consistent formatting
 //! (preset, alignment, divider style) across all commands.
 
-use comfy_table::{presets, CellAlignment, ContentArrangement, Table};
+use comfy_table::{CellAlignment, ContentArrangement, Table, presets};
 
 /// Column alignment.
 #[derive(Clone, Copy)]
@@ -171,8 +171,14 @@ mod tests {
     fn test_cli_table_basic() {
         // Smoke test — just verify it doesn't panic
         CliTable::new(vec![
-            Col { header: "Name", align: Align::Left },
-            Col { header: "Count", align: Align::Right },
+            Col {
+                header: "Name",
+                align: Align::Left,
+            },
+            Col {
+                header: "Count",
+                align: Align::Right,
+            },
         ])
         .row(vec!["hello".into(), "42".into()])
         .print();
@@ -181,8 +187,14 @@ mod tests {
     #[test]
     fn test_cli_table_with_total() {
         CliTable::new(vec![
-            Col { header: "Model", align: Align::Left },
-            Col { header: "Tokens", align: Align::Right },
+            Col {
+                header: "Model",
+                align: Align::Left,
+            },
+            Col {
+                header: "Tokens",
+                align: Align::Right,
+            },
         ])
         .rows(vec![
             vec!["gpt-4".into(), "1,234".into()],

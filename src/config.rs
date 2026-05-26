@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -190,7 +190,6 @@ pub struct ProviderConfig {
     pub unknown: HashMap<String, serde_yaml_ng::Value>,
 }
 
-
 /// Pricing per 1M tokens for cost estimation.
 /// All fields are optional — if a field is None, that token type contributes $0
 /// to the cost estimate but is flagged as partial.
@@ -302,6 +301,11 @@ pub struct QuotaConfig {
     /// Default monthly token limit for all API keys (None = unlimited)
     #[serde(default)]
     pub monthly_token_limit: Option<u64>,
+    /// Default per-key requests-per-minute rate limit (None / 0 = unlimited).
+    /// Enforced as a token-bucket via the `governor` crate; rejected requests
+    /// receive HTTP 429 with `Retry-After`.
+    #[serde(default)]
+    pub requests_per_minute: Option<u32>,
     /// Catch-all for unknown fields
     #[serde(flatten, default)]
     pub unknown: HashMap<String, serde_yaml_ng::Value>,
@@ -317,6 +321,9 @@ pub struct ApiKeyConfig {
     /// Per-key monthly token limit override (None = use global default)
     #[serde(default)]
     pub monthly_token_limit: Option<u64>,
+    /// Per-key requests-per-minute override (None = use global default)
+    #[serde(default)]
+    pub requests_per_minute: Option<u32>,
 }
 
 /// Intermediate deserialization type that accepts both string and object forms.
@@ -332,6 +339,8 @@ enum ApiKeyEntry {
         daily_token_limit: Option<u64>,
         #[serde(default)]
         monthly_token_limit: Option<u64>,
+        #[serde(default)]
+        requests_per_minute: Option<u32>,
     },
 }
 
@@ -342,15 +351,18 @@ impl From<ApiKeyEntry> for ApiKeyConfig {
                 key,
                 daily_token_limit: None,
                 monthly_token_limit: None,
+                requests_per_minute: None,
             },
             ApiKeyEntry::WithConfig {
                 key,
                 daily_token_limit,
                 monthly_token_limit,
+                requests_per_minute,
             } => ApiKeyConfig {
                 key,
                 daily_token_limit,
                 monthly_token_limit,
+                requests_per_minute,
             },
         }
     }
@@ -371,9 +383,7 @@ pub fn parse_bind_address(s: &str) -> Result<SocketAddr> {
     if let Ok(ip) = s.parse::<IpAddr>() {
         return Ok(SocketAddr::new(ip, 8900));
     }
-    bail!(
-        "Invalid bind address '{s}'. Expected IP (e.g. 127.0.0.1) or IP:PORT (e.g. 0.0.0.0:9000)"
-    )
+    bail!("Invalid bind address '{s}'. Expected IP (e.g. 127.0.0.1) or IP:PORT (e.g. 0.0.0.0:9000)")
 }
 
 fn default_log_level() -> String {
@@ -460,7 +470,11 @@ impl Config {
 
     /// Look up pricing configuration for a model by name.
     pub fn get_model_pricing(&self, model_name: &str) -> Option<&ModelPricing> {
-        self.models.iter().find(|m| m.name == model_name)?.pricing.as_ref()
+        self.models
+            .iter()
+            .find(|m| m.name == model_name)?
+            .pricing
+            .as_ref()
     }
 
     fn from_file_and_env(file_config: ConfigFile) -> Result<Self> {
@@ -1045,7 +1059,8 @@ models:
     #[test]
     fn test_example_config_is_valid() {
         let example_path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/config.yaml");
-        let config = Config::load(Some(example_path)).expect("examples/config.yaml should be a valid config");
+        let config = Config::load(Some(example_path))
+            .expect("examples/config.yaml should be a valid config");
 
         // Verify structure is parsed correctly
         assert_eq!(config.bind, "127.0.0.1:8900");
@@ -1071,7 +1086,10 @@ models:
 
         // Verify pricing is parsed from example config
         let claude_pricing = config.get_model_pricing("claude-sonnet-4-6");
-        assert!(claude_pricing.is_some(), "claude-sonnet-4-6 should have pricing");
+        assert!(
+            claude_pricing.is_some(),
+            "claude-sonnet-4-6 should have pricing"
+        );
         let cp = claude_pricing.unwrap();
         assert_eq!(cp.input, Some(3.00));
         assert_eq!(cp.output, Some(15.00));
@@ -1098,10 +1116,18 @@ models:
         };
 
         // 1M input tokens = $3.00, 500K output = $7.50, 200K cache_read = $0.06, 100K cache_write = $0.375
-        let tokens = TokenCounts { input: 1_000_000, output: 500_000, cache_read: 200_000, cache_write: 100_000 };
+        let tokens = TokenCounts {
+            input: 1_000_000,
+            output: 500_000,
+            cache_read: 200_000,
+            cache_write: 100_000,
+        };
         let cost = pricing.calculate_cost(&tokens);
         let expected = 3.00 + 7.50 + 0.06 + 0.375;
-        assert!((cost - expected).abs() < 1e-10, "cost={cost}, expected={expected}");
+        assert!(
+            (cost - expected).abs() < 1e-10,
+            "cost={cost}, expected={expected}"
+        );
     }
 
     #[test]
@@ -1114,11 +1140,19 @@ models:
             cache_write: None,
         };
 
-        let tokens = TokenCounts { input: 100_000, output: 50_000, cache_read: 30_000, cache_write: 10_000 };
+        let tokens = TokenCounts {
+            input: 100_000,
+            output: 50_000,
+            cache_read: 30_000,
+            cache_write: 10_000,
+        };
         let cost = pricing.calculate_cost(&tokens);
         // Only input (0.025) + output (0.10) = 0.125; cache types contribute 0
         let expected = 0.025 + 0.10;
-        assert!((cost - expected).abs() < 1e-10, "cost={cost}, expected={expected}");
+        assert!(
+            (cost - expected).abs() < 1e-10,
+            "cost={cost}, expected={expected}"
+        );
     }
 
     #[test]
@@ -1131,7 +1165,12 @@ models:
             cache_write: None,
         };
 
-        let tokens = TokenCounts { input: 1_000_000, output: 500_000, cache_read: 200_000, cache_write: 100_000 };
+        let tokens = TokenCounts {
+            input: 1_000_000,
+            output: 500_000,
+            cache_read: 200_000,
+            cache_write: 100_000,
+        };
         let cost = pricing.calculate_cost(&tokens);
         assert_eq!(cost, 0.0);
     }
@@ -1145,8 +1184,18 @@ models:
             cache_read: Some(0.30),
             cache_write: Some(3.75),
         };
-        assert!(!full.is_partial(&TokenCounts { input: 100, output: 50, cache_read: 10, cache_write: 5 }));
-        assert!(!full.is_partial(&TokenCounts { input: 100, output: 50, cache_read: 0, cache_write: 0 }));
+        assert!(!full.is_partial(&TokenCounts {
+            input: 100,
+            output: 50,
+            cache_read: 10,
+            cache_write: 5
+        }));
+        assert!(!full.is_partial(&TokenCounts {
+            input: 100,
+            output: 50,
+            cache_read: 0,
+            cache_write: 0
+        }));
 
         // Missing cache_read but no cache read usage — not partial
         let no_cache = ModelPricing {
@@ -1155,13 +1204,33 @@ models:
             cache_read: None,
             cache_write: None,
         };
-        assert!(!no_cache.is_partial(&TokenCounts { input: 100, output: 50, cache_read: 0, cache_write: 0 }));
+        assert!(!no_cache.is_partial(&TokenCounts {
+            input: 100,
+            output: 50,
+            cache_read: 0,
+            cache_write: 0
+        }));
         // With cache read usage — partial
-        assert!(no_cache.is_partial(&TokenCounts { input: 100, output: 50, cache_read: 10, cache_write: 0 }));
+        assert!(no_cache.is_partial(&TokenCounts {
+            input: 100,
+            output: 50,
+            cache_read: 10,
+            cache_write: 0
+        }));
         // With cache write usage — partial
-        assert!(no_cache.is_partial(&TokenCounts { input: 100, output: 50, cache_read: 0, cache_write: 5 }));
+        assert!(no_cache.is_partial(&TokenCounts {
+            input: 100,
+            output: 50,
+            cache_read: 0,
+            cache_write: 5
+        }));
         // Both cache types used — partial
-        assert!(no_cache.is_partial(&TokenCounts { input: 100, output: 50, cache_read: 10, cache_write: 5 }));
+        assert!(no_cache.is_partial(&TokenCounts {
+            input: 100,
+            output: 50,
+            cache_read: 10,
+            cache_write: 5
+        }));
 
         // Missing input — always partial
         let no_input = ModelPricing {
@@ -1170,7 +1239,12 @@ models:
             cache_read: Some(0.30),
             cache_write: Some(3.75),
         };
-        assert!(no_input.is_partial(&TokenCounts { input: 0, output: 0, cache_read: 0, cache_write: 0 }));
+        assert!(no_input.is_partial(&TokenCounts {
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0
+        }));
     }
 
     #[test]
@@ -1204,7 +1278,8 @@ models:
         let config_path = temp_dir.path().join("pricing_config.yaml");
         fs::write(&config_path, yaml_content).expect("Failed to write config file");
 
-        let config = Config::load(Some(config_path.to_str().unwrap())).expect("Failed to load config");
+        let config =
+            Config::load(Some(config_path.to_str().unwrap())).expect("Failed to load config");
 
         // Claude has full pricing
         let claude_pricing = config.get_model_pricing("claude-sonnet-4-6").unwrap();
@@ -1212,7 +1287,12 @@ models:
         assert_eq!(claude_pricing.output, Some(15.00));
         assert_eq!(claude_pricing.cache_read, Some(0.30));
         assert_eq!(claude_pricing.cache_write, Some(3.75));
-        assert!(!claude_pricing.is_partial(&TokenCounts { input: 100, output: 50, cache_read: 10, cache_write: 5 }));
+        assert!(!claude_pricing.is_partial(&TokenCounts {
+            input: 100,
+            output: 50,
+            cache_read: 10,
+            cache_write: 5
+        }));
 
         // GPT has partial pricing (no cache)
         let gpt_pricing = config.get_model_pricing("gpt-5-mini").unwrap();
@@ -1220,7 +1300,12 @@ models:
         assert_eq!(gpt_pricing.output, Some(2.00));
         assert_eq!(gpt_pricing.cache_read, None);
         assert_eq!(gpt_pricing.cache_write, None);
-        assert!(gpt_pricing.is_partial(&TokenCounts { input: 100, output: 50, cache_read: 10, cache_write: 0 }));
+        assert!(gpt_pricing.is_partial(&TokenCounts {
+            input: 100,
+            output: 50,
+            cache_read: 10,
+            cache_write: 0
+        }));
 
         // Gemini has no pricing
         assert!(config.get_model_pricing("gemini-2.5-pro").is_none());

@@ -4,6 +4,8 @@ use std::net::SocketAddr;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{EnvFilter, fmt};
 
+#[cfg(feature = "db")]
+use crate::database::Database;
 use crate::{
     balancer::LoadBalancer,
     commands::CommandHandler,
@@ -14,8 +16,6 @@ use crate::{
     routes::{AppState, create_router},
     token::TokenManager,
 };
-#[cfg(feature = "db")]
-use crate::database::Database;
 
 pub struct Cli;
 
@@ -59,12 +59,16 @@ impl Cli {
                 }
                 #[cfg(feature = "db")]
                 ("usage", usage_matches) => {
-                    let api_key = usage_matches.get_one::<String>("api-key").map(|s| s.as_str());
+                    let api_key = usage_matches
+                        .get_one::<String>("api-key")
+                        .map(|s| s.as_str());
                     let daily = usage_matches.get_one::<u32>("daily").copied();
                     let weekly = usage_matches.get_one::<u32>("weekly").copied();
                     let monthly = usage_matches.get_one::<u32>("monthly").copied();
                     let show_cost = usage_matches.get_flag("cost");
-                    return handler.usage(api_key, daily, weekly, monthly, show_cost).await;
+                    return handler
+                        .usage(api_key, daily, weekly, monthly, show_cost)
+                        .await;
                 }
                 #[cfg(feature = "db")]
                 ("logs", logs_matches) => {
@@ -189,21 +193,15 @@ impl Cli {
                     ),
             );
 
-        cmd
+        cmd.subcommand(Command::new("resource-groups").about("List all resource groups"))
             .subcommand(
-                Command::new("resource-groups")
-                    .about("List all resource groups"),
-            )
-            .subcommand(
-                Command::new("deployments")
-                    .about("List deployments")
-                    .arg(
-                        Arg::new("resource-group")
-                            .short('r')
-                            .long("resource-group")
-                            .value_name("RESOURCE_GROUP")
-                            .help("Resource group to filter deployments"),
-                    ),
+                Command::new("deployments").about("List deployments").arg(
+                    Arg::new("resource-group")
+                        .short('r')
+                        .long("resource-group")
+                        .value_name("RESOURCE_GROUP")
+                        .help("Resource group to filter deployments"),
+                ),
             )
             .subcommand(
                 Command::new("configure")
@@ -237,8 +235,12 @@ impl Cli {
             "aicore_router={},acr={},info",
             config.log_level, config.log_level
         );
-        let env_filter = EnvFilter::try_new(&filter_directive)
-            .with_context(|| format!("Invalid log_level '{}'. Valid options: trace, debug, info, warn, error", config.log_level))?;
+        let env_filter = EnvFilter::try_new(&filter_directive).with_context(|| {
+            format!(
+                "Invalid log_level '{}'. Valid options: trace, debug, info, warn, error",
+                config.log_level
+            )
+        })?;
 
         #[cfg(feature = "tui")]
         let tui_log_tx = if matches.get_flag("tui") {
@@ -303,7 +305,7 @@ impl Cli {
             token_manager.clone(),
             config.refresh_interval_secs,
         );
-        model_registry
+        let _registry_handle = model_registry
             .start()
             .await
             .context("Failed to start model registry")?;
@@ -325,7 +327,9 @@ impl Cli {
 
         #[cfg(not(feature = "db"))]
         if config.log_requests.enabled {
-            tracing::warn!("log_requests enabled in config but 'db' feature not compiled; request logging unavailable");
+            tracing::warn!(
+                "log_requests enabled in config but 'db' feature not compiled; request logging unavailable"
+            );
         }
 
         let rate_limiter = AuthRateLimiter::new();
@@ -340,7 +344,11 @@ impl Cli {
                 if let Some(ref db) = cleanup_db {
                     match db.cleanup_old_requests(retention_days).await {
                         Ok(0) => {}
-                        Ok(n) => tracing::info!("Cleaned up {} old log entries (>{} days)", n, retention_days),
+                        Ok(n) => tracing::info!(
+                            "Cleaned up {} old log entries (>{} days)",
+                            n,
+                            retention_days
+                        ),
                         Err(e) => tracing::warn!("Failed to clean up old logs: {}", e),
                     }
                 }
@@ -360,7 +368,8 @@ impl Cli {
         // Create quota manager if enabled
         let quota_manager = if config.quotas.enabled {
             #[cfg(feature = "db")]
-            let qm = crate::quota::QuotaManager::new(&config.api_keys, &config.quotas, database.clone());
+            let qm =
+                crate::quota::QuotaManager::new(&config.api_keys, &config.quotas, database.clone());
             #[cfg(not(feature = "db"))]
             let qm = crate::quota::QuotaManager::new(&config.api_keys, &config.quotas);
 
@@ -387,17 +396,38 @@ impl Cli {
             );
 
             #[cfg(not(feature = "db"))]
-            tracing::warn!("Quotas running in-memory only (no 'db' feature); usage resets on restart");
+            tracing::warn!(
+                "Quotas running in-memory only (no 'db' feature); usage resets on restart"
+            );
 
             #[cfg(feature = "db")]
             if !config.log_requests.enabled {
-                tracing::warn!("Quotas running in-memory only (log_requests disabled); usage resets on restart");
+                tracing::warn!(
+                    "Quotas running in-memory only (log_requests disabled); usage resets on restart"
+                );
             }
 
             Some(qm)
         } else {
             None
         };
+
+        // Build per-API-key request-rate limiter (separate from token quotas above).
+        // Returns None if no requests_per_minute is configured anywhere.
+        let request_limiter =
+            crate::request_limiter::RequestLimiter::from_config(&config.api_keys, &config.quotas)
+                .map(std::sync::Arc::new);
+        if let Some(ref rl) = request_limiter {
+            tracing::info!(
+                "Per-key request rate limiting enabled (default: {})",
+                config
+                    .quotas
+                    .requests_per_minute
+                    .map(|n| format!("{n} req/min"))
+                    .unwrap_or_else(|| "unlimited".to_string()),
+            );
+            let _ = rl; // suppress unused-variable warning when feature combos exclude usage
+        }
 
         let state = AppState {
             config: config.clone(),
@@ -410,6 +440,7 @@ impl Cli {
             database,
             rate_limiter,
             quota_manager: quota_manager.clone(),
+            request_limiter,
         };
 
         let app = create_router(state)

@@ -17,6 +17,7 @@ use crate::{
     quota::{QuotaCheckResult, QuotaManager},
     rate_limit::AuthRateLimiter,
     registry::ModelRegistry,
+    request_limiter::{RequestLimitResult, RequestLimiter},
     token::TokenManager,
 };
 
@@ -32,6 +33,7 @@ pub struct AppState {
     pub database: Option<crate::database::Database>,
     pub rate_limiter: AuthRateLimiter,
     pub quota_manager: Option<QuotaManager>,
+    pub request_limiter: Option<std::sync::Arc<RequestLimiter>>,
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -134,7 +136,17 @@ async fn execute_proxy_request(
     }
 
     // Pre-compute API key hash once for quota checks, DB logging, and usage recording
-    let api_key_hash = request_api_key.as_ref().map(|k| crate::quota::hash_api_key(k));
+    let api_key_hash = request_api_key
+        .as_ref()
+        .map(|k| crate::quota::hash_api_key(k));
+
+    // Per-key request-rate check (separate from cumulative token quota below).
+    if let Some(ref rl) = state.request_limiter
+        && let Some(ref kh) = api_key_hash
+        && let RequestLimitResult::Exceeded { retry_after_secs } = rl.check(kh)
+    {
+        return Err(AppError::RateLimitedRequests { retry_after_secs });
+    }
 
     // Check token quota before processing
     if let Some(ref qm) = state.quota_manager
@@ -449,6 +461,8 @@ pub enum AppError {
     AllProvidersRateLimited,
     #[error("Too many failed authentication attempts")]
     RateLimitedAuth { retry_after_secs: u64 },
+    #[error("Per-key request rate limit exceeded")]
+    RateLimitedRequests { retry_after_secs: u64 },
     #[error("Token quota exceeded ({limit_type} limit)")]
     QuotaExceeded {
         retry_after_secs: u64,
@@ -486,6 +500,13 @@ impl IntoResponse for AppError {
                     retry_after_secs
                 ),
             ),
+            AppError::RateLimitedRequests { retry_after_secs } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Per-key request rate limit exceeded. Retry after {} seconds.",
+                    retry_after_secs
+                ),
+            ),
             AppError::QuotaExceeded {
                 retry_after_secs,
                 limit_type,
@@ -507,8 +528,16 @@ impl IntoResponse for AppError {
 
         let mut response = (status, Json(json!({ "error": message }))).into_response();
 
-        if let AppError::RateLimitedAuth { retry_after_secs } = &self
-            && let Ok(val) = axum::http::HeaderValue::from_str(&retry_after_secs.to_string())
+        let retry_after = match &self {
+            AppError::RateLimitedAuth { retry_after_secs }
+            | AppError::RateLimitedRequests { retry_after_secs }
+            | AppError::QuotaExceeded {
+                retry_after_secs, ..
+            } => Some(*retry_after_secs),
+            _ => None,
+        };
+        if let Some(secs) = retry_after
+            && let Ok(val) = axum::http::HeaderValue::from_str(&secs.to_string())
         {
             response.headers_mut().insert("retry-after", val);
         }

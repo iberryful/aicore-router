@@ -2,10 +2,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 
-use crate::{
-    config::Provider,
-    token::TokenManager,
-};
+use crate::{config::Provider, token::TokenManager};
 
 #[derive(Debug, Deserialize)]
 pub struct ResourceGroup {
@@ -184,6 +181,4 @@ impl AiCoreClient {
 
         Ok(deployments)
     }
-
-
 }

@@ -42,10 +42,7 @@ pub struct MetricsSnapshot {
 #[derive(Debug, Clone)]
 pub enum MetricsEvent {
     RequestStarted,
-    RequestCompleted {
-        success: bool,
-        tokens: TokenCounts,
-    },
+    RequestCompleted { success: bool, tokens: TokenCounts },
 }
 
 struct MetricsInner {
@@ -148,10 +145,18 @@ impl MetricsService {
             self.inner.failed_requests.fetch_add(1, Ordering::Relaxed);
         }
 
-        self.inner.total_input_tokens.fetch_add(tokens.input, Ordering::Relaxed);
-        self.inner.total_output_tokens.fetch_add(tokens.output, Ordering::Relaxed);
-        self.inner.total_cache_read_tokens.fetch_add(tokens.cache_read, Ordering::Relaxed);
-        self.inner.total_cache_write_tokens.fetch_add(tokens.cache_write, Ordering::Relaxed);
+        self.inner
+            .total_input_tokens
+            .fetch_add(tokens.input, Ordering::Relaxed);
+        self.inner
+            .total_output_tokens
+            .fetch_add(tokens.output, Ordering::Relaxed);
+        self.inner
+            .total_cache_read_tokens
+            .fetch_add(tokens.cache_read, Ordering::Relaxed);
+        self.inner
+            .total_cache_write_tokens
+            .fetch_add(tokens.cache_write, Ordering::Relaxed);
 
         // Update per-model tracking
         if let Some(model_name) = model {
@@ -181,7 +186,10 @@ impl MetricsService {
                 total_input_tokens: self.inner.total_input_tokens.load(Ordering::Relaxed),
                 total_output_tokens: self.inner.total_output_tokens.load(Ordering::Relaxed),
                 total_cache_read_tokens: self.inner.total_cache_read_tokens.load(Ordering::Relaxed),
-                total_cache_write_tokens: self.inner.total_cache_write_tokens.load(Ordering::Relaxed),
+                total_cache_write_tokens: self
+                    .inner
+                    .total_cache_write_tokens
+                    .load(Ordering::Relaxed),
             },
         }
     }
@@ -194,11 +202,7 @@ impl MetricsService {
     /// Non-blocking per-model usage for synchronous contexts.
     /// Returns None if the lock is contended.
     pub fn session_usage_by_model_sync(&self) -> Option<HashMap<String, TokenCounts>> {
-        self.inner
-            .model_usage
-            .try_read()
-            .ok()
-            .map(|m| m.clone())
+        self.inner.model_usage.try_read().ok().map(|m| m.clone())
     }
 
     /// Subscribe to real-time metrics events.
@@ -236,8 +240,17 @@ mod tests {
     #[tokio::test]
     async fn test_record_completion_success() {
         let ms = MetricsService::new();
-        ms.record_completion(true, Some("test-model"), &TokenCounts { input: 100, output: 50, cache_read: 10, cache_write: 5 })
-            .await;
+        ms.record_completion(
+            true,
+            Some("test-model"),
+            &TokenCounts {
+                input: 100,
+                output: 50,
+                cache_read: 10,
+                cache_write: 5,
+            },
+        )
+        .await;
         let snap = ms.snapshot_sync();
         assert_eq!(snap.successful_requests, 1);
         assert_eq!(snap.failed_requests, 0);
@@ -250,7 +263,8 @@ mod tests {
     #[tokio::test]
     async fn test_record_completion_failure() {
         let ms = MetricsService::new();
-        ms.record_completion(false, None, &TokenCounts::default()).await;
+        ms.record_completion(false, None, &TokenCounts::default())
+            .await;
         let snap = ms.snapshot_sync();
         assert_eq!(snap.successful_requests, 0);
         assert_eq!(snap.failed_requests, 1);
@@ -259,10 +273,28 @@ mod tests {
     #[tokio::test]
     async fn test_accumulation() {
         let ms = MetricsService::new();
-        ms.record_completion(true, Some("gpt-4o"), &TokenCounts { input: 100, output: 50, cache_read: 0, cache_write: 0 })
-            .await;
-        ms.record_completion(true, Some("gpt-4o"), &TokenCounts { input: 200, output: 100, cache_read: 30, cache_write: 0 })
-            .await;
+        ms.record_completion(
+            true,
+            Some("gpt-4o"),
+            &TokenCounts {
+                input: 100,
+                output: 50,
+                cache_read: 0,
+                cache_write: 0,
+            },
+        )
+        .await;
+        ms.record_completion(
+            true,
+            Some("gpt-4o"),
+            &TokenCounts {
+                input: 200,
+                output: 100,
+                cache_read: 30,
+                cache_write: 0,
+            },
+        )
+        .await;
         let snap = ms.snapshot_sync();
         assert_eq!(snap.usage.total_input_tokens, 300);
         assert_eq!(snap.usage.total_output_tokens, 150);
@@ -272,12 +304,39 @@ mod tests {
     #[tokio::test]
     async fn test_per_model_tracking() {
         let ms = MetricsService::new();
-        ms.record_completion(true, Some("claude-sonnet-4-5"), &TokenCounts { input: 100, output: 50, cache_read: 10, cache_write: 5 })
-            .await;
-        ms.record_completion(true, Some("gpt-4o"), &TokenCounts { input: 200, output: 100, cache_read: 0, cache_write: 0 })
-            .await;
-        ms.record_completion(true, Some("claude-sonnet-4-5"), &TokenCounts { input: 300, output: 150, cache_read: 20, cache_write: 0 })
-            .await;
+        ms.record_completion(
+            true,
+            Some("claude-sonnet-4-5"),
+            &TokenCounts {
+                input: 100,
+                output: 50,
+                cache_read: 10,
+                cache_write: 5,
+            },
+        )
+        .await;
+        ms.record_completion(
+            true,
+            Some("gpt-4o"),
+            &TokenCounts {
+                input: 200,
+                output: 100,
+                cache_read: 0,
+                cache_write: 0,
+            },
+        )
+        .await;
+        ms.record_completion(
+            true,
+            Some("claude-sonnet-4-5"),
+            &TokenCounts {
+                input: 300,
+                output: 150,
+                cache_read: 20,
+                cache_write: 0,
+            },
+        )
+        .await;
 
         let model_usage = ms.session_usage_by_model().await;
 
@@ -297,8 +356,17 @@ mod tests {
     #[tokio::test]
     async fn test_no_model_not_tracked() {
         let ms = MetricsService::new();
-        ms.record_completion(true, None, &TokenCounts { input: 100, output: 50, cache_read: 0, cache_write: 0 })
-            .await;
+        ms.record_completion(
+            true,
+            None,
+            &TokenCounts {
+                input: 100,
+                output: 50,
+                cache_read: 0,
+                cache_write: 0,
+            },
+        )
+        .await;
 
         let model_usage = ms.session_usage_by_model().await;
         assert!(model_usage.is_empty());

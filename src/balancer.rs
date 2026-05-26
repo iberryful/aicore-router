@@ -131,11 +131,17 @@ mod tests {
         let balancer = LoadBalancer::new(providers, LoadBalancingStrategy::RoundRobin);
 
         // First call starts at index 0
-        let names: Vec<&str> = balancer.get_ordered_providers().map(|p| p.name.as_str()).collect();
+        let names: Vec<&str> = balancer
+            .get_ordered_providers()
+            .map(|p| p.name.as_str())
+            .collect();
         assert_eq!(names, vec!["provider1", "provider2", "provider3"]);
 
         // Second call starts at index 1
-        let names: Vec<&str> = balancer.get_ordered_providers().map(|p| p.name.as_str()).collect();
+        let names: Vec<&str> = balancer
+            .get_ordered_providers()
+            .map(|p| p.name.as_str())
+            .collect();
         assert_eq!(names, vec!["provider2", "provider3", "provider1"]);
     }
 
@@ -150,11 +156,17 @@ mod tests {
         let balancer = LoadBalancer::new(providers, LoadBalancingStrategy::Fallback);
 
         // Always starts from provider1
-        let names: Vec<&str> = balancer.get_ordered_providers().map(|p| p.name.as_str()).collect();
+        let names: Vec<&str> = balancer
+            .get_ordered_providers()
+            .map(|p| p.name.as_str())
+            .collect();
         assert_eq!(names, vec!["provider1", "provider2", "provider3"]);
 
         // Second call also starts from provider1 (no rotation)
-        let names: Vec<&str> = balancer.get_ordered_providers().map(|p| p.name.as_str()).collect();
+        let names: Vec<&str> = balancer
+            .get_ordered_providers()
+            .map(|p| p.name.as_str())
+            .collect();
         assert_eq!(names, vec!["provider1", "provider2", "provider3"]);
     }
 

@@ -220,7 +220,11 @@ impl Database {
             let conn = conn.blocking_lock();
 
             let date_expr = group_by.date_expr();
-            let key_clause = if api_key_hash.is_some() { "AND api_key_hash = ?2" } else { "" };
+            let key_clause = if api_key_hash.is_some() {
+                "AND api_key_hash = ?2"
+            } else {
+                ""
+            };
 
             let sql = format!(
                 "SELECT COALESCE(api_key_hash, '') as key_hash, model, {date_expr} as period,
@@ -235,14 +239,18 @@ impl Database {
                  ORDER BY period DESC, key_hash, model"
             );
 
-            let params: Vec<Box<dyn rusqlite::types::ToSql>> = if let Some(ref key_hash) = api_key_hash {
-                vec![Box::new(since.clone()), Box::new(key_hash.clone())]
-            } else {
-                vec![Box::new(since.clone())]
-            };
+            let params: Vec<Box<dyn rusqlite::types::ToSql>> =
+                if let Some(ref key_hash) = api_key_hash {
+                    vec![Box::new(since.clone()), Box::new(key_hash.clone())]
+                } else {
+                    vec![Box::new(since.clone())]
+                };
 
-            let params_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-            let mut stmt = conn.prepare(&sql).context("Failed to prepare usage query")?;
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let mut stmt = conn
+                .prepare(&sql)
+                .context("Failed to prepare usage query")?;
             let rows = stmt
                 .query_map(params_refs.as_slice(), |row| {
                     Ok(UsageRow {
@@ -269,8 +277,7 @@ impl Database {
     }
 
     /// SQL expression for summing all token columns.
-    const TOTAL_TOKENS_EXPR: &'static str =
-        "COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)+COALESCE(cache_read_tokens,0)+COALESCE(cache_write_tokens,0)), 0)";
+    const TOTAL_TOKENS_EXPR: &'static str = "COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)+COALESCE(cache_read_tokens,0)+COALESCE(cache_write_tokens,0)), 0)";
 
     /// Load quota baselines by aggregating the requests table.
     /// Returns Vec<(api_key_hash, daily_tokens, monthly_tokens)> for all keys with activity.
@@ -329,8 +336,10 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
 
-            let daily_rows = Self::query_total_tokens_since(&conn, &local_day_start, Some(&key_hash))?;
-            let monthly_rows = Self::query_total_tokens_since(&conn, &local_month_start, Some(&key_hash))?;
+            let daily_rows =
+                Self::query_total_tokens_since(&conn, &local_day_start, Some(&key_hash))?;
+            let monthly_rows =
+                Self::query_total_tokens_since(&conn, &local_month_start, Some(&key_hash))?;
 
             let daily = daily_rows.first().map(|(_, v)| *v).unwrap_or(0);
             let monthly = monthly_rows.first().map(|(_, v)| *v).unwrap_or(0);
@@ -363,9 +372,14 @@ impl Database {
             Self::TOTAL_TOKENS_EXPR,
         );
 
-        let mut stmt = conn.prepare(&sql).context("Failed to prepare baseline query")?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .context("Failed to prepare baseline query")?;
         let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<(String, u64)> {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?.max(0) as u64))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?.max(0) as u64,
+            ))
         };
         let rows: Vec<(String, u64)> = if let Some(kh) = key_hash {
             stmt.query_map(rusqlite::params![since, kh], row_mapper)

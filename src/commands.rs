@@ -1,7 +1,7 @@
 //! CLI command handlers for administrative operations.
 
-use crate::{client::AiCoreClient, config::Config, token::TokenManager};
 use crate::table::{Align, CliTable, Col, format_number};
+use crate::{client::AiCoreClient, config::Config, token::TokenManager};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
@@ -48,20 +48,40 @@ impl CommandHandler {
             return Ok(());
         }
 
-        let rows: Vec<Vec<String>> = resource_groups.resources.iter().map(|rg| {
-            vec![
-                rg.resource_group_id.clone(),
-                rg.status.clone(),
-                rg.zone_id.as_deref().unwrap_or("N/A").to_string(),
-                rg.created_at.split('T').next().unwrap_or(&rg.created_at).to_string(),
-            ]
-        }).collect();
+        let rows: Vec<Vec<String>> = resource_groups
+            .resources
+            .iter()
+            .map(|rg| {
+                vec![
+                    rg.resource_group_id.clone(),
+                    rg.status.clone(),
+                    rg.zone_id.as_deref().unwrap_or("N/A").to_string(),
+                    rg.created_at
+                        .split('T')
+                        .next()
+                        .unwrap_or(&rg.created_at)
+                        .to_string(),
+                ]
+            })
+            .collect();
 
         CliTable::new(vec![
-            Col { header: "RESOURCE GROUP", align: Align::Left },
-            Col { header: "STATUS", align: Align::Left },
-            Col { header: "ZONE ID", align: Align::Left },
-            Col { header: "CREATED AT", align: Align::Left },
+            Col {
+                header: "RESOURCE GROUP",
+                align: Align::Left,
+            },
+            Col {
+                header: "STATUS",
+                align: Align::Left,
+            },
+            Col {
+                header: "ZONE ID",
+                align: Align::Left,
+            },
+            Col {
+                header: "CREATED AT",
+                align: Align::Left,
+            },
         ])
         .title(format!("Resource Groups ({} total)", resource_groups.count))
         .rows(rows)
@@ -73,8 +93,18 @@ impl CommandHandler {
     pub async fn list_deployments(&self, resource_group: Option<&str>) -> Result<()> {
         if let Some(rg_name) = resource_group {
             // Validate that the resource group is configured
-            if !self.config.providers.iter().any(|p| p.resource_group == rg_name) {
-                let available: Vec<&str> = self.config.providers.iter().map(|p| p.resource_group.as_str()).collect();
+            if !self
+                .config
+                .providers
+                .iter()
+                .any(|p| p.resource_group == rg_name)
+            {
+                let available: Vec<&str> = self
+                    .config
+                    .providers
+                    .iter()
+                    .map(|p| p.resource_group.as_str())
+                    .collect();
                 anyhow::bail!(
                     "Resource group '{}' is not configured. Available: {}",
                     rg_name,
@@ -88,7 +118,8 @@ impl CommandHandler {
                 if i > 0 {
                     println!();
                 }
-                self.list_deployments_for_resource_group(&provider.resource_group).await?;
+                self.list_deployments_for_resource_group(&provider.resource_group)
+                    .await?;
             }
             Ok(())
         }
@@ -105,30 +136,58 @@ impl CommandHandler {
             return Ok(());
         }
 
-        let mut rows: Vec<Vec<String>> = deployments.resources.iter().map(|deployment| {
-            let (model_name, model_version) = deployment.get_model_info();
-            let model_display = match (model_name, model_version) {
-                (Some(name), Some(version)) => format!("{name}:{version}"),
-                (Some(name), None) => name,
-                _ => "N/A".to_string(),
-            };
-            vec![
-                deployment.id[..std::cmp::min(deployment.id.len(), 16)].to_string(),
-                deployment.status.clone(),
-                model_display,
-                deployment.configuration_name.as_deref().unwrap_or("N/A").to_string(),
-                deployment.start_time.as_deref().and_then(|t| t.split('T').next()).unwrap_or("N/A").to_string(),
-            ]
-        }).collect();
+        let mut rows: Vec<Vec<String>> = deployments
+            .resources
+            .iter()
+            .map(|deployment| {
+                let (model_name, model_version) = deployment.get_model_info();
+                let model_display = match (model_name, model_version) {
+                    (Some(name), Some(version)) => format!("{name}:{version}"),
+                    (Some(name), None) => name,
+                    _ => "N/A".to_string(),
+                };
+                vec![
+                    deployment.id[..std::cmp::min(deployment.id.len(), 16)].to_string(),
+                    deployment.status.clone(),
+                    model_display,
+                    deployment
+                        .configuration_name
+                        .as_deref()
+                        .unwrap_or("N/A")
+                        .to_string(),
+                    deployment
+                        .start_time
+                        .as_deref()
+                        .and_then(|t| t.split('T').next())
+                        .unwrap_or("N/A")
+                        .to_string(),
+                ]
+            })
+            .collect();
 
         rows.sort_by(|a, b| a[2].cmp(&b[2]));
 
         CliTable::new(vec![
-            Col { header: "ID", align: Align::Left },
-            Col { header: "STATUS", align: Align::Left },
-            Col { header: "DEPLOYED MODEL", align: Align::Left },
-            Col { header: "CONFIG MODEL", align: Align::Left },
-            Col { header: "START TIME", align: Align::Left },
+            Col {
+                header: "ID",
+                align: Align::Left,
+            },
+            Col {
+                header: "STATUS",
+                align: Align::Left,
+            },
+            Col {
+                header: "DEPLOYED MODEL",
+                align: Align::Left,
+            },
+            Col {
+                header: "CONFIG MODEL",
+                align: Align::Left,
+            },
+            Col {
+                header: "START TIME",
+                align: Align::Left,
+            },
         ])
         .title(format!("Deployments ({} total)", deployments.count))
         .rows(rows)
@@ -155,8 +214,8 @@ impl CommandHandler {
         let settings_path = claude_dir.join("settings.json");
         let onboarding_path = home_path.join(".claude.json");
 
-        let addr = crate::config::parse_bind_address(&self.config.bind)
-            .context("Invalid bind address")?;
+        let addr =
+            crate::config::parse_bind_address(&self.config.bind).context("Invalid bind address")?;
         let api_key = &self
             .config
             .api_keys
@@ -167,8 +226,7 @@ impl CommandHandler {
         let base_url = format!("http://localhost:{}/v1", addr.port());
 
         // --- Configure settings.json ---
-        let settings_modified =
-            Self::configure_settings_file(&settings_path, &base_url, api_key)?;
+        let settings_modified = Self::configure_settings_file(&settings_path, &base_url, api_key)?;
 
         // --- Configure .claude.json (onboarding) ---
         let onboarding_modified = Self::configure_onboarding_file(&onboarding_path)?;
@@ -238,10 +296,7 @@ impl CommandHandler {
             ("ANTHROPIC_AUTH_TOKEN", api_key.to_string()),
             ("DISABLE_TELEMETRY", "1".to_string()),
             ("DISABLE_ERROR_REPORTING", "1".to_string()),
-            (
-                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-                "1".to_string(),
-            ),
+            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_string()),
             ("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1".to_string()),
             ("ANTHROPIC_MODEL", "claude-opus-latest[1m]".to_string()),
             (
@@ -263,8 +318,7 @@ impl CommandHandler {
         ];
 
         // Recommended env vars — only set if absent
-        let recommended_env: Vec<(&str, String)> =
-            vec![("ENABLE_TOOL_SEARCH", "true".to_string())];
+        let recommended_env: Vec<(&str, String)> = vec![("ENABLE_TOOL_SEARCH", "true".to_string())];
 
         let mut modified = false;
 
@@ -349,11 +403,7 @@ impl CommandHandler {
             .context("Onboarding file is not a JSON object")?;
 
         // Only set if not already true
-        if obj
-            .get("hasCompletedOnboarding")
-            .and_then(|v| v.as_bool())
-            == Some(true)
-        {
+        if obj.get("hasCompletedOnboarding").and_then(|v| v.as_bool()) == Some(true) {
             return Ok(false);
         }
 
@@ -375,8 +425,8 @@ impl CommandHandler {
     /// Writes opencode.jsonc with providers for Anthropic, OpenAI, and Gemini
     /// all pointing at this router's endpoints.
     pub fn configure_opencode(&self) -> Result<()> {
-        let addr = crate::config::parse_bind_address(&self.config.bind)
-            .context("Invalid bind address")?;
+        let addr =
+            crate::config::parse_bind_address(&self.config.bind).context("Invalid bind address")?;
         let api_key = &self
             .config
             .api_keys
@@ -588,16 +638,18 @@ impl CommandHandler {
 
         // Format a local date as a naive datetime string for DB queries.
         // SQLite's datetime(?1, 'utc') handles local→UTC conversion natively.
-        let to_local_since = |date: chrono::NaiveDate| -> String {
-            format!("{} 00:00:00", date)
-        };
+        let to_local_since = |date: chrono::NaiveDate| -> String { format!("{} 00:00:00", date) };
 
         let key_label = api_key.map(|k| format!(" (key: {k})")).unwrap_or_default();
 
         if let Some(n) = daily {
             let since = to_local_since(today - chrono::Duration::days(n as i64));
             let rows = db
-                .query_usage(key_hash_filter.as_deref(), &since, crate::database::GroupBy::Day)
+                .query_usage(
+                    key_hash_filter.as_deref(),
+                    &since,
+                    crate::database::GroupBy::Day,
+                )
                 .await?;
             let rows = Self::aggregate_by_period_and_model(&rows);
             let title = format!("Token Usage \u{2014} Past {} Days{}", n, key_label);
@@ -605,7 +657,11 @@ impl CommandHandler {
         } else if let Some(n) = weekly {
             let since = to_local_since(today - chrono::Duration::weeks(n as i64));
             let rows = db
-                .query_usage(key_hash_filter.as_deref(), &since, crate::database::GroupBy::Week)
+                .query_usage(
+                    key_hash_filter.as_deref(),
+                    &since,
+                    crate::database::GroupBy::Week,
+                )
                 .await?;
             let rows = Self::aggregate_by_period_and_model(&rows);
             let title = format!("Token Usage \u{2014} Past {} Weeks{}", n, key_label);
@@ -617,7 +673,11 @@ impl CommandHandler {
                 .unwrap_or(today);
             let since = to_local_since(since_date);
             let rows = db
-                .query_usage(key_hash_filter.as_deref(), &since, crate::database::GroupBy::Month)
+                .query_usage(
+                    key_hash_filter.as_deref(),
+                    &since,
+                    crate::database::GroupBy::Month,
+                )
                 .await?;
             let rows = Self::aggregate_by_period_and_model(&rows);
             let title = format!("Token Usage \u{2014} Past {} Months{}", n, key_label);
@@ -625,7 +685,11 @@ impl CommandHandler {
         } else {
             let today_str = to_local_since(today);
             let rows = db
-                .query_usage(key_hash_filter.as_deref(), &today_str, crate::database::GroupBy::Day)
+                .query_usage(
+                    key_hash_filter.as_deref(),
+                    &today_str,
+                    crate::database::GroupBy::Day,
+                )
                 .await?;
 
             // Aggregate by model (collapse per-key breakdown)
@@ -634,9 +698,10 @@ impl CommandHandler {
             Self::print_usage_table(&aggregated, false, show_cost, &self.config, &title);
 
             if show_cost {
-                Self::print_partial_warnings(
-                    &Self::collect_partial_models(&aggregated, &self.config),
-                );
+                Self::print_partial_warnings(&Self::collect_partial_models(
+                    &aggregated,
+                    &self.config,
+                ));
             }
         }
 
@@ -661,18 +726,45 @@ impl CommandHandler {
         // Build column definitions conditionally
         let mut columns: Vec<Col> = Vec::new();
         if show_period {
-            columns.push(Col { header: "Period", align: Align::Left });
+            columns.push(Col {
+                header: "Period",
+                align: Align::Left,
+            });
         }
-        columns.push(Col { header: "Model", align: Align::Left });
-        columns.push(Col { header: "Input", align: Align::Right });
-        columns.push(Col { header: "Output", align: Align::Right });
-        columns.push(Col { header: "Cache R", align: Align::Right });
-        columns.push(Col { header: "Cache W", align: Align::Right });
-        columns.push(Col { header: "Total", align: Align::Right });
+        columns.push(Col {
+            header: "Model",
+            align: Align::Left,
+        });
+        columns.push(Col {
+            header: "Input",
+            align: Align::Right,
+        });
+        columns.push(Col {
+            header: "Output",
+            align: Align::Right,
+        });
+        columns.push(Col {
+            header: "Cache R",
+            align: Align::Right,
+        });
+        columns.push(Col {
+            header: "Cache W",
+            align: Align::Right,
+        });
+        columns.push(Col {
+            header: "Total",
+            align: Align::Right,
+        });
         if show_cost {
-            columns.push(Col { header: "Est. Cost", align: Align::Right });
+            columns.push(Col {
+                header: "Est. Cost",
+                align: Align::Right,
+            });
         }
-        columns.push(Col { header: "Reqs", align: Align::Right });
+        columns.push(Col {
+            header: "Reqs",
+            align: Align::Right,
+        });
 
         // Build data rows and accumulate totals
         let mut total_input = 0u64;
@@ -685,7 +777,10 @@ impl CommandHandler {
         let mut data_rows: Vec<Vec<String>> = Vec::new();
 
         for row in rows {
-            let total = row.input_tokens + row.output_tokens + row.cache_read_tokens + row.cache_write_tokens;
+            let total = row.input_tokens
+                + row.output_tokens
+                + row.cache_read_tokens
+                + row.cache_write_tokens;
             total_input += row.input_tokens;
             total_output += row.output_tokens;
             total_cache_read += row.cache_read_tokens;
@@ -699,20 +794,30 @@ impl CommandHandler {
                     cache_read: row.cache_read_tokens,
                     cache_write: row.cache_write_tokens,
                 };
-                Self::format_cost_cell(&row.model, &tokens, config, &mut total_cost, &mut partial_models)
+                Self::format_cost_cell(
+                    &row.model,
+                    &tokens,
+                    config,
+                    &mut total_cost,
+                    &mut partial_models,
+                )
             } else {
                 String::new()
             };
 
             let mut cells = Vec::new();
-            if show_period { cells.push(row.period.clone()); }
+            if show_period {
+                cells.push(row.period.clone());
+            }
             cells.push(row.model.clone());
             cells.push(format_number(row.input_tokens));
             cells.push(format_number(row.output_tokens));
             cells.push(format_number(row.cache_read_tokens));
             cells.push(format_number(row.cache_write_tokens));
             cells.push(format_number(total));
-            if show_cost { cells.push(cost_str); }
+            if show_cost {
+                cells.push(cost_str);
+            }
             cells.push(row.request_count.to_string());
 
             data_rows.push(cells);
@@ -721,14 +826,18 @@ impl CommandHandler {
         // Build total row
         let grand_total = total_input + total_output + total_cache_read + total_cache_write;
         let mut total_cells = Vec::new();
-        if show_period { total_cells.push(String::new()); }
+        if show_period {
+            total_cells.push(String::new());
+        }
         total_cells.push("Total".to_string());
         total_cells.push(format_number(total_input));
         total_cells.push(format_number(total_output));
         total_cells.push(format_number(total_cache_read));
         total_cells.push(format_number(total_cache_write));
         total_cells.push(format_number(grand_total));
-        if show_cost { total_cells.push(crate::format_cost_value(total_cost)); }
+        if show_cost {
+            total_cells.push(crate::format_cost_value(total_cost));
+        }
         total_cells.push(total_reqs.to_string());
 
         CliTable::new(columns)
@@ -753,8 +862,11 @@ impl CommandHandler {
                 cache_read: row.cache_read_tokens,
                 cache_write: row.cache_write_tokens,
             };
-            if let Some(pricing) = config.get_model_pricing(&row.model) && pricing.is_partial(&tokens) && !partial.contains(&row.model.to_string()) {
-                    partial.push(row.model.to_string());
+            if let Some(pricing) = config.get_model_pricing(&row.model)
+                && pricing.is_partial(&tokens)
+                && !partial.contains(&row.model.to_string())
+            {
+                partial.push(row.model.to_string());
             }
         }
         partial
@@ -789,7 +901,6 @@ impl CommandHandler {
         }
     }
 
-
     /// Print warnings for models with incomplete pricing.
     #[cfg(feature = "db")]
     fn print_partial_warnings(partial_models: &[String]) {
@@ -803,7 +914,9 @@ impl CommandHandler {
 
     /// Aggregate usage rows by (period, model), collapsing per-key breakdown.
     #[cfg(feature = "db")]
-    fn aggregate_by_period_and_model(rows: &[crate::database::UsageRow]) -> Vec<crate::database::UsageRow> {
+    fn aggregate_by_period_and_model(
+        rows: &[crate::database::UsageRow],
+    ) -> Vec<crate::database::UsageRow> {
         let mut map: std::collections::HashMap<(String, String), crate::database::UsageRow> =
             std::collections::HashMap::new();
         for row in rows {
@@ -881,8 +994,7 @@ impl CommandHandler {
         println!("  LB Strategy:{:?}", self.config.load_balancing);
 
         // Port availability check
-        let addr_available =
-            std::net::TcpListener::bind(&*self.config.bind).is_ok();
+        let addr_available = std::net::TcpListener::bind(&*self.config.bind).is_ok();
         println!(
             "  Bind Status:{}",
             if addr_available {
@@ -954,7 +1066,10 @@ impl CommandHandler {
                 "  Status:     {}",
                 if exists { "exists" } else { "not created yet" }
             );
-            println!("  Retention:  {} days", self.config.log_requests.retention_days);
+            println!(
+                "  Retention:  {} days",
+                self.config.log_requests.retention_days
+            );
         } else {
             println!("  Enabled:    false");
         }
@@ -1001,10 +1116,7 @@ mod tests {
             parsed["env"]["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"],
             "1"
         );
-        assert_eq!(
-            parsed["env"]["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"],
-            "1"
-        );
+        assert_eq!(parsed["env"]["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1");
         assert_eq!(parsed["env"]["ANTHROPIC_MODEL"], "claude-opus-latest[1m]");
         assert_eq!(
             parsed["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
@@ -1117,6 +1229,7 @@ mod tests {
                 key: "test-key".to_string(),
                 daily_token_limit: None,
                 monthly_token_limit: None,
+                requests_per_minute: None,
             }],
             bind: "127.0.0.1:8900".to_string(),
             models: vec![],
