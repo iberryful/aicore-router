@@ -1,4 +1,9 @@
 //! Gemini-family scenarios.
+//!
+//! `thinkingBudget: 0 → -1` rewrite is not e2e-tested: the unit test
+//! `fix_thinking_budget_zero_becomes_negative_one` verifies the rewrite
+//! directly, and the upstream's acceptance of `-1` (Gemini's documented
+//! "auto" sentinel) is stable.
 
 #![cfg(feature = "e2e")]
 
@@ -59,35 +64,4 @@ async fn stream_generate_content_action_routes() {
     .expect("request");
     let (status, body) = read_status_and_body(resp).await;
     assert_eq!(status, 200, "streamGenerateContent: {body}");
-}
-
-/// `thinkingConfig.thinkingBudget: 0` is rewritten to `-1` by
-/// `transforms::gemini::fix_thinking_budget` (Gemini's "auto" sentinel).
-/// The request should reach the upstream successfully.
-#[tokio::test]
-async fn thinking_budget_zero_accepted() {
-    let acr = shared().await;
-    let Some(model) = acr.config.model_for_family("gemini") else {
-        skip("no Gemini model configured");
-        return;
-    };
-    let body = json!({
-        "contents": [{"role": "user", "parts": [{"text": "Reply with one short word."}]}],
-        "generationConfig": {
-            "thinkingConfig": {"thinkingBudget": 0}
-        }
-    });
-    let resp = auth_bearer(
-        client().post(format!(
-            "{}/gemini/models/{model}:generateContent",
-            acr.base_url()
-        )),
-        KEY_DEFAULT,
-    )
-    .json(&body)
-    .send()
-    .await
-    .expect("request");
-    let (status, body) = read_status_and_body(resp).await;
-    assert_eq!(status, 200, "thinkingBudget=0: {body}");
 }

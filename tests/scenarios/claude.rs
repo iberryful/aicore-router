@@ -1,11 +1,16 @@
-//! Claude-family scenarios — tool use, vision, cache_control TTL.
+//! Claude-family scenarios — tool use and vision.
 //!
-//! `Anthropic-Beta` header propagation is **not** tested here. The
-//! `transforms::extract_anthropic_beta_*` unit tests cover the remap and
-//! pass-through logic directly; AI Core's beta-flag allowlist is upstream-
-//! controlled and unstable, so a positive e2e assertion (request must
-//! succeed) ends up testing the upstream's allowlist rather than acr's
-//! propagation.
+//! `cache_control` TTL injection is not e2e-tested: the unit tests
+//! `inject_cache_ttl_writes_1h_into_ephemeral_blocks` and
+//! `inject_cache_ttl_is_idempotent_when_ttl_already_set` directly verify
+//! that the TTL field is added to the body. An e2e assertion can only
+//! observe "upstream accepts the request," which doesn't prove injection
+//! happened — the request would also succeed if the field were silently
+//! dropped.
+//!
+//! `Anthropic-Beta` header propagation is also not tested here — see the
+//! commit history for the rationale (deferred to a future change that
+//! filters Bedrock-irrelevant Anthropic-direct flags).
 
 #![cfg(feature = "e2e")]
 
@@ -87,35 +92,4 @@ async fn vision_inline_image_block() {
     .expect("request");
     let (status, body) = read_status_and_body(resp).await;
     assert_eq!(status, 200, "vision: {body}");
-}
-
-/// `cache_control: { type: "ephemeral" }` on a system block — the router
-/// injects `ttl: "1h"` automatically.
-#[tokio::test]
-async fn cache_control_with_ttl() {
-    let acr = shared().await;
-    let Some(model) = acr.config.model_for_family("claude") else {
-        skip("no Claude model configured");
-        return;
-    };
-    let body = json!({
-        "model": model,
-        "max_tokens": 16,
-        "system": [{
-            "type": "text",
-            "text": "You are a brief assistant.",
-            "cache_control": {"type": "ephemeral"}
-        }],
-        "messages": [{"role": "user", "content": "Reply with one short word."}],
-    });
-    let resp = auth_bearer(
-        client().post(format!("{}/v1/messages", acr.base_url())),
-        KEY_DEFAULT,
-    )
-    .json(&body)
-    .send()
-    .await
-    .expect("request");
-    let (status, body) = read_status_and_body(resp).await;
-    assert_eq!(status, 200, "cache_control TTL: {body}");
 }
