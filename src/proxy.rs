@@ -999,10 +999,8 @@ pub fn extract_token_stats(data: &str, family: &LlmFamily) -> Option<TokenStats>
     }
 }
 
-/// Extract token stats from a complete (non-streaming) response body. Public
-/// so e2e tests can reuse the same field-name logic when asserting usage on
-/// non-streaming responses.
-pub fn extract_token_stats_from_body(body: &str, family: &LlmFamily) -> Option<TokenStats> {
+/// Extract token stats from a complete (non-streaming) response body.
+fn extract_token_stats_from_body(body: &str, family: &LlmFamily) -> Option<TokenStats> {
     let parsed: Value = serde_json::from_str(body).ok()?;
 
     match family {
