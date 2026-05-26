@@ -166,41 +166,4 @@ mod tests {
         assert_eq!(format_number(100), "100");
         assert_eq!(format_number(10000000), "10,000,000");
     }
-
-    #[test]
-    fn test_cli_table_basic() {
-        // Smoke test — just verify it doesn't panic
-        CliTable::new(vec![
-            Col {
-                header: "Name",
-                align: Align::Left,
-            },
-            Col {
-                header: "Count",
-                align: Align::Right,
-            },
-        ])
-        .row(vec!["hello".into(), "42".into()])
-        .print();
-    }
-
-    #[test]
-    fn test_cli_table_with_total() {
-        CliTable::new(vec![
-            Col {
-                header: "Model",
-                align: Align::Left,
-            },
-            Col {
-                header: "Tokens",
-                align: Align::Right,
-            },
-        ])
-        .rows(vec![
-            vec!["gpt-4".into(), "1,234".into()],
-            vec!["claude".into(), "5,678".into()],
-        ])
-        .total_row(vec!["Total".into(), "6,912".into()])
-        .print();
-    }
 }

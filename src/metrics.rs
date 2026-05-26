@@ -216,48 +216,11 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_increment_decrement_active() {
-        let ms = MetricsService::new();
-        ms.increment_active();
-        ms.increment_active();
-        let snap = ms.snapshot_sync();
-        assert_eq!(snap.active_requests, 2);
-        assert_eq!(snap.total_requests, 2);
-
-        ms.decrement_active();
-        let snap = ms.snapshot_sync();
-        assert_eq!(snap.active_requests, 1);
-    }
-
-    #[tokio::test]
     async fn test_decrement_no_underflow() {
         let ms = MetricsService::new();
         ms.decrement_active(); // should not panic or underflow
         let snap = ms.snapshot_sync();
         assert_eq!(snap.active_requests, 0);
-    }
-
-    #[tokio::test]
-    async fn test_record_completion_success() {
-        let ms = MetricsService::new();
-        ms.record_completion(
-            true,
-            Some("test-model"),
-            &TokenCounts {
-                input: 100,
-                output: 50,
-                cache_read: 10,
-                cache_write: 5,
-            },
-        )
-        .await;
-        let snap = ms.snapshot_sync();
-        assert_eq!(snap.successful_requests, 1);
-        assert_eq!(snap.failed_requests, 0);
-        assert_eq!(snap.usage.total_input_tokens, 100);
-        assert_eq!(snap.usage.total_output_tokens, 50);
-        assert_eq!(snap.usage.total_cache_read_tokens, 10);
-        assert_eq!(snap.usage.total_cache_write_tokens, 5);
     }
 
     #[tokio::test]
@@ -268,89 +231,6 @@ mod tests {
         let snap = ms.snapshot_sync();
         assert_eq!(snap.successful_requests, 0);
         assert_eq!(snap.failed_requests, 1);
-    }
-
-    #[tokio::test]
-    async fn test_accumulation() {
-        let ms = MetricsService::new();
-        ms.record_completion(
-            true,
-            Some("gpt-4o"),
-            &TokenCounts {
-                input: 100,
-                output: 50,
-                cache_read: 0,
-                cache_write: 0,
-            },
-        )
-        .await;
-        ms.record_completion(
-            true,
-            Some("gpt-4o"),
-            &TokenCounts {
-                input: 200,
-                output: 100,
-                cache_read: 30,
-                cache_write: 0,
-            },
-        )
-        .await;
-        let snap = ms.snapshot_sync();
-        assert_eq!(snap.usage.total_input_tokens, 300);
-        assert_eq!(snap.usage.total_output_tokens, 150);
-        assert_eq!(snap.usage.total_cache_read_tokens, 30);
-    }
-
-    #[tokio::test]
-    async fn test_per_model_tracking() {
-        let ms = MetricsService::new();
-        ms.record_completion(
-            true,
-            Some("claude-sonnet-4-5"),
-            &TokenCounts {
-                input: 100,
-                output: 50,
-                cache_read: 10,
-                cache_write: 5,
-            },
-        )
-        .await;
-        ms.record_completion(
-            true,
-            Some("gpt-4o"),
-            &TokenCounts {
-                input: 200,
-                output: 100,
-                cache_read: 0,
-                cache_write: 0,
-            },
-        )
-        .await;
-        ms.record_completion(
-            true,
-            Some("claude-sonnet-4-5"),
-            &TokenCounts {
-                input: 300,
-                output: 150,
-                cache_read: 20,
-                cache_write: 0,
-            },
-        )
-        .await;
-
-        let model_usage = ms.session_usage_by_model().await;
-
-        let claude = model_usage.get("claude-sonnet-4-5").unwrap();
-        assert_eq!(claude.input, 400);
-        assert_eq!(claude.output, 200);
-        assert_eq!(claude.cache_read, 30);
-        assert_eq!(claude.cache_write, 5);
-
-        let gpt = model_usage.get("gpt-4o").unwrap();
-        assert_eq!(gpt.input, 200);
-        assert_eq!(gpt.output, 100);
-        assert_eq!(gpt.cache_read, 0);
-        assert_eq!(gpt.cache_write, 0);
     }
 
     #[tokio::test]

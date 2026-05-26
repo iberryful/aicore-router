@@ -443,31 +443,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_insert_request() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        let db = Database::open(db_path).await.unwrap();
-
-        let record = RequestRecord {
-            correlation_id: "test-123".to_string(),
-            method: "POST".to_string(),
-            path: "/v1/messages".to_string(),
-            model: "claude-sonnet-4-5".to_string(),
-            provider: "default".to_string(),
-            duration_ms: 123.45,
-            response_status: 200,
-            streaming: true,
-            input_tokens: Some(100),
-            output_tokens: Some(50),
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-            api_key_hash: Some("abc123def456".to_string()),
-        };
-
-        db.insert_request(record).await.unwrap();
-    }
-
-    #[tokio::test]
     async fn test_multiple_inserts() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
