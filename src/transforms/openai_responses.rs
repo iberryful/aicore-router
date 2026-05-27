@@ -65,6 +65,7 @@ fn filter_tools(obj: &mut Map<String, Value>) -> Vec<String> {
 
     let original_len = tools.len();
     let mut kept_names = Vec::new();
+    let mut dropped_types: Vec<String> = Vec::new();
 
     tools.retain(|t| {
         let ty = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -74,10 +75,7 @@ fn filter_tools(obj: &mut Map<String, Value>) -> Vec<String> {
                 kept_names.push(name.to_string());
             }
         } else {
-            tracing::debug!(
-                "Dropping unsupported Responses-API tool entry type='{}'",
-                ty
-            );
+            dropped_types.push(ty.to_string());
         }
         keep
     });
@@ -85,8 +83,9 @@ fn filter_tools(obj: &mut Map<String, Value>) -> Vec<String> {
     let dropped = original_len - tools.len();
     if dropped > 0 {
         tracing::debug!(
-            "Filtered {} unsupported tool entries (kept {} function tools)",
+            "Filtered {} unsupported Responses-API tool entries (types={:?}, kept {} function tools)",
             dropped,
+            dropped_types,
             tools.len()
         );
     }

@@ -110,6 +110,7 @@ fn normalize_messages(obj: &mut Map<String, Value>) {
     };
 
     let mut normalized: Vec<Value> = Vec::with_capacity(messages.len());
+    let mut merged_indices: Vec<usize> = Vec::new();
     let mut i = 0;
 
     while i < messages.len() {
@@ -135,7 +136,7 @@ fn normalize_messages(obj: &mut Map<String, Value>) {
                 merged_obj.insert("content".to_string(), Value::String(new_content));
             }
 
-            tracing::debug!("Normalized Codex CLI preamble message at index {}", i);
+            merged_indices.push(i);
             normalized.push(merged);
             i += 2; // Skip the preamble; loop increment will advance past it
             continue;
@@ -143,6 +144,14 @@ fn normalize_messages(obj: &mut Map<String, Value>) {
 
         normalized.push(messages[i].clone());
         i += 1;
+    }
+
+    if !merged_indices.is_empty() {
+        tracing::debug!(
+            "Normalized {} Codex CLI preamble message(s) at indices {:?}",
+            merged_indices.len(),
+            merged_indices
+        );
     }
 
     obj.insert("messages".to_string(), Value::Array(normalized));
