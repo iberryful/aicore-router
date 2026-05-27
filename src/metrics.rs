@@ -211,6 +211,34 @@ impl MetricsService {
     }
 }
 
+/// RAII handle for an in-flight request.
+///
+/// Constructing the guard increments `active_requests` (and `total_requests`,
+/// emitting a `RequestStarted` event); dropping it decrements `active_requests`.
+/// Embed the guard in the response body wrapper so the decrement fires when
+/// the body is consumed, dropped, or errors — independent of any spawned
+/// upstream-drain task. Mirrors `tower_http::metrics::InFlightRequests`.
+pub struct ActiveRequestGuard {
+    metrics: MetricsService,
+}
+
+impl ActiveRequestGuard {
+    pub fn new(metrics: &MetricsService) -> Self {
+        metrics.inner.active_requests.fetch_add(1, Ordering::Relaxed);
+        metrics.inner.total_requests.fetch_add(1, Ordering::Relaxed);
+        let _ = metrics.inner.sender.send(MetricsEvent::RequestStarted);
+        Self {
+            metrics: metrics.clone(),
+        }
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.metrics.decrement_active();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +287,29 @@ mod tests {
         ms.increment_active();
         let event = rx.recv().await.unwrap();
         assert!(matches!(event, MetricsEvent::RequestStarted));
+    }
+
+    #[tokio::test]
+    async fn guard_increments_on_new_decrements_on_drop() {
+        let ms = MetricsService::new();
+        {
+            let _guard = ActiveRequestGuard::new(&ms);
+            assert_eq!(ms.snapshot_sync().active_requests, 1);
+            assert_eq!(ms.snapshot_sync().total_requests, 1);
+        }
+        assert_eq!(ms.snapshot_sync().active_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn guard_decrements_on_panic_unwind() {
+        let ms = MetricsService::new();
+        let ms_clone = ms.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ActiveRequestGuard::new(&ms_clone);
+            assert_eq!(ms_clone.snapshot_sync().active_requests, 1);
+            panic!("simulated handler panic");
+        }));
+        assert!(result.is_err());
+        assert_eq!(ms.snapshot_sync().active_requests, 0);
     }
 }

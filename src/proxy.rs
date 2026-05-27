@@ -287,6 +287,7 @@ impl ProxyRequest {
         &self,
         client: &Client,
         metrics: &MetricsService,
+        active_guard: &mut Option<crate::metrics::ActiveRequestGuard>,
         #[cfg(feature = "db")] db_context: Option<DbContext>,
         quota_manager: Option<crate::quota::QuotaManager>,
         api_key_hash: Option<String>,
@@ -405,12 +406,18 @@ impl ProxyRequest {
                 },
                 start_time,
                 metrics,
+                active_guard
+                    .take()
+                    .expect("active_guard must be Some on streaming success path"),
                 #[cfg(feature = "db")]
                 db_context,
                 quota_manager,
                 api_key_hash,
             )?;
-            // Streaming records metrics when the stream completes (inside spawned task)
+            // The body now owns the guard; `active_requests` decrements when
+            // axum drops the body (client done, disconnect, or error).
+            // Token-stat / quota recording still happens inside the spawned
+            // drain task — see `handle_streaming_response`.
             Ok(ProxyExecuteResult::Response {
                 response,
                 token_stats: TokenStats::default(),
@@ -477,11 +484,17 @@ impl ProxyRequest {
         ))
     }
 
+    // Eight parameters — each is a distinct request-scoped concern (upstream
+    // stream prep, timing, metrics, RAII guard, optional db context, optional
+    // quota manager, api key hash). Bundling them adds boilerplate without
+    // cutting call-site complexity.
+    #[allow(clippy::too_many_arguments)]
     fn handle_streaming_response(
         &self,
         prepared: PreparedStream,
         start_time: Instant,
         metrics: &MetricsService,
+        active_guard: crate::metrics::ActiveRequestGuard,
         #[cfg(feature = "db")] db_context: Option<DbContext>,
         quota_manager: Option<crate::quota::QuotaManager>,
         api_key_hash: Option<String>,
@@ -582,10 +595,12 @@ impl ProxyRequest {
                 }
             }
 
-            // Record metrics when streaming is done
+            // Record metrics when streaming is done. `active_requests` is
+            // *not* decremented here — that lives with the response body
+            // (`active_guard` rides inside `GuardedStream` below) so the
+            // counter reflects the body's lifetime, not this drain task's.
             let success = !stream_error;
             let counts = token_stats.to_counts();
-            metrics.decrement_active();
             metrics
                 .record_completion(success, Some(&model), &counts)
                 .await;
@@ -624,7 +639,10 @@ impl ProxyRequest {
             }
         });
 
-        let stream = ReceiverStream::new(rx);
+        let stream = GuardedStream {
+            inner: ReceiverStream::new(rx),
+            _guard: active_guard,
+        };
         let body = Body::from_stream(stream);
 
         Ok(Response::builder()
@@ -858,6 +876,30 @@ enum PeekOutcome {
 struct PreparedStream {
     stream: futures::stream::BoxStream<'static, reqwest::Result<axum::body::Bytes>>,
     prebuffered: Vec<u8>,
+}
+
+/// Wraps the per-request response stream so that the `ActiveRequestGuard`
+/// rides along with the body. When axum drops the body — normal completion,
+/// client disconnect, or hyper-side error — the guard's `Drop` decrements
+/// `active_requests`. This decouples "is the request still in flight" from
+/// "is the spawned upstream-drain task still running."
+struct GuardedStream<S> {
+    inner: S,
+    _guard: crate::metrics::ActiveRequestGuard,
+}
+
+impl<S, T, E> futures::Stream for GuardedStream<S>
+where
+    S: futures::Stream<Item = std::result::Result<T, E>> + Unpin,
+{
+    type Item = std::result::Result<T, E>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
 }
 
 /// Read upstream chunks until we either see a `data:` line we can classify
@@ -1554,5 +1596,49 @@ mod tests {
         let (outcome, _buf) =
             peek_classify_stream(&mut s, &LlmFamily::OpenAi, Duration::from_secs(2)).await;
         assert!(matches!(outcome, PeekOutcome::RateLimited));
+    }
+
+    #[tokio::test]
+    async fn guarded_stream_drops_guard_when_consumed_to_end() {
+        use crate::metrics::{ActiveRequestGuard, MetricsService};
+        use futures::StreamExt;
+
+        let metrics = MetricsService::new();
+        let guard = ActiveRequestGuard::new(&metrics);
+        assert_eq!(metrics.snapshot_sync().active_requests, 1);
+
+        let inner = futures::stream::iter(vec![
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"a")),
+            Ok(axum::body::Bytes::from_static(b"b")),
+        ]);
+        let mut wrapped = GuardedStream {
+            inner,
+            _guard: guard,
+        };
+        while wrapped.next().await.is_some() {}
+        // Stream consumed but wrapper still alive.
+        assert_eq!(metrics.snapshot_sync().active_requests, 1);
+        drop(wrapped);
+        assert_eq!(metrics.snapshot_sync().active_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn guarded_stream_drops_guard_on_early_drop() {
+        use crate::metrics::{ActiveRequestGuard, MetricsService};
+
+        let metrics = MetricsService::new();
+        let guard = ActiveRequestGuard::new(&metrics);
+        assert_eq!(metrics.snapshot_sync().active_requests, 1);
+
+        let inner = futures::stream::iter(vec![Ok::<_, std::io::Error>(
+            axum::body::Bytes::from_static(b"a"),
+        )]);
+        let wrapped = GuardedStream {
+            inner,
+            _guard: guard,
+        };
+        // Simulate axum dropping the body before draining (e.g. client gone).
+        drop(wrapped);
+        assert_eq!(metrics.snapshot_sync().active_requests, 0);
     }
 }

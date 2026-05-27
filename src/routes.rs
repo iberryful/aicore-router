@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::{
     balancer::LoadBalancer,
     config::Config,
-    metrics::MetricsService,
+    metrics::{ActiveRequestGuard, MetricsService},
     proxy::{ProxyExecuteResult, ProxyRequestBuilder, ProxyRequestParams, extract_api_key},
     quota::{QuotaCheckResult, QuotaManager},
     rate_limit::AuthRateLimiter,
@@ -105,9 +105,9 @@ fn parse_model_operation(model_operation: &str) -> Result<(String, String), AppE
     }
 }
 
-/// Record a failed request (decrement active count and log failure metrics).
+/// Record a failed request's completion stats. Decrement of `active_requests`
+/// is handled by `ActiveRequestGuard` dropping on the caller's return path.
 async fn record_failure_metrics(metrics: &MetricsService) {
-    metrics.decrement_active();
     metrics
         .record_completion(false, None, &crate::metrics::TokenCounts::default())
         .await;
@@ -190,7 +190,13 @@ async fn execute_proxy_request(
         }
     }
 
-    state.metrics.increment_active();
+    // The guard increments `active_requests` here and decrements when dropped.
+    // For streaming success, we hand it off to the response body so the count
+    // tracks the *body's* lifetime — i.e. drops the moment the client is done,
+    // not when the spawned upstream-drain task happens to exit. For all other
+    // paths the guard drops on this function's return.
+    let mut active_guard: Option<ActiveRequestGuard> =
+        Some(ActiveRequestGuard::new(&state.metrics));
 
     let params = ProxyRequestParams {
         headers,
@@ -257,6 +263,7 @@ async fn execute_proxy_request(
             .execute(
                 &state.client,
                 &state.metrics,
+                &mut active_guard,
                 #[cfg(feature = "db")]
                 db_context,
                 state.quota_manager.clone(),
@@ -285,9 +292,11 @@ async fn execute_proxy_request(
                 // For non-streaming responses, record metrics now.
                 // Streaming responses record metrics when the stream completes,
                 // UNLESS the response is an error (no streaming task was spawned).
+                // `active_requests` itself is decremented by `active_guard`
+                // dropping — for non-streaming on this function's return; for
+                // streaming success, when the response body is dropped.
                 if !proxy.stream || !is_success {
                     let counts = token_stats.to_counts();
-                    state.metrics.decrement_active();
                     state
                         .metrics
                         .record_completion(is_success, Some(&proxy.model), &counts)
