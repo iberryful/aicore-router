@@ -6,3 +6,4 @@ config.yaml
 !examples/config.yaml
 .claude
 .DS_Store
+docs/
