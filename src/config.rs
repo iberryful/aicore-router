@@ -386,6 +386,19 @@ pub fn parse_bind_address(s: &str) -> Result<SocketAddr> {
     bail!("Invalid bind address '{s}'. Expected IP (e.g. 127.0.0.1) or IP:PORT (e.g. 0.0.0.0:9000)")
 }
 
+/// If the `PORT` env var is set and parses as a u16, override the port part of `bind`.
+/// The IP from the file (or default) is preserved.
+fn apply_port_env_override(bind: String) -> Result<String> {
+    let Ok(raw) = env::var("PORT") else {
+        return Ok(bind);
+    };
+    let port: u16 = raw
+        .parse()
+        .with_context(|| format!("PORT env var '{raw}' is not a valid u16"))?;
+    let addr = parse_bind_address(&bind)?;
+    Ok(SocketAddr::new(addr.ip(), port).to_string())
+}
+
 fn default_log_level() -> String {
     DEFAULT_LOG_LEVEL.to_string()
 }
@@ -514,7 +527,7 @@ impl Config {
             ));
         }
 
-        let bind = file_config.bind;
+        let bind = apply_port_env_override(file_config.bind)?;
 
         let log_level = file_config.log_level.unwrap_or_else(default_log_level);
 
