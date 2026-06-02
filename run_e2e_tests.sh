@@ -1,13 +1,24 @@
 #!/bin/bash
+# E2E Test Runner — local only; excluded from CI and commit hooks.
+#
+# The harness spawns a single shared `acr` process via OnceCell and reuses
+# it across every test. To keep state-sensitive scenarios (rate limits, DB
+# rows) deterministic, tests run sequentially via `--test-threads=1`.
+#
+# We pre-build the `acr` binary so the test harness can spawn it directly
+# (avoiding cargo lock contention from a `cargo build` invocation inside a
+# running `cargo test`).
 
-# E2E Test Runner
-# This script runs end-to-end tests locally only
-# These tests are excluded from CI and commit hooks
+set -euo pipefail
 
-echo "Running E2E tests locally..."
-echo "Make sure your config.yaml is properly configured!"
+echo "Building acr binary…"
+cargo build --bin acr
 
-# Run tests with e2e feature enabled
-cargo test --features e2e --test e2e_tests
+echo
+echo "Running e2e tests against your real ~/.aicore/config.yaml providers."
+echo "Tests run serially; this can take a few minutes."
+echo
+cargo test --features e2e --test e2e_tests -- --test-threads=1 --nocapture "$@"
 
-echo "E2E tests completed!"
+echo
+echo "E2E tests completed."

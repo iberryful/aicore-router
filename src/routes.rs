@@ -1,18 +1,23 @@
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
 };
 use serde_json::{Value, json};
+use std::net::SocketAddr;
 use thiserror::Error;
 
 use crate::{
     balancer::LoadBalancer,
     config::Config,
-    proxy::{ProxyExecuteResult, ProxyRequestBuilder, ProxyRequestParams},
+    metrics::{ActiveRequestGuard, MetricsService},
+    proxy::{ProxyExecuteResult, ProxyRequestBuilder, ProxyRequestParams, extract_api_key},
+    quota::{QuotaCheckResult, QuotaManager},
+    rate_limit::AuthRateLimiter,
     registry::ModelRegistry,
+    request_limiter::{RequestLimitResult, RequestLimiter},
     token::TokenManager,
 };
 
@@ -23,6 +28,12 @@ pub struct AppState {
     pub token_manager: TokenManager,
     pub load_balancer: LoadBalancer,
     pub client: reqwest::Client,
+    pub metrics: MetricsService,
+    #[cfg(feature = "db")]
+    pub database: Option<crate::database::Database>,
+    pub rate_limiter: AuthRateLimiter,
+    pub quota_manager: Option<QuotaManager>,
+    pub request_limiter: Option<std::sync::Arc<RequestLimiter>>,
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -30,6 +41,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(health_check))
         .route("/v1/models", get(get_models))
         .route("/v1/chat/completions", post(handle_openai_chat))
+        .route("/litellm/v1/chat/completions", post(handle_openai_chat))
+        .route("/v1/embeddings", post(handle_openai_embeddings))
+        .route(
+            "/v1/responses/compact",
+            post(handle_openai_responses_compact),
+        )
+        .route("/v1/responses", post(handle_openai_responses))
         .route(
             "/openai/deployments/{model}/chat/completions",
             post(handle_azure_openai),
@@ -39,6 +57,7 @@ pub fn create_router(state: AppState) -> Router {
             post(handle_azure_openai),
         )
         .route("/v1/messages", post(handle_claude_messages))
+        .route("/anthropic/v1/messages", post(handle_claude_messages))
         .route(
             "/gemini/models/{model_operation}",
             post(handle_gemini_models),
@@ -74,22 +93,111 @@ fn ensure_model_in_body(body: &mut Value, model: &str) {
 }
 
 fn parse_model_operation(model_operation: &str) -> Result<(String, String), AppError> {
-    let parts: Vec<&str> = model_operation.split(':').collect();
-    if parts.len() != 2 {
-        return Err(AppError::BadRequest(
+    match model_operation.split_once(':') {
+        Some((model, action))
+            if !model.is_empty() && !action.is_empty() && !action.contains(':') =>
+        {
+            Ok((model.to_string(), action.to_string()))
+        }
+        _ => Err(AppError::BadRequest(
             "Invalid model operation format. Expected 'model:action'".to_string(),
-        ));
+        )),
     }
-    Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
+/// Record a failed request's completion stats. Decrement of `active_requests`
+/// is handled by `ActiveRequestGuard` dropping on the caller's return path.
+async fn record_failure_metrics(metrics: &MetricsService) {
+    metrics
+        .record_completion(false, None, &crate::metrics::TokenCounts::default())
+        .await;
+}
+
+#[cfg_attr(not(feature = "db"), allow(unused_variables))]
+// Eight parameters — each is a distinct request-scoped concern (axum-extracted
+// state, request shape, downstream routing). Bundling into a struct would just
+// shift the call-site complexity without reducing it.
+#[allow(clippy::too_many_arguments)]
 async fn execute_proxy_request(
     state: &AppState,
     headers: &HeaderMap,
     body: Value,
     model: &str,
     action: Option<String>,
+    client_ip: &str,
+    request_path: &str,
+    force_family: Option<crate::proxy::LlmFamily>,
 ) -> Result<Response, AppError> {
+    // Check rate limiting before processing
+    if let Some(remaining) = state.rate_limiter.is_rate_limited(client_ip).await {
+        return Err(AppError::RateLimitedAuth {
+            retry_after_secs: remaining.as_secs(),
+        });
+    }
+
+    // Reject the "internal" key from non-loopback IPs
+    let request_api_key = extract_api_key(headers);
+    if let Some(ref key) = request_api_key
+        && key == "internal"
+    {
+        // Fail closed on parse errors: an unparseable client_ip cannot be
+        // validated as loopback, so refuse to honor the privileged "internal"
+        // key. axum's ConnectInfo always yields a parseable IP, so reaching
+        // this branch implies upstream construction is broken — log and reject.
+        let parsed: Result<std::net::IpAddr, _> = client_ip.parse();
+        match parsed {
+            Ok(ip) if ip.is_loopback() => {}
+            Ok(_) => return Err(AppError::InvalidApiKey),
+            Err(e) => {
+                tracing::warn!(
+                    "Could not parse client IP '{}' while checking 'internal' key: {}",
+                    client_ip,
+                    e
+                );
+                return Err(AppError::InvalidApiKey);
+            }
+        }
+    }
+
+    // Pre-compute API key hash once for quota checks, DB logging, and usage recording
+    let api_key_hash = request_api_key
+        .as_ref()
+        .map(|k| crate::quota::hash_api_key(k));
+
+    // Per-key request-rate check (separate from cumulative token quota below).
+    if let Some(ref rl) = state.request_limiter
+        && let Some(ref kh) = api_key_hash
+        && let RequestLimitResult::Exceeded { retry_after_secs } = rl.check(kh)
+    {
+        return Err(AppError::RateLimitedRequests { retry_after_secs });
+    }
+
+    // Check token quota before processing
+    if let Some(ref qm) = state.quota_manager
+        && let Some(ref kh) = api_key_hash
+    {
+        match qm.check_quota_hashed(kh).await {
+            QuotaCheckResult::Exceeded {
+                retry_after_secs,
+                limit_type,
+            } => {
+                return Err(AppError::QuotaExceeded {
+                    retry_after_secs,
+                    limit_type,
+                });
+            }
+            QuotaCheckResult::Allowed { .. } => {}
+        }
+    }
+
+    // The guard increments `active_requests` here and decrements when dropped.
+    // For streaming success, we hand it off to the response body so the count
+    // tracks the *body's* lifetime — i.e. drops the moment the client is done,
+    // not when the spawned upstream-drain task happens to exit. For all other
+    // paths the guard drops on this function's return.
+    let mut active_guard: Option<ActiveRequestGuard> =
+        Some(ActiveRequestGuard::new(&state.metrics));
+
     let params = ProxyRequestParams {
         headers,
         method: Method::POST,
@@ -100,22 +208,20 @@ async fn execute_proxy_request(
         token_manager: &state.token_manager,
         model_registry: &state.model_registry,
         load_balancer: &state.load_balancer,
+        force_family,
     };
 
     let builder = ProxyRequestBuilder::new(params);
 
-    // Get providers in round-robin order with fallback
+    // Get providers in load-balanced order. `LoadBalancer::new` rejects empty
+    // / all-disabled provider lists at startup, so this iterator is non-empty
+    // by construction.
     let providers = state.load_balancer.get_ordered_providers();
-    if providers.is_empty() {
-        return Err(AppError::Internal(anyhow::anyhow!(
-            "No providers available"
-        )));
-    }
 
     let mut last_error: Option<AppError> = None;
 
     // Try each provider in order until one succeeds or all are exhausted
-    for (i, provider) in providers.iter().enumerate() {
+    for (i, provider) in providers.enumerate() {
         // Try to build the request for this provider
         let proxy = match builder.build_for_provider(provider).await {
             Ok(proxy) => proxy,
@@ -128,22 +234,105 @@ async fn execute_proxy_request(
                 last_error = Some(AppError::ModelNotAvailableOnProvider { model, provider });
                 continue;
             }
+            Err(AppError::InvalidApiKey) => {
+                // Record auth failure for rate limiting
+                state.rate_limiter.record_failure(client_ip).await;
+                record_failure_metrics(&state.metrics).await;
+                return Err(AppError::InvalidApiKey);
+            }
             Err(e) => {
                 // Non-recoverable error (auth failure, etc.)
+                record_failure_metrics(&state.metrics).await;
                 return Err(e);
             }
         };
 
+        #[cfg(feature = "db")]
+        let db_context = {
+            state.database.as_ref().map(|db| crate::proxy::DbContext {
+                database: db.clone(),
+                request_path: request_path.to_string(),
+                api_key_hash: api_key_hash.clone(),
+            })
+        };
+
         // Execute the request
-        match proxy.execute(&state.client, &state.config).await {
-            Ok(ProxyExecuteResult::Response(response)) => {
-                if i > 0 {
+        #[cfg(feature = "db")]
+        let start_time = std::time::Instant::now();
+        match proxy
+            .execute(
+                &state.client,
+                &state.metrics,
+                &mut active_guard,
+                #[cfg(feature = "db")]
+                db_context,
+                state.quota_manager.clone(),
+                api_key_hash.clone(),
+            )
+            .await
+        {
+            Ok(ProxyExecuteResult::Response {
+                response,
+                token_stats,
+            }) => {
+                let is_success = response.status().is_success();
+
+                // Record successful auth only after a successful response
+                if is_success {
+                    state.rate_limiter.record_success(client_ip).await;
+                }
+                if i > 0 && is_success {
                     tracing::info!(
                         "Request succeeded on provider '{}' after {} fallback(s)",
                         provider.name,
                         i
                     );
                 }
+
+                // For non-streaming responses, record metrics now.
+                // Streaming responses record metrics when the stream completes,
+                // UNLESS the response is an error (no streaming task was spawned).
+                // `active_requests` itself is decremented by `active_guard`
+                // dropping — for non-streaming on this function's return; for
+                // streaming success, when the response body is dropped.
+                if !proxy.stream || !is_success {
+                    let counts = token_stats.to_counts();
+                    state
+                        .metrics
+                        .record_completion(is_success, Some(&proxy.model), &counts)
+                        .await;
+
+                    // Log request to database
+                    #[cfg(feature = "db")]
+                    if let Some(ref db) = state.database {
+                        let elapsed = start_time.elapsed();
+                        let response_status = response.status().as_u16();
+                        let record = crate::database::RequestRecord::new(
+                            request_path.to_string(),
+                            proxy.model.clone(),
+                            proxy.provider_name.clone(),
+                            elapsed,
+                            response_status,
+                            false,
+                            &token_stats,
+                            api_key_hash.clone(),
+                        );
+                        let db = db.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = db.insert_request(record).await {
+                                tracing::warn!("Failed to log request to database: {}", e);
+                            }
+                        });
+                    }
+
+                    // Record quota usage for non-streaming responses
+                    if let Some(ref qm) = state.quota_manager
+                        && let Some(ref kh) = api_key_hash
+                    {
+                        qm.record_usage_hashed(kh, &counts).await;
+                    }
+                }
+
                 return Ok(response);
             }
             Ok(ProxyExecuteResult::RateLimited) => {
@@ -168,6 +357,7 @@ async fn execute_proxy_request(
     }
 
     // All providers exhausted
+    record_failure_metrics(&state.metrics).await;
     match last_error {
         Some(AppError::RateLimited(_)) => Err(AppError::AllProvidersRateLimited),
         Some(e) => Err(e),
@@ -178,15 +368,20 @@ async fn execute_proxy_request(
 }
 
 pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
+    use crate::constants::get_context_length;
+
     let model_names = state.model_registry.get_available_models().await;
 
     let model_data: Vec<serde_json::Value> = model_names
         .into_iter()
         .map(|model_name| {
-            json!({
-                "id": model_name,
-                "object": "model"
-            })
+            let mut obj = serde_json::Map::new();
+            obj.insert("id".into(), json!(model_name));
+            obj.insert("object".into(), json!("model"));
+            if let Some(ctx_len) = get_context_length(&model_name) {
+                obj.insert("context_length".into(), json!(ctx_len));
+            }
+            serde_json::Value::Object(obj)
         })
         .collect();
 
@@ -199,41 +394,169 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
 
 pub async fn handle_openai_chat(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, AppError> {
     let model = extract_model_from_body(&body)?;
-    execute_proxy_request(&state, &headers, body, &model, None).await
+    let client_ip = addr.ip().to_string();
+    execute_proxy_request(
+        &state,
+        &headers,
+        body,
+        &model,
+        None,
+        &client_ip,
+        "/v1/chat/completions",
+        None,
+    )
+    .await
+}
+
+/// OpenAI-canonical embeddings endpoint. The model name comes from the request
+/// body (`text-embedding-*` family); routing to the Azure OpenAI embeddings URL
+/// is handled by `proxy::build_url` based on the `text-` prefix.
+pub async fn handle_openai_embeddings(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, AppError> {
+    let model = extract_model_from_body(&body)?;
+    let client_ip = addr.ip().to_string();
+    execute_proxy_request(
+        &state,
+        &headers,
+        body,
+        &model,
+        None,
+        &client_ip,
+        "/v1/embeddings",
+        None,
+    )
+    .await
+}
+
+/// OpenAI Responses API (`/v1/responses`). The route uniquely determines the
+/// API shape (Responses, not Chat Completions) regardless of model name, so we
+/// pass `force_family = Some(OpenAiResponses)`. The request body is filtered
+/// to the function-tools allowlist by `transforms::openai_responses` —
+/// `transforms::openai::prepare` does not run on this path.
+pub async fn handle_openai_responses(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, AppError> {
+    let model = extract_model_from_body(&body)?;
+    let client_ip = addr.ip().to_string();
+    execute_proxy_request(
+        &state,
+        &headers,
+        body,
+        &model,
+        None,
+        &client_ip,
+        "/v1/responses",
+        Some(crate::proxy::LlmFamily::OpenAiResponses),
+    )
+    .await
+}
+
+/// OpenAI Responses-API compaction subpath (`/v1/responses/compact`), used by
+/// Codex CLI's auto-compact-remote feature when a conversation runs up against
+/// the context window. AI Core natively allowlists `responses/compact` on Azure
+/// OpenAI deployments (verified empirically); the request and response shapes
+/// are the same as the create endpoint plus an `instructions` field, and the
+/// response includes the standard `usage` so token tracking works for free.
+///
+/// Sets `action = Some("compact")` to make `proxy::build_url` select the
+/// `responses/compact` URL action instead of the default `responses`.
+pub async fn handle_openai_responses_compact(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, AppError> {
+    let model = extract_model_from_body(&body)?;
+    let client_ip = addr.ip().to_string();
+    execute_proxy_request(
+        &state,
+        &headers,
+        body,
+        &model,
+        Some("compact".to_string()),
+        &client_ip,
+        "/v1/responses/compact",
+        Some(crate::proxy::LlmFamily::OpenAiResponses),
+    )
+    .await
 }
 
 pub async fn handle_azure_openai(
     State(state): State<AppState>,
     Path(model): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> Result<Response, AppError> {
     ensure_model_in_body(&mut body, &model);
     let model = extract_model_from_body(&body)?;
-    execute_proxy_request(&state, &headers, body, &model, None).await
+    let client_ip = addr.ip().to_string();
+    execute_proxy_request(
+        &state,
+        &headers,
+        body,
+        &model,
+        None,
+        &client_ip,
+        "/openai/deployments",
+        None,
+    )
+    .await
 }
 
 pub async fn handle_claude_messages(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, AppError> {
     let model = extract_model_from_body(&body)?;
-    execute_proxy_request(&state, &headers, body, &model, None).await
+    let client_ip = addr.ip().to_string();
+    execute_proxy_request(
+        &state,
+        &headers,
+        body,
+        &model,
+        None,
+        &client_ip,
+        "/v1/messages",
+        None,
+    )
+    .await
 }
 
 pub async fn handle_gemini_models(
     State(state): State<AppState>,
     Path(model_operation): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, AppError> {
     let (model, action) = parse_model_operation(&model_operation)?;
-    execute_proxy_request(&state, &headers, body, &model, Some(action)).await
+    let client_ip = addr.ip().to_string();
+    execute_proxy_request(
+        &state,
+        &headers,
+        body,
+        &model,
+        Some(action),
+        &client_ip,
+        "/gemini/models",
+        None,
+    )
+    .await
 }
 
 #[derive(Debug, Error)]
@@ -250,14 +573,23 @@ pub enum AppError {
     RateLimited(String),
     #[error("All providers are rate limited")]
     AllProvidersRateLimited,
+    #[error("Too many failed authentication attempts")]
+    RateLimitedAuth { retry_after_secs: u64 },
+    #[error("Per-key request rate limit exceeded")]
+    RateLimitedRequests { retry_after_secs: u64 },
+    #[error("Token quota exceeded ({limit_type} limit)")]
+    QuotaExceeded {
+        retry_after_secs: u64,
+        limit_type: crate::quota::LimitType,
+    },
     #[error("Internal server error")]
     Internal(#[from] anyhow::Error),
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+        let (status, message) = match &self {
+            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             AppError::MissingApiKey => (
                 StatusCode::UNAUTHORIZED,
                 "API key not found in headers".to_string(),
@@ -275,6 +607,30 @@ impl IntoResponse for AppError {
                 StatusCode::TOO_MANY_REQUESTS,
                 "All providers are rate limited. Please try again later.".to_string(),
             ),
+            AppError::RateLimitedAuth { retry_after_secs } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Too many failed authentication attempts. Retry after {} seconds.",
+                    retry_after_secs
+                ),
+            ),
+            AppError::RateLimitedRequests { retry_after_secs } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Per-key request rate limit exceeded. Retry after {} seconds.",
+                    retry_after_secs
+                ),
+            ),
+            AppError::QuotaExceeded {
+                retry_after_secs,
+                limit_type,
+            } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Token quota exceeded ({} limit). Retry after {} seconds.",
+                    limit_type, retry_after_secs
+                ),
+            ),
             AppError::Internal(err) => {
                 tracing::error!("Internal error: {}", err);
                 (
@@ -284,10 +640,53 @@ impl IntoResponse for AppError {
             }
         };
 
-        let body = json!({
-            "error": message
-        });
+        let mut response = (status, Json(json!({ "error": message }))).into_response();
 
-        (status, Json(body)).into_response()
+        let retry_after = match &self {
+            AppError::RateLimitedAuth { retry_after_secs }
+            | AppError::RateLimitedRequests { retry_after_secs }
+            | AppError::QuotaExceeded {
+                retry_after_secs, ..
+            } => Some(*retry_after_secs),
+            _ => None,
+        };
+        if let Some(secs) = retry_after
+            && let Ok(val) = axum::http::HeaderValue::from_str(&secs.to_string())
+        {
+            response.headers_mut().insert("retry-after", val);
+        }
+
+        response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_model_operation_accepts_well_formed_input() {
+        let (model, action) = parse_model_operation("gemini-2.5-flash:generateContent").unwrap();
+        assert_eq!(model, "gemini-2.5-flash");
+        assert_eq!(action, "generateContent");
+    }
+
+    #[test]
+    fn parse_model_operation_rejects_missing_action() {
+        assert!(parse_model_operation("gemini-2.5-flash").is_err());
+    }
+
+    #[test]
+    fn parse_model_operation_rejects_empty_components() {
+        assert!(parse_model_operation(":generateContent").is_err());
+        assert!(parse_model_operation("gemini-2.5-flash:").is_err());
+        assert!(parse_model_operation(":").is_err());
+    }
+
+    #[test]
+    fn parse_model_operation_rejects_multiple_colons() {
+        // A second colon would split unevenly; reject up front rather than
+        // ambiguously assigning it to the model or action.
+        assert!(parse_model_operation("foo:bar:baz").is_err());
     }
 }

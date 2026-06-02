@@ -4,8 +4,26 @@ pub mod client;
 pub mod commands;
 pub mod config;
 pub mod constants;
-pub mod errors;
+#[cfg(feature = "db")]
+pub mod database;
+pub mod metrics;
 pub mod proxy;
+pub mod quota;
+pub mod rate_limit;
 pub mod registry;
+pub mod request_limiter;
 pub mod routes;
+pub mod table;
 pub mod token;
+pub mod transforms;
+#[cfg(feature = "tui")]
+pub mod tui;
+
+/// Format a cost value with adaptive precision: 4 decimal places below $1, 2 above.
+pub(crate) fn format_cost_value(cost: f64) -> String {
+    if cost < 1.0 {
+        format!("${:.4}", cost)
+    } else {
+        format!("${:.2}", cost)
+    }
+}

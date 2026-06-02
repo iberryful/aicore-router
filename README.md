@@ -9,12 +9,53 @@ A high-performance Rust-based proxy service for SAP AI Core, providing unified a
 - **Multi-Model Support**: OpenAI GPT, Claude (Anthropic), and Gemini (Google) APIs
 - **Streaming Support**: Real-time streaming responses for all supported models
 - **Dynamic Model Resolution**: Automatic discovery and mapping of models from AI Core deployments
-- **CLI Administration**: Command-line tools to inspect deployments and resource groups
-- **Token Usage Statistics**: Logs token usage for all streaming responses
-- **OAuth Token Management**: Automatic token refresh with SAP UAA
+- **Multi-Provider Load Balancing**: Round-robin or fallback strategies across multiple AI Core tenants with automatic 429 retry
+- **Model Aliases**: Wildcard pattern matching (`*` may appear anywhere) to route variant model names to configured deployments
+- **Auto Max-Context**: Each Claude request automatically gets the maximum context window the model is capable of (1M for Sonnet 4+ / Opus 4.6+, with `context-1m-2025-08-07` beta auto-injected where needed)
+- **Token Quotas**: Per-API-key daily/monthly token limits with 429 rejection and Retry-After headers
+- **Request Logging**: SQLite-based request logging with token usage, configurable retention, and CLI usage reports
+- **Cost Estimation**: Per-model pricing config with `--cost` flag for estimated spend breakdown
+- **Terminal UI Dashboard**: Real-time TUI with metrics, active requests, and log viewer (`--tui` flag)
+- **CLI Administration**: Inspect deployments, resource groups, configure tools, view usage, and run diagnostics
+- **OAuth Token Management**: Automatic token refresh with SAP UAA and per-provider caching
 - **High Performance**: Built with Rust and async/await for maximum throughput
-- **Simple Configuration**: YAML config file only
-- **Cloud Ready**: Easy deployment with configuration management
+- **Simple Configuration**: Single YAML config file with CLI flag overrides
+
+## Supported Backends
+
+acr is purpose-built for **SAP AI Core** and routes only the three foundation-model families that SAP AI Core exposes via the LLM-shaped APIs Claude Code / Cursor / similar IDE tooling expect. AI Core also offers other backends (Mistral, Cohere, Amazon Nova/Titan, Perplexity Sonar, SAP RPT-1, etc.) — those are **out of scope** for acr; route them through the AI Core SDK or your own client. acr now rejects unsupported model families with a clear `400 Bad Request` rather than silently misrouting them.
+
+### Design principle: transparent proxy
+
+acr is a **transparent proxy**. As long as transparency works (no errors from upstream, optimal defaults like max-context and 1h cache TTL applied where the model is capable), we don't interfere with the request. We only transform when the upstream would otherwise reject, or when an "optimal default" is unambiguously better for our target clients (Claude Code / Cursor / OpenCode). Unknown beta features are passed through to the upstream — Bedrock decides what it accepts, not acr.
+
+### Supported
+
+| Client-facing API (acr) | LLM family | AI Core backend | AI Core action / URL shape |
+|---|---|---|---|
+| `/v1/messages`, `/anthropic/v1/messages` | Claude (Anthropic) | `aws-bedrock` | `/v2/inference/deployments/{id}/invoke` (and `/invoke-with-response-stream` for streams) — Bedrock **InvokeModel** API, native Anthropic Messages JSON shape |
+| `/v1/chat/completions`, `/litellm/v1/chat/completions`, `/openai/deployments/{model}/chat/completions` | OpenAI GPT / o-series | `azure-openai` | `/v2/inference/deployments/{id}/chat/completions?api-version=…` — Azure OpenAI Chat Completions |
+| `/v1/responses` | OpenAI Responses API (Codex CLI v0.130+) | `azure-openai` | `/v2/inference/deployments/{id}/responses?api-version=…` — passthrough; AI Core natively exposes the Responses endpoint |
+| `/v1/responses/compact` | OpenAI Responses-compaction subpath (Codex auto-compact) | `azure-openai` | `/v2/inference/deployments/{id}/responses/compact?api-version=…` — passthrough; same body+response shape as `/v1/responses`, always unary |
+| `/v1/embeddings`, `/openai/deployments/{model}/embedding` | OpenAI `text-embedding-*` | `azure-openai` | `/v2/inference/deployments/{id}/embeddings?api-version=…` |
+| `/v1beta/models/{model}:{action}`, `/gemini/v1beta/models/{model}:{action}` | Gemini (Google) | `gcp-vertexai` | `/v2/inference/deployments/{id}/models/{model}:generateContent` (or `:streamGenerateContent`) — Vertex AI GenerateContent |
+
+The OpenAI family covers `gpt-*`, `text-embedding-*`, and the `o`-series reasoning models (`o1`, `o3`, `o3-mini`, `o4-mini`, future `o5+` via regex).
+
+### Not supported (use AI Core SDK directly)
+
+`aws-bedrock` Amazon Nova / Titan · `aicore-cohere` Command / reranker · `aicore-mistralai` Mistral · `aicore-nvidia` NV embed · `aicore-sap` RPT-1, ABAP-Codestral, etc. · `perplexity-ai` Sonar · `orchestration` sap-abap-1 · `azure-openai` DALL-E / Whisper / realtime.
+
+### Nuances vs the upstream-published APIs
+
+acr's wire format is the public LLM API shape; the AI Core endpoint behind it has its own quirks. acr smooths these over so clients don't have to:
+
+- **Anthropic via Bedrock InvokeModel.** acr stamps `anthropic_version: bedrock-2023-05-31` and routes to `/invoke`, not the AI Core Converse endpoint (which is also exposed but lags native features). Strips the `cache_control.scope` field that Claude Code 2.1.88+ sends but Bedrock rejects — including on `tools[]` definitions, system blocks, and message content. Always injects `ttl: "1h"` into ephemeral `cache_control` blocks (1h cache vs the 5-min default — major win for IDE/agent sessions). Validates and clamps the `thinking.budget_tokens` against `max_tokens`. For `claude-opus-4-7` strips `temperature` / `top_p` / `top_k` and converts `thinking: enabled` → `thinking: adaptive` (4.7 deprecates explicit sampling at the model level, even outside thinking mode). Translates the `Anthropic-Beta` header through a remap table — known names (e.g., `advanced-tool-use-2025-11-20` → `tool-search-tool-2025-10-19`) are rewritten; unknown names pass through unchanged so Bedrock decides.
+- **Auto max-context.** Each Claude request automatically gets the maximum context window the resolved model is capable of: native 1M models (Sonnet 4.6, Opus 4.6/4.7) need no header; Sonnet 4 / 4.5 get the `context-1m-2025-08-07` beta auto-injected; Haiku and older Opus 4 stay at 200k. The `[1m]` suffix on a model name (e.g. `claude-sonnet-4-5[1m]`) is silently accepted for backward compatibility but no longer functionally required.
+- **OpenAI via Azure (Chat Completions).** Renames legacy `max_tokens` → `max_completion_tokens` (canonical since GPT-4o 2024-08-06+, required for o-series and GPT-5). For streaming requests, sets `stream_options.include_usage = true` so the final SSE chunk carries token counts. Normalizes a Codex-CLI bug where a preamble assistant message is inserted between `assistant(tool_calls)` and `tool(response)`. None of these apply to the Responses API path below.
+- **OpenAI Responses API (Codex CLI v0.130+).** `POST /v1/responses` is near-passthrough: acr filters `tools[]` to AI Core's accepted set (`type: function` only — last verified against gpt-5.5 on 2026-05-26; the upstream rejects `custom`, `web_search`, `tool_search`, `local_shell`, `image_generation`, `mcp`, `code_interpreter`, `file_search`, etc., and Codex CLI offers no flag to suppress them) and resets `tool_choice` to `"auto"` if it referenced a dropped tool. Everything else is forwarded unmodified. Token usage is read from the Responses-specific `usage.input_tokens` / `usage.output_tokens` / `usage.input_tokens_details.cached_tokens` shape (different field names from Chat Completions). Streaming events flow through unmodified once the stream is committed (see the mid-stream rate-limit bullet below for the peek step that runs before commit); usage is recorded from any terminal frame — `response.completed`, `response.incomplete` (e.g., `max_output_tokens` reached), or `response.failed` (upstream error) — so partial-stream token counts still hit the quota and DB log. The sibling `POST /v1/responses/compact` is also passthrough; Codex's auto-compact-remote feature works through it (always unary, no streaming).
+- **Gemini via Vertex.** Strips `id` from `functionResponse` parts (AI Core wrapper rejects it). Rewrites `thinkingConfig.thinkingBudget: 0` → `-1` so "let the model decide" doesn't get read as "thinking disabled" (a deliberate convenience over strict transparency, matching common SDK convention).
+- **Mid-stream rate-limit failover (all families).** AI Core / Azure can return HTTP 200 + open an SSE stream that then emits a rate-limit error mid-stream (Front Door throttling, Bedrock `ThrottlingException`, Vertex `RESOURCE_EXHAUSTED`, etc.). acr peeks the upstream's first parseable `data:` event (per-family classifier in `transforms::stream_classify`); if it's a rate-limit signal **before any bytes have been forwarded to the client**, acr surfaces it as an HTTP-429-equivalent and the existing `LoadBalancer` fallback retries on the next provider — silently. After the first chunk has been forwarded, acr lets the rate-limit event reach the client and relies on the client's reconnect (each reconnect is a fresh request that goes through the same peek path, so a sustained throttle still rotates providers cleanly).
 
 ## Installation
 
@@ -77,9 +118,17 @@ Edit `~/.aicore/config.yaml` with your settings:
 log_level: INFO
 
 # API keys for authenticating requests (supports multiple keys)
+# Simple string format or object format with per-key quota overrides
 api_keys:
   - your-api-key-1
-  - your-api-key-2
+  - key: your-api-key-2
+    daily_token_limit: 0  # unlimited
+
+# Token quota defaults (optional)
+quotas:
+  enabled: true
+  daily_token_limit: 1000000
+  monthly_token_limit: 20000000
 
 # Multiple AI Core providers for load balancing
 providers:
@@ -101,33 +150,18 @@ providers:
     enabled: true
 
 # Server configuration
-port: 8900
-refresh_interval_secs: 600
+bind: "127.0.0.1:8900"
+refresh_interval_secs: 300
 
 # Model mappings (optional)
 # Models are now discovered automatically from your AI Core deployments.
 # You can still define them here to override or add custom mappings.
 models:
   - name: gpt-4o  # Auto-discover: uses 'gpt-4o' to find deployment
-  - name: claude-sonnet-4-5
-    aicore_model_name: anthropic--claude-4-sonnet  # Map to AI Core's model name
+  - name: claude-sonnet-4-6
+    aicore_model_name: anthropic--claude-4.6-sonnet  # Map to AI Core's model name
   - name: gemini-2.5-pro
     aicore_model_name: gemini-2.5-pro
-```
-
-### Legacy Single-Provider Configuration
-
-For backward compatibility, you can still use the `credentials` block for a single provider:
-```yaml
-# Legacy single-provider configuration
-credentials:
-  uaa_token_url: https://your-tenant.authentication.sap.hana.ondemand.com/oauth/token
-  uaa_client_id: your-client-id
-  uaa_client_secret: your-client-secret
-  aicore_api_url: https://api.ai.prod.sap.com
-  api_key: your-api-key  # Legacy: use api_keys at root level instead
-
-resource_group: your-resource-group
 ```
 
 ### API Endpoints
@@ -143,6 +177,7 @@ curl -X POST http://localhost:8900/v1/chat/completions \
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": true
   }'
+```
 
 #### Claude API
 ```bash
@@ -150,10 +185,10 @@ curl -X POST http://localhost:8900/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: $your_api_key" \
   -d '{
-    "model": "claude-sonnet-4",
+    "model": "claude-sonnet-4-6",
     "messages": [{"role": "user", "content": "Hello!"}],
     "max_tokens": 1000,
-    "stream: true
+    "stream": true
   }'
 ```
 
@@ -191,18 +226,129 @@ cargo test
 
 The AI Core Router includes a command-line interface (CLI) for administrative tasks.
 
+### Running the Server
+
+```bash
+# Start with default config (~/.aicore/config.yaml)
+acr
+
+# Custom bind address and config
+acr -b 0.0.0.0:9000 --config ./my-config.yaml
+
+# Override log level
+acr --log-level debug
+
+# Enable request logging
+acr --log-requests
+
+# Enable terminal UI dashboard (requires --features tui)
+acr --tui
+```
+
+### Diagnostics
+
+Print diagnostic information about the configuration:
+```bash
+acr diagnose
+```
+
 ### List Deployments
 
 List all deployments in a resource group:
 ```bash
-acr deployments list -r <your-resource-group>
+acr deployments -r <your-resource-group>
 ```
 
 ### List Resource Groups
 
 List all available resource groups:
 ```bash
-acr resource-group list
+acr resource-groups
+```
+
+### Token Usage
+
+Show per-key, per-model token usage statistics from the request database:
+```bash
+# Summary: today, this week, this month
+acr usage
+
+# Filter by API key
+acr usage <your-api-key>
+
+# Daily breakdown for past 7 days
+acr usage --daily 7
+
+# Weekly breakdown for past 4 weeks
+acr usage --weekly 4
+
+# Monthly breakdown for past 3 months
+acr usage --monthly 3
+```
+
+Requires request logging to be enabled via `--log-requests` flag or config:
+```yaml
+log_requests:
+  enabled: true                  # or use --log-requests flag
+  db_path: ~/.aicore/requests.db # default
+  retention_days: 30             # auto-cleanup on startup, 0 = keep forever
+```
+
+### Cost Estimation
+
+Add `--cost` to any usage command to display estimated costs alongside token counts:
+```bash
+# Today's usage with cost
+acr usage --cost
+
+# Daily breakdown with cost
+acr usage --daily 7 --cost
+
+# Filter by key with cost
+acr usage <your-api-key> --monthly 3 --cost
+```
+
+Cost estimation uses per-model pricing configured in the `models` section:
+```yaml
+models:
+  - name: claude-sonnet-4-6
+    aicore_model_name: anthropic--claude-4.6-sonnet
+    pricing:
+      input: 3.00        # $ per 1M input tokens
+      output: 15.00      # $ per 1M output tokens
+      cache_read: 0.30   # $ per 1M cache read tokens
+      cache_write: 3.75  # $ per 1M cache write tokens
+
+  - name: gpt-5-mini
+    pricing:
+      input: 0.25
+      output: 2.00
+      # cache_read/cache_write omitted — cost marked as partial (*)
+```
+
+**Rules:**
+- All pricing fields are optional — omitted fields contribute $0 to the estimate
+- If a model has token usage for a field with no rate configured, cost is flagged with `*` (partial)
+- Models with no `pricing` section show `N/A` in the cost column
+- The total cost row sums all models that have pricing configured
+
+### Manage Logs
+
+Clean up old request logs:
+```bash
+# Use retention_days from config (default: 30)
+acr logs clean
+
+# Override with specific number of days
+acr logs clean --days 7
+```
+
+### Configure Tools
+
+Auto-configure coding tools to use this router:
+```bash
+acr configure claude-code
+acr configure opencode
 ```
 
 ## Configuration Reference
@@ -280,16 +426,17 @@ At minimum, you need:
 | Config Path | Description |
 |-------------|-------------|
 | `api_keys` | List of API keys for accessing the router |
-| `providers` | At least one provider configuration (or legacy `credentials` block) |
+| `providers` | At least one provider configuration |
 
 ### Optional Configuration
 
 | Config File Path | Default | Description |
 |------------------|---------|-------------|
-| `port` | 8900 | Server port |
+| `bind` | `127.0.0.1:8900` | Bind address (IP or IP:PORT) |
 | `log_level` | INFO | Logging level |
-| `refresh_interval_secs` | 600 | Interval for refreshing model deployments |
+| `refresh_interval_secs` | 300 | Interval for refreshing model deployments |
 | `load_balancing` | round_robin | Load balancing strategy: `round_robin` or `fallback` |
+| `openai_api_version` | 2025-04-01-preview | Azure OpenAI API version used in query parameters |
 
 ### API Keys Configuration
 
@@ -302,12 +449,34 @@ api_keys:
   - shared-team-key
 ```
 
-**Environment Variables:**
-- `API_KEY`: Single API key (for backward compatibility)
-- `API_KEYS`: Comma-separated list of API keys
+### Token Quotas
 
-**Backward Compatibility:**
-The legacy `credentials.api_key` field is still supported for backward compatibility, but we recommend using the root-level `api_keys` array for new configurations.
+You can enforce per-API-key token usage limits with daily and monthly budgets. When a key exceeds its quota, requests are rejected with HTTP 429 and a `Retry-After` header.
+
+```yaml
+# Global quota defaults (apply to all keys unless overridden)
+quotas:
+  enabled: true
+  daily_token_limit: 1000000     # 1M tokens/day
+  monthly_token_limit: 20000000  # 20M tokens/month
+
+# API keys with optional per-key quota overrides
+api_keys:
+  - user-key-1                            # inherits global limits
+  - key: admin-key
+    daily_token_limit: 0                  # 0 = unlimited (overrides global)
+    monthly_token_limit: 0
+  - key: limited-key
+    daily_token_limit: 500000             # per-key override
+    monthly_token_limit: 10000000
+```
+
+**Rules:**
+- `0` = explicitly unlimited (overrides global default)
+- Omitted per-key limit = inherits global default
+- Omitted `quotas` section or `enabled: false` = no throttling (all keys unlimited)
+- Quotas reset at midnight UTC (daily) and 1st of month UTC (monthly)
+- Usage is persisted to SQLite and survives restarts (requires `--log-requests` or `log_requests.enabled: true`)
 
 ### Model Configuration
 
@@ -319,8 +488,8 @@ models:
   - name: gpt-4o
 
   # Mapped: when AI Core uses a different model name
-  - name: claude-sonnet-4-5
-    aicore_model_name: anthropic--claude-4-sonnet
+  - name: claude-sonnet-4-6
+    aicore_model_name: anthropic--claude-4.6-sonnet
 ```
 
 If no models are configured, the router will automatically discover them from your AI Core deployments.
@@ -331,11 +500,11 @@ You can configure alias patterns to match multiple model name variants to a sing
 
 ```yaml
 models:
-  - name: claude-sonnet-4-5
-    aicore_model_name: anthropic--claude-4-sonnet
+  - name: claude-sonnet-4-6
+    aicore_model_name: anthropic--claude-4.6-sonnet
     aliases:
-      - "claude-sonnet-4-5-*"      # Match: claude-sonnet-4-5-20250929, etc.
-      - "claude-4-sonnet"          # Exact alias
+      - "claude-sonnet-4-6-*"      # Match: claude-sonnet-4-6-20260101, etc.
+      - "claude-4.6-sonnet"        # Exact alias
 
   - name: gpt-4o
     aliases:
@@ -344,7 +513,10 @@ models:
 
 **Alias Pattern Syntax:**
 - **Exact match**: `"claude-4-sonnet"` matches only `claude-4-sonnet`
-- **Prefix match**: `"claude-sonnet-4-5-*"` matches any model starting with `claude-sonnet-4-5-`
+- **Wildcard `*`**: matches any sequence of characters (including empty), and may appear **anywhere** in the pattern
+  - Trailing: `"claude-sonnet-4-6-*"` matches `claude-sonnet-4-6-20260101`
+  - Leading or middle: `"claude-*-sonnet"` matches `claude-4.6-sonnet`, `*-haiku-*` matches `claude-haiku-4-5`
+- All other characters (including `.` and `-`) match literally — `claude-4.6-*` won't match `claude-4x6-sonnet`
 
 **Resolution Priority:**
 1. **Exact name match**: Request matches a configured model name directly
@@ -352,10 +524,22 @@ models:
 3. **Family fallback**: Falls back to configured default for the model family
 
 **Conflict Resolution:**
-When multiple alias patterns match, the most specific pattern wins. Specificity is determined by the length of the literal prefix before the `*` wildcard.
+When multiple alias patterns match, the most specific pattern wins. Specificity is the total length of the literal portion (sum of segment lengths between `*`s).
 
-Example: For request `claude-sonnet-4-5-20250929`:
-- `claude-sonnet-4-5-*` (18 chars) wins over `claude-*` (7 chars)
+Example: For request `claude-sonnet-4-6-20260101`:
+- `claude-sonnet-4-6-*` (18 chars literal) wins over `claude-*` (7 chars literal)
+
+### Extended Context Window — automatic
+
+acr automatically enables the maximum context window the resolved Claude model is capable of:
+
+| Model family | Max context | How |
+|---|---|---|
+| Sonnet 4.6, Opus 4.6, Opus 4.7 | 1M tokens | Native — no header needed |
+| Sonnet 4, Sonnet 4.5 | 1M tokens | acr auto-injects `Anthropic-Beta: context-1m-2025-08-07` |
+| Opus 4 / 4.1 / 4.5, Haiku 4.x, Claude 3 Haiku | 200k tokens | No 1M-context beta available |
+
+The `[1m]` suffix on a model name (e.g. `claude-sonnet-4-5[1m]`) is silently accepted for backward compatibility but no longer functionally required — capability-driven injection makes it a no-op.
 
 ### Fallback Models
 
@@ -363,15 +547,15 @@ You can configure default fallback models for each model family. When a requeste
 
 ```yaml
 models:
-  - name: claude-sonnet-4-5
-    aicore_model_name: anthropic--claude-4-sonnet
+  - name: claude-sonnet-4-6
+    aicore_model_name: anthropic--claude-4.6-sonnet
   - name: gpt-4o
-  - name: gemini-1.5-pro
+  - name: gemini-2.5-pro
 
 fallback_models:
-  claude: claude-sonnet-4-5    # For models starting with "claude"
+  claude: claude-sonnet-4-6    # For models starting with "claude"
   openai: gpt-4o               # For models starting with "gpt" or "text"
-  gemini: gemini-1.5-pro       # For models starting with "gemini"
+  gemini: gemini-2.5-pro       # For models starting with "gemini"
 ```
 
 **Behavior:**

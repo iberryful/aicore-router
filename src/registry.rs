@@ -1,10 +1,11 @@
 //! Model registry that tracks deployments across multiple providers.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::client::AiCoreClient;
@@ -13,9 +14,9 @@ use crate::token::TokenManager;
 
 /// Resolved deployment information including which provider hosts it
 #[derive(Debug, Clone)]
-pub struct ResolvedDeployment {
-    pub deployment_id: String,
-    pub provider_name: String,
+struct ResolvedDeployment {
+    deployment_id: String,
+    provider_name: String,
 }
 
 /// Runtime model registry that manages resolved deployment IDs across multiple providers
@@ -54,53 +55,51 @@ impl ModelRegistry {
         }
     }
 
-    /// Start the registry with initial resolution and background refresh
-    pub async fn start(&self) -> Result<()> {
-        // Validate fallback models configuration
-        self.validate_fallback_models();
+    /// Start the registry: validate config, do an initial deployment fetch,
+    /// then spawn the background refresh task.
+    ///
+    /// Returns the `JoinHandle` of the background task so the caller can
+    /// observe panics or coordinate shutdown. If the handle is dropped, the
+    /// task continues running (Tokio JoinHandle drop does not abort);
+    /// callers wanting graceful shutdown should call `.abort()` on it.
+    pub async fn start(&self) -> Result<JoinHandle<()>> {
+        // Validate fallback models configuration — fail fast on misconfig
+        // rather than letting bad fallbacks surface as confusing per-request
+        // errors at runtime.
+        self.validate_fallback_models()?;
 
         // Initial resolution
         self.refresh_deployments().await?;
 
         // Start background refresh task
         let registry = self.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             registry.background_refresh().await;
         });
 
-        Ok(())
+        Ok(handle)
     }
 
-    /// Validate that configured fallback models exist in the models list
-    fn validate_fallback_models(&self) {
+    /// Validate that configured fallback models exist in the models list.
+    /// Returns an error listing every misconfigured family so users see all
+    /// problems in one shot rather than fixing them one at a time.
+    fn validate_fallback_models(&self) -> Result<()> {
         let model_names: Vec<&str> = self.config_models.iter().map(|m| m.name.as_str()).collect();
 
-        if let Some(ref claude_fallback) = self.fallback_models.claude
-            && !model_names.contains(&claude_fallback.as_str())
-        {
-            warn!(
-                "Fallback model '{}' for claude family is not configured in models list",
-                claude_fallback
-            );
-        }
+        let missing: Vec<String> = self
+            .fallback_models
+            .iter()
+            .filter(|(_, fallback)| !model_names.contains(fallback))
+            .map(|(family, fallback)| format!("{family} -> '{fallback}'"))
+            .collect();
 
-        if let Some(ref openai_fallback) = self.fallback_models.openai
-            && !model_names.contains(&openai_fallback.as_str())
-        {
-            warn!(
-                "Fallback model '{}' for openai family is not configured in models list",
-                openai_fallback
-            );
+        if !missing.is_empty() {
+            return Err(anyhow!(
+                "fallback model(s) not configured in models list: {}",
+                missing.join(", ")
+            ));
         }
-
-        if let Some(ref gemini_fallback) = self.fallback_models.gemini
-            && !model_names.contains(&gemini_fallback.as_str())
-        {
-            warn!(
-                "Fallback model '{}' for gemini family is not configured in models list",
-                gemini_fallback
-            );
-        }
+        Ok(())
     }
 
     /// Get deployment info for a model on a specific provider
@@ -118,33 +117,20 @@ impl ModelRegistry {
         })
     }
 
-    /// Get all providers that have a specific model deployed
-    pub async fn get_providers_for_model(&self, model_name: &str) -> Vec<ResolvedDeployment> {
-        let resolved = self.resolved_models.read().await;
-        resolved.get(model_name).cloned().unwrap_or_default()
-    }
-
-    /// Get deployment ID for a model (returns first available for backward compatibility)
-    pub async fn get_deployment_id(&self, model_name: &str) -> Option<String> {
-        let resolved = self.resolved_models.read().await;
-        resolved
-            .get(model_name)
-            .and_then(|deployments| deployments.first())
-            .map(|d| d.deployment_id.clone())
-    }
-
     /// Get all available (resolved) model names
     pub async fn get_available_models(&self) -> Vec<String> {
-        let resolved = self.resolved_models.read().await;
-        let mut models: Vec<String> = resolved.keys().cloned().collect();
+        let mut models: Vec<String> = {
+            let resolved = self.resolved_models.read().await;
+            resolved.keys().cloned().collect()
+        };
         models.sort();
         models
     }
 
-    /// Check if a model is available (has been resolved) on any provider
-    pub async fn is_model_available(&self, model_name: &str) -> bool {
-        let resolved = self.resolved_models.read().await;
-        resolved.contains_key(model_name)
+    /// Non-blocking count of resolved models for synchronous contexts (e.g. TUI rendering).
+    /// Returns `None` if the lock is contended (e.g. during a refresh).
+    pub fn resolved_model_count_sync(&self) -> Option<usize> {
+        self.resolved_models.try_read().ok().map(|m| m.len())
     }
 
     /// Find model configuration by name
@@ -161,11 +147,6 @@ impl ModelRegistry {
             GEMINI_PREFIX => self.fallback_models.gemini.as_deref(),
             _ => None,
         }
-    }
-
-    /// Get model names from configuration (not necessarily resolved)
-    pub fn get_configured_model_names(&self) -> Vec<&str> {
-        self.config_models.iter().map(|m| m.name.as_str()).collect()
     }
 
     /// Find a model config by checking aliases with glob pattern matching.
@@ -215,34 +196,69 @@ impl ModelRegistry {
 
         let mut all_resolved: HashMap<String, Vec<ResolvedDeployment>> = HashMap::new();
 
+        // Collect rows for the summary table: (provider, deployment_id, status, deployed_model, config_model)
+        let mut table_rows: Vec<(String, String, String, String, String)> = Vec::new();
+
         // Query each provider for deployments
         for provider in &self.providers {
             if !provider.enabled {
                 continue;
             }
 
-            info!(
-                "Querying provider '{}' (resource_group: {})...",
-                provider.name, provider.resource_group
-            );
-
             // Create a client for this provider
             let client = AiCoreClient::from_provider(provider.clone(), self.token_manager.clone());
 
             match client
-                .build_model_to_deployment_mapping(Some(&provider.resource_group))
+                .list_deployments(Some(&provider.resource_group))
                 .await
             {
-                Ok(aicore_deployments) => {
+                Ok(deployments) => {
+                    // Build mapping from aicore model name -> (deployment_id, status)
+                    let mut aicore_map: HashMap<String, (String, String)> = HashMap::new();
+                    for deployment in &deployments.resources {
+                        if let Some(model_name) = deployment.get_aicore_model_name() {
+                            aicore_map.insert(
+                                model_name,
+                                (deployment.id.clone(), deployment.status.clone()),
+                            );
+                        }
+                    }
+
+                    // Log all deployments from this provider
+                    for deployment in &deployments.resources {
+                        let deployed_model = deployment
+                            .get_aicore_model_name()
+                            .unwrap_or_else(|| "N/A".to_string());
+                        // Find matching config model
+                        let config_model = self
+                            .config_models
+                            .iter()
+                            .find(|m| {
+                                let aicore_name = m.aicore_model_name.as_ref().unwrap_or(&m.name);
+                                aicore_name == &deployed_model
+                            })
+                            .map(|m| m.name.clone())
+                            .unwrap_or_else(|| "-".to_string());
+
+                        table_rows.push((
+                            provider.name.clone(),
+                            deployment.id.clone(),
+                            deployment.status.clone(),
+                            deployed_model,
+                            config_model,
+                        ));
+                    }
+
+                    // Resolve config models to deployments
                     for model_config in &self.config_models {
-                        // Use aicore_model_name if specified, otherwise use the model name itself
                         let aicore_model_name = model_config
                             .aicore_model_name
                             .as_ref()
                             .unwrap_or(&model_config.name);
 
-                        // Resolve from AI Core model name
-                        if let Some(deployment_id) = aicore_deployments.get(aicore_model_name) {
+                        if let Some((deployment_id, status)) = aicore_map.get(aicore_model_name)
+                            && status == crate::constants::deployment::RUNNING_STATUS
+                        {
                             all_resolved
                                 .entry(model_config.name.clone())
                                 .or_default()
@@ -250,10 +266,6 @@ impl ModelRegistry {
                                     deployment_id: deployment_id.clone(),
                                     provider_name: provider.name.clone(),
                                 });
-                            info!(
-                                "Provider '{}': Model '{}' -> aicore_model_name: '{}' -> deployment_id: {}",
-                                provider.name, model_config.name, aicore_model_name, deployment_id
-                            );
                         }
                     }
                 }
@@ -266,8 +278,63 @@ impl ModelRegistry {
             }
         }
 
+        // Log the summary table
+        use crate::table::{Align, CliTable, Col};
+
+        table_rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.4.cmp(&b.4)));
+
+        let rows: Vec<Vec<String>> = table_rows
+            .iter()
+            .map(|(provider, id, status, deployed, config)| {
+                vec![
+                    provider.clone(),
+                    id.clone(),
+                    status.clone(),
+                    deployed.clone(),
+                    config.clone(),
+                ]
+            })
+            .collect();
+
+        let table = CliTable::new(vec![
+            Col {
+                header: "PROVIDER",
+                align: Align::Left,
+            },
+            Col {
+                header: "DEPLOYMENT ID",
+                align: Align::Left,
+            },
+            Col {
+                header: "STATUS",
+                align: Align::Left,
+            },
+            Col {
+                header: "DEPLOYED MODEL",
+                align: Align::Left,
+            },
+            Col {
+                header: "CONFIG MODEL",
+                align: Align::Left,
+            },
+        ])
+        .title("Deployment resolution summary")
+        .rows(rows);
+
+        for line in table.render() {
+            info!("{}", line);
+        }
+
         let resolved_count = all_resolved.len();
         let total_deployments: usize = all_resolved.values().map(|v| v.len()).sum();
+
+        // Compute unresolved before moving all_resolved
+        let unresolved: Vec<&str> = self
+            .config_models
+            .iter()
+            .filter(|m| !all_resolved.contains_key(&m.name))
+            .map(|m| m.name.as_str())
+            .collect();
 
         // Update the resolved models
         {
@@ -280,29 +347,70 @@ impl ModelRegistry {
             resolved_count, total_deployments
         );
 
+        if resolved_count == 0 {
+            error!(
+                "No models resolved \u{2014} proxy cannot route requests. Check config and deployments."
+            );
+        }
+
+        if !unresolved.is_empty() {
+            warn!(
+                "Unresolved config models (no matching deployment found): {}",
+                unresolved.join(", ")
+            );
+
+            // Warn specifically about unresolved fallback models
+            for (family, fb) in self.fallback_models.iter() {
+                if unresolved.contains(&fb) {
+                    warn!(
+                        "Fallback model '{}' for {} family is unresolved — fallback will not work",
+                        fb, family
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 }
 
-/// Check if a glob pattern matches a string.
-/// Only supports trailing `*` wildcard (prefix matching).
-/// Returns the specificity (length of literal prefix) if matches, None otherwise.
-/// Higher specificity = more specific match.
+/// Check if a glob pattern matches a string. `*` is a wildcard matching any
+/// character sequence (including empty) and may appear anywhere in the pattern;
+/// all other characters match literally.
+///
+/// Returns the specificity (length of the literal portion — sum of segment
+/// lengths between `*`s) when the pattern matches, `None` otherwise. Higher
+/// specificity = more specific match, used to break ties between competing
+/// alias patterns.
+///
+/// Examples:
+/// - `claude-*-sonnet` matches `claude-4.6-sonnet` with specificity 14
+/// - `*-haiku-*` matches `claude-haiku-4-5` with specificity 7
+/// - `claude-*` matches `claude-anything` with specificity 7 (trailing-only is the common case)
+/// - `claude-opus-4-7` exact-matches only `claude-opus-4-7` with specificity 15
 fn glob_matches(pattern: &str, input: &str) -> Option<usize> {
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        // Pattern ends with *: prefix match
-        if input.starts_with(prefix) {
-            Some(prefix.len()) // Specificity = length of literal part
-        } else {
-            None
+    // Fast paths first.
+    if !pattern.contains('*') {
+        return (pattern == input).then_some(pattern.len());
+    }
+    // Convert glob to regex anchored at both ends; escape regex metacharacters
+    // in literal segments so e.g. `claude-4.6-*` doesn't treat `.` as wildcard.
+    let mut re = String::with_capacity(pattern.len() + 4);
+    re.push('^');
+    for (i, segment) in pattern.split('*').enumerate() {
+        if i > 0 {
+            re.push_str(".*");
         }
+        re.push_str(&regex::escape(segment));
+    }
+    re.push('$');
+    let regex = regex::Regex::new(&re).ok()?;
+    if regex.is_match(input) {
+        // Specificity: total literal length (everything except the `*`s).
+        let literal_len: usize = pattern.split('*').map(|s| s.len()).sum();
+        Some(literal_len)
     } else {
-        // No wildcard: exact match only
-        if pattern == input {
-            Some(pattern.len())
-        } else {
-            None
-        }
+        None
     }
 }
 
@@ -363,6 +471,32 @@ mod tests {
         assert_eq!(general.unwrap(), 7);
     }
 
+    #[test]
+    fn test_glob_matches_mid_string_wildcard() {
+        // `*` may now appear anywhere in the pattern
+        assert_eq!(
+            glob_matches("claude-*-sonnet", "claude-4.6-sonnet"),
+            Some(14) // "claude-" (7) + "-sonnet" (7) = 14
+        );
+        assert!(glob_matches("claude-*-sonnet", "claude-4-sonnet").is_some());
+        assert!(glob_matches("claude-*-sonnet", "claude-haiku").is_none());
+    }
+
+    #[test]
+    fn test_glob_matches_leading_and_trailing_wildcards() {
+        // `*-haiku-*` matches anything containing `-haiku-`
+        assert_eq!(glob_matches("*-haiku-*", "claude-haiku-4-5"), Some(7));
+        assert!(glob_matches("*-haiku-*", "claude-haiku").is_none()); // no trailing dash
+        assert!(glob_matches("*haiku*", "claude-haiku-4-5").is_some());
+    }
+
+    #[test]
+    fn test_glob_matches_escapes_regex_metachars_in_literal_segments() {
+        // The `.` in `4.6` must match literally, not as regex `.`
+        assert!(glob_matches("claude-4.6-*", "claude-4.6-sonnet").is_some());
+        assert!(glob_matches("claude-4.6-*", "claude-4x6-sonnet").is_none());
+    }
+
     fn create_test_registry(models: Vec<Model>) -> ModelRegistry {
         ModelRegistry::new(
             models,
@@ -379,6 +513,7 @@ mod tests {
             name: "claude-sonnet-4-5".to_string(),
             aicore_model_name: None,
             aliases: vec!["claude-4-sonnet".to_string()],
+            pricing: None,
         }];
         let registry = create_test_registry(models);
 
@@ -393,6 +528,7 @@ mod tests {
             name: "claude-sonnet-4-5".to_string(),
             aicore_model_name: None,
             aliases: vec!["claude-sonnet-4-5-*".to_string()],
+            pricing: None,
         }];
         let registry = create_test_registry(models);
 
@@ -408,11 +544,13 @@ mod tests {
                 name: "claude-general".to_string(),
                 aicore_model_name: None,
                 aliases: vec!["claude-*".to_string()],
+                pricing: None,
             },
             Model {
                 name: "claude-sonnet-4-5".to_string(),
                 aicore_model_name: None,
                 aliases: vec!["claude-sonnet-4-5-*".to_string()],
+                pricing: None,
             },
         ];
         let registry = create_test_registry(models);
@@ -434,6 +572,7 @@ mod tests {
             name: "claude-sonnet-4-5".to_string(),
             aicore_model_name: None,
             aliases: vec!["claude-sonnet-4-5-*".to_string()],
+            pricing: None,
         }];
         let registry = create_test_registry(models);
 
@@ -451,6 +590,7 @@ mod tests {
                 "claude-4-sonnet".to_string(),
                 "sonnet-4.5".to_string(),
             ],
+            pricing: None,
         }];
         let registry = create_test_registry(models);
 
