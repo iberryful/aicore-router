@@ -1,6 +1,8 @@
 //! CLI command handlers for administrative operations.
 
-use crate::table::{Align, CliTable, Col, format_number};
+#[cfg(feature = "db")]
+use crate::table::format_number;
+use crate::table::{Align, CliTable, Col};
 use crate::{client::AiCoreClient, config::Config, token::TokenManager};
 use anyhow::{Context, Result};
 use std::path::PathBuf;

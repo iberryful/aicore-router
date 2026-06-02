@@ -5,7 +5,7 @@ edition = "2024"
 repository = "https://github.com/iberryful/aicore-router"
 
 [features]
-default = ["tui", "db"]
+default = ["tui"]
 e2e = []
 tui = ["ratatui", "crossterm"]
 db = ["rusqlite"]
