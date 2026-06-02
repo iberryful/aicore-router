@@ -224,7 +224,10 @@ pub struct ActiveRequestGuard {
 
 impl ActiveRequestGuard {
     pub fn new(metrics: &MetricsService) -> Self {
-        metrics.inner.active_requests.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .inner
+            .active_requests
+            .fetch_add(1, Ordering::Relaxed);
         metrics.inner.total_requests.fetch_add(1, Ordering::Relaxed);
         let _ = metrics.inner.sender.send(MetricsEvent::RequestStarted);
         Self {
