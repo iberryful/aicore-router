@@ -4,6 +4,10 @@ Cargo.lock
 .env
 config.yaml
 !examples/config.yaml
-.claude
+.claude/settings.local.json
+.claude/sessions/
+.claude/history.jsonl
+.claude/shell-snapshots/
+.claude/tasks/
 .DS_Store
 docs/
