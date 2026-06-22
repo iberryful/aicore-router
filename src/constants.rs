@@ -78,6 +78,21 @@ pub mod api {
         ("files-api-2025-04-14", None),
         ("message-batches-2024-09-24", None),
         ("managed-agents-2026-04-01", None),
+        // Anthropic-hosted features added in Claude Code 2.1.x; Bedrock
+        // rejects each with `400 invalid beta flag`. Empirically probed
+        // 2026-06-22 against AWS Bedrock Anthropic. Claude Code 2.1.185
+        // sends `thinking-token-count-2026-05-13` by default; without this
+        // entry, the request 400s and the client surfaces
+        // "API Error: 400 invalid beta flag".
+        ("code-execution-2025-05-22", None),
+        ("fast-mode-2026-02-01", None),
+        ("output-300k-2026-03-24", None),
+        ("user-profiles-2026-03-24", None),
+        ("advisor-tool-2026-03-01", None),
+        ("cache-diagnosis-2026-04-07", None),
+        ("thinking-token-count-2026-05-13", None),
+        ("server-side-fallback-2026-06-01", None),
+        ("fallback-credit-2026-06-01", None),
     ];
 
     /// Beta feature name for 1M extended context window
