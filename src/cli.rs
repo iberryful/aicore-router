@@ -287,7 +287,7 @@ impl Cli {
         tracing::info!("Load balancing strategy: {:?}", config.load_balancing);
 
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300)) // 5 min timeout for long LLM responses
+            .timeout(std::time::Duration::from_secs(600))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .context("Failed to build HTTP client")?;
