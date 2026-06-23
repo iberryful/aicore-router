@@ -599,11 +599,12 @@ impl ProxyRequest {
             // Log completion when streaming is done
             let elapsed = start_time.elapsed();
             tracing::info!(
-                "Proxy done - original_model: {}, resolved_model: {}, provider: {}, time: {:.2}ms, status: 200, stream: true, {}",
+                "Proxy done - original_model: {}, resolved_model: {}, provider: {}, time: {:.2}ms, status: 200, stream: true, success: {}, {}",
                 original_model,
                 model,
                 provider_name,
                 elapsed.as_secs_f64() * 1000.0,
+                success,
                 token_stats
             );
 
@@ -620,7 +621,7 @@ impl ProxyRequest {
                     provider_name.clone(),
                     elapsed,
                     200,
-                    true,
+                    success,
                     &token_stats,
                     ctx.api_key_hash,
                 );
