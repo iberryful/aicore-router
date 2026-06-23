@@ -108,12 +108,6 @@ pub mod api {
     // Default max_tokens for Anthropic if not provided (Bedrock requires this field)
     pub const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 4096;
 
-    // Idle timeout between upstream chunks. The body's `ActiveRequestGuard`
-    // (see `proxy::GuardedStream`) decouples TUI accuracy from this value, so
-    // we bound the spawned drain task's lifetime tightly to avoid piling up
-    // dead tasks against truly hung upstreams.
-    pub const STREAMING_TIMEOUT_SECS: u64 = 60;
-
     // Peek window for classifying upstream's first SSE chunks before
     // committing to forwarding the response to the client. If the first
     // parseable `data:` line indicates a rate-limit / throttling failure,

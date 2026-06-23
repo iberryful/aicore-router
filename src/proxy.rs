@@ -519,7 +519,6 @@ impl ProxyRequest {
             let mut token_stats = TokenStats::default();
             let mut client_gone = false;
             let mut stream_error = false;
-            let chunk_timeout = Duration::from_secs(STREAMING_TIMEOUT_SECS);
 
             // Drain whatever the peek phase already buffered before pulling
             // any new chunks — otherwise a tiny initial response (rate-limit
@@ -554,17 +553,9 @@ impl ProxyRequest {
                     break;
                 }
 
-                let chunk_result = match tokio::time::timeout(chunk_timeout, stream.next()).await {
-                    Ok(Some(result)) => result,
-                    Ok(None) => break, // Stream ended normally
-                    Err(_) => {
-                        tracing::error!(
-                            "Streaming response timed out after {}s with no data",
-                            STREAMING_TIMEOUT_SECS
-                        );
-                        stream_error = true;
-                        break;
-                    }
+                let chunk_result = match stream.next().await {
+                    Some(result) => result,
+                    None => break, // Stream ended normally
                 };
                 match chunk_result {
                     Ok(chunk) => {
@@ -862,8 +853,8 @@ enum PeekOutcome {
     /// the forwarder anyway — it'll exit cleanly.
     StreamEnded,
     /// Peek window elapsed before any `data:` line arrived. Proceed with
-    /// the forwarder; the per-chunk timeout inside the forwarder
-    /// (`STREAMING_TIMEOUT_SECS`) is the real watchdog.
+    /// the forwarder; reqwest's overall request timeout (set in `cli.rs`)
+    /// is the only watchdog past commit.
     PeekTimeout,
     /// Transport-level error reading from the upstream stream.
     Transport(reqwest::Error),
