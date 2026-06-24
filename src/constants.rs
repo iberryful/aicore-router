@@ -10,10 +10,16 @@ pub mod models {
     pub const GPT_PREFIX: &str = "gpt";
     pub const TEXT_PREFIX: &str = "text";
 
-    /// Resolved client-facing name for Claude Opus 4.7. Used by `proxy::is_opus_4_7`
-    /// to gate request-shape overrides specific to this model (sampling-param strip,
-    /// adaptive-thinking conversion).
+    /// Resolved client-facing name for Claude Opus 4.7. Used by
+    /// `transforms::anthropic::requires_adaptive_thinking` to gate request-shape
+    /// overrides specific to adaptive-thinking models (sampling-param strip,
+    /// `thinking: enabled` → `adaptive` conversion).
     pub const CLAUDE_OPUS_4_7: &str = "claude-opus-4-7";
+
+    /// Resolved client-facing name for Claude Opus 4.8. Same overrides as 4.7 —
+    /// Bedrock rejects `thinking.type.enabled` and non-1 sampling params on this
+    /// model. See `transforms::anthropic::requires_adaptive_thinking`.
+    pub const CLAUDE_OPUS_4_8: &str = "claude-opus-4-8";
 }
 
 pub mod api {
@@ -132,6 +138,13 @@ struct ContextCaps {
 static MODEL_CONTEXT_CAPS: &[(&str, ContextCaps)] = &[
     // --- Anthropic Claude (via AWS Bedrock) ---
     // Native 1M context (no beta needed):
+    (
+        "claude-opus-4-8",
+        ContextCaps {
+            max: 1_000_000,
+            beta: None,
+        },
+    ),
     (
         "claude-opus-4-7",
         ContextCaps {
@@ -371,6 +384,7 @@ mod tests {
 
     #[test]
     fn context_length_returns_max_for_known_models() {
+        assert_eq!(get_context_length("claude-opus-4-8"), Some(1_000_000));
         assert_eq!(get_context_length("claude-opus-4-7"), Some(1_000_000));
         assert_eq!(get_context_length("claude-sonnet-4-6"), Some(1_000_000));
         assert_eq!(get_context_length("claude-sonnet-4-5"), Some(1_000_000));
@@ -406,6 +420,7 @@ mod tests {
         );
         // Native-1M models — no beta needed:
         assert_eq!(get_extended_context_beta("claude-sonnet-4-6"), None);
+        assert_eq!(get_extended_context_beta("claude-opus-4-8"), None);
         assert_eq!(get_extended_context_beta("claude-opus-4-7"), None);
         assert_eq!(get_extended_context_beta("claude-opus-4-6"), None);
         // 200k models — no extended-context beta available:
