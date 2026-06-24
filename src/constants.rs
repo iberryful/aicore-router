@@ -128,9 +128,21 @@ pub mod api {
 /// the model can accept; `beta` is the `Anthropic-Beta` header value (if any) that
 /// must be set on the request to unlock that maximum. `beta: None` means `max` is
 /// the native default — no header required.
+#[derive(Copy, Clone)]
 struct ContextCaps {
     max: u64,
     beta: Option<&'static str>,
+}
+
+const fn cap(max: u64) -> ContextCaps {
+    ContextCaps { max, beta: None }
+}
+
+const fn cap_beta(max: u64, beta: &'static str) -> ContextCaps {
+    ContextCaps {
+        max,
+        beta: Some(beta),
+    }
 }
 
 /// Prefix-matched table of model context capabilities.
@@ -138,213 +150,45 @@ struct ContextCaps {
 static MODEL_CONTEXT_CAPS: &[(&str, ContextCaps)] = &[
     // --- Anthropic Claude (via AWS Bedrock) ---
     // Native 1M context (no beta needed):
-    (
-        "claude-opus-4-8",
-        ContextCaps {
-            max: 1_000_000,
-            beta: None,
-        },
-    ),
-    (
-        "claude-opus-4-7",
-        ContextCaps {
-            max: 1_000_000,
-            beta: None,
-        },
-    ),
-    (
-        "claude-opus-4-6",
-        ContextCaps {
-            max: 1_000_000,
-            beta: None,
-        },
-    ),
-    (
-        "claude-sonnet-4-6",
-        ContextCaps {
-            max: 1_000_000,
-            beta: None,
-        },
-    ),
+    ("claude-opus-4-8", cap(1_000_000)),
+    ("claude-opus-4-7", cap(1_000_000)),
+    ("claude-opus-4-6", cap(1_000_000)),
+    ("claude-sonnet-4-6", cap(1_000_000)),
     // 1M via context-1m-2025-08-07 beta (200k native, beta unlocks 1M):
-    (
-        "claude-sonnet-4-5",
-        ContextCaps {
-            max: 1_000_000,
-            beta: Some(api::CONTEXT_1M_BETA),
-        },
-    ),
-    (
-        "claude-sonnet-4",
-        ContextCaps {
-            max: 1_000_000,
-            beta: Some(api::CONTEXT_1M_BETA),
-        },
-    ),
+    ("claude-sonnet-4-5", cap_beta(1_000_000, api::CONTEXT_1M_BETA)),
+    ("claude-sonnet-4", cap_beta(1_000_000, api::CONTEXT_1M_BETA)),
     // 200k models (no extended-context beta available):
-    (
-        "claude-opus-4-5",
-        ContextCaps {
-            max: 200_000,
-            beta: None,
-        },
-    ),
-    (
-        "claude-opus-4-1",
-        ContextCaps {
-            max: 200_000,
-            beta: None,
-        },
-    ),
-    (
-        "claude-opus-4",
-        ContextCaps {
-            max: 200_000,
-            beta: None,
-        },
-    ), // catch-all for older Opus 4 variants
-    (
-        "claude-haiku-4",
-        ContextCaps {
-            max: 200_000,
-            beta: None,
-        },
-    ), // includes claude-haiku-4-5
-    (
-        "claude-3-haiku",
-        ContextCaps {
-            max: 200_000,
-            beta: None,
-        },
-    ),
+    ("claude-opus-4-5", cap(200_000)),
+    ("claude-opus-4-1", cap(200_000)),
+    ("claude-opus-4", cap(200_000)), // catch-all for older Opus 4 variants
+    ("claude-haiku-4", cap(200_000)), // includes claude-haiku-4-5
+    ("claude-3-haiku", cap(200_000)),
     // --- OpenAI (via Azure) ---
     // GPT-5.5 / GPT-5.5-pro / GPT-5.4: 1.05M context
-    (
-        "gpt-5.5",
-        ContextCaps {
-            max: 1_050_000,
-            beta: None,
-        },
-    ),
-    (
-        "gpt-5.4-mini",
-        ContextCaps {
-            max: 400_000,
-            beta: None,
-        },
-    ),
-    (
-        "gpt-5.4-nano",
-        ContextCaps {
-            max: 400_000,
-            beta: None,
-        },
-    ),
-    (
-        "gpt-5.4",
-        ContextCaps {
-            max: 1_050_000,
-            beta: None,
-        },
-    ),
+    ("gpt-5.5", cap(1_050_000)),
+    ("gpt-5.4-mini", cap(400_000)),
+    ("gpt-5.4-nano", cap(400_000)),
+    ("gpt-5.4", cap(1_050_000)),
     // GPT-5 through GPT-5.3: 400k context
-    (
-        "gpt-5",
-        ContextCaps {
-            max: 400_000,
-            beta: None,
-        },
-    ),
+    ("gpt-5", cap(400_000)),
     // GPT-4.1 family (including mini/nano): ~1M (1,047,576)
-    (
-        "gpt-4.1",
-        ContextCaps {
-            max: 1_047_576,
-            beta: None,
-        },
-    ),
+    ("gpt-4.1", cap(1_047_576)),
     // GPT-4o / GPT-4o-mini: 128k
-    (
-        "gpt-4o",
-        ContextCaps {
-            max: 128_000,
-            beta: None,
-        },
-    ),
+    ("gpt-4o", cap(128_000)),
     // OpenAI o-series reasoning: all 200k
-    (
-        "o4-mini",
-        ContextCaps {
-            max: 200_000,
-            beta: None,
-        },
-    ),
-    (
-        "o3-mini",
-        ContextCaps {
-            max: 200_000,
-            beta: None,
-        },
-    ),
-    (
-        "o3",
-        ContextCaps {
-            max: 200_000,
-            beta: None,
-        },
-    ),
-    (
-        "o1",
-        ContextCaps {
-            max: 200_000,
-            beta: None,
-        },
-    ),
+    ("o4-mini", cap(200_000)),
+    ("o3-mini", cap(200_000)),
+    ("o3", cap(200_000)),
+    ("o1", cap(200_000)),
     // --- Google Gemini (via GCP Vertex AI) ---
     // All Gemini 2.0+ models: 1M context
-    (
-        "gemini-3",
-        ContextCaps {
-            max: 1_048_576,
-            beta: None,
-        },
-    ),
-    (
-        "gemini-2.5",
-        ContextCaps {
-            max: 1_048_576,
-            beta: None,
-        },
-    ),
-    (
-        "gemini-2.0",
-        ContextCaps {
-            max: 1_048_576,
-            beta: None,
-        },
-    ),
+    ("gemini-3", cap(1_048_576)),
+    ("gemini-2.5", cap(1_048_576)),
+    ("gemini-2.0", cap(1_048_576)),
     // --- Embedding models ---
-    (
-        "text-embedding-3-large",
-        ContextCaps {
-            max: 8_192,
-            beta: None,
-        },
-    ),
-    (
-        "text-embedding-3-small",
-        ContextCaps {
-            max: 8_192,
-            beta: None,
-        },
-    ),
-    (
-        "text-embedding",
-        ContextCaps {
-            max: 8_192,
-            beta: None,
-        },
-    ),
+    ("text-embedding-3-large", cap(8_192)),
+    ("text-embedding-3-small", cap(8_192)),
+    ("text-embedding", cap(8_192)),
 ];
 
 fn get_context_caps(model: &str) -> Option<&'static ContextCaps> {
