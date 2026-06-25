@@ -43,14 +43,14 @@ impl Cli {
                     return handler.list_deployments(resource_group).await;
                 }
                 ("configure", configure_matches) => {
-                    if let Some(("claude-code", _)) = configure_matches.subcommand() {
+                    if let Some(("claude", _)) = configure_matches.subcommand() {
                         return handler.configure_claude_code();
                     }
                     if let Some(("opencode", _)) = configure_matches.subcommand() {
                         return handler.configure_opencode();
                     }
                     eprintln!(
-                        "Unknown configure subcommand. Use 'acr configure claude-code' or 'acr configure opencode'"
+                        "Unknown configure subcommand. Use 'acr configure claude' or 'acr configure opencode'"
                     );
                     std::process::exit(1);
                 }
@@ -207,7 +207,7 @@ impl Cli {
                 Command::new("configure")
                     .about("Configure coding tools to use this router")
                     .subcommand(
-                        Command::new("claude-code")
+                        Command::new("claude")
                             .about("Auto-configure Claude Code to use this router"),
                     )
                     .subcommand(

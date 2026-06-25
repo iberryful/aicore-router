@@ -347,7 +347,7 @@ acr logs clean --days 7
 
 Auto-configure coding tools to use this router:
 ```bash
-acr configure claude-code
+acr configure claude
 acr configure opencode
 ```
 
