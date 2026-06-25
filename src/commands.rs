@@ -1263,6 +1263,24 @@ mod tests {
     }
 
     #[test]
+    fn from_models_picks_newest_in_each_family() {
+        let models = vec![
+            make_model("claude-opus-4-6"),
+            make_model("claude-opus-4-8"),
+            make_model("claude-opus-4-7"),
+            make_model("claude-sonnet-4-6"),
+            make_model("claude-haiku-4-5"),
+            make_model("gpt-5.5"), // non-Claude, ignored
+            make_model("gemini-2.5-pro"),
+        ];
+        let choices = ClaudeModelChoices::from_models(&models);
+        assert_eq!(choices.opus.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(choices.sonnet.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(choices.haiku.as_deref(), Some("claude-haiku-4-5"));
+        assert!(!choices.is_empty());
+    }
+
+    #[test]
     fn claude_model_choices_env_vars_skips_missing_families() {
         let choices = ClaudeModelChoices {
             opus: Some("claude-opus-4-8".to_string()),
