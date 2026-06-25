@@ -12,6 +12,117 @@ pub struct CommandHandler {
     config: Config,
 }
 
+/// Picked Claude models for the per-family `ANTHROPIC_*_MODEL` env vars that
+/// `acr configure claude` writes into `~/.claude/settings.json`.
+///
+/// Each field is `Some(name)` when a model in that sub-family is configured in
+/// the user's aicore config, or `None` when none is. The chosen name within a
+/// sub-family is the **newest version**, picked by numeric comparison on the
+/// trailing `-<major>-<minor>` segments of the model name (so `claude-opus-4-10`
+/// correctly beats `claude-opus-4-2`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ClaudeModelChoices {
+    pub opus: Option<String>,
+    pub sonnet: Option<String>,
+    pub haiku: Option<String>,
+}
+
+impl ClaudeModelChoices {
+    /// Pick the newest configured model in each Claude sub-family.
+    /// Picks are independent: any subset (or none) may be present.
+    pub fn from_models(models: &[crate::config::Model]) -> Self {
+        Self {
+            opus: pick_newest_in_family(models, "opus"),
+            sonnet: pick_newest_in_family(models, "sonnet"),
+            haiku: pick_newest_in_family(models, "haiku"),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.opus.is_none() && self.sonnet.is_none() && self.haiku.is_none()
+    }
+
+    /// Build the `ANTHROPIC_*` env-var pairs for Claude Code's `settings.json`.
+    ///
+    /// Each `ANTHROPIC_DEFAULT_*_MODEL` is emitted only when a model exists for
+    /// that sub-family. `ANTHROPIC_MODEL` defaults to opus → sonnet → haiku in
+    /// availability order; `ANTHROPIC_SMALL_FAST_MODEL` prefers haiku → sonnet
+    /// → opus. The `[1m]` suffix is appended to model names whose context
+    /// window is at least 1M (per acr's catalog) so Claude Code's client-side
+    /// UI and history budgeting reflect the actual context window — acr's
+    /// server-side handling strips the suffix regardless.
+    pub fn env_vars(&self) -> Vec<(&'static str, String)> {
+        let mut out: Vec<(&'static str, String)> = Vec::new();
+
+        if let Some(name) = self.primary_model() {
+            out.push(("ANTHROPIC_MODEL", with_1m_suffix(name)));
+        }
+        if let Some(name) = &self.opus {
+            out.push(("ANTHROPIC_DEFAULT_OPUS_MODEL", with_1m_suffix(name)));
+        }
+        if let Some(name) = &self.sonnet {
+            out.push(("ANTHROPIC_DEFAULT_SONNET_MODEL", with_1m_suffix(name)));
+        }
+        if let Some(name) = &self.haiku {
+            out.push(("ANTHROPIC_DEFAULT_HAIKU_MODEL", with_1m_suffix(name)));
+        }
+        if let Some(name) = self.small_fast_model() {
+            out.push(("ANTHROPIC_SMALL_FAST_MODEL", with_1m_suffix(name)));
+        }
+
+        out
+    }
+
+    fn primary_model(&self) -> Option<&str> {
+        self.opus
+            .as_deref()
+            .or(self.sonnet.as_deref())
+            .or(self.haiku.as_deref())
+    }
+
+    fn small_fast_model(&self) -> Option<&str> {
+        self.haiku
+            .as_deref()
+            .or(self.sonnet.as_deref())
+            .or(self.opus.as_deref())
+    }
+}
+
+fn pick_newest_in_family(models: &[crate::config::Model], family: &str) -> Option<String> {
+    let prefix = format!("claude-{family}-");
+    let mut best: Option<((u32, u32), String)> = None;
+    for m in models {
+        let Some(rest) = m.name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let mut parts = rest.split('-');
+        let Some(major) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let minor = parts
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        // Skip names with trailing non-numeric segments (e.g. preview tags).
+        if parts.next().is_some() {
+            continue;
+        }
+        let key = (major, minor);
+        if best.as_ref().is_none_or(|(b, _)| key > *b) {
+            best = Some((key, m.name.clone()));
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
+fn with_1m_suffix(model_name: &str) -> String {
+    if crate::constants::get_context_length(model_name).is_some_and(|c| c >= 1_000_000) {
+        format!("{model_name}[1m]")
+    } else {
+        model_name.to_string()
+    }
+}
+
 impl CommandHandler {
     pub fn new(config: Config) -> Result<Self> {
         // Create a token manager for CLI operations
@@ -204,6 +315,11 @@ impl CommandHandler {
     /// - Required env vars (auth, base URL, telemetry, model defaults) — always written
     /// - Recommended settings (tool search, git attribution) — only written if absent
     ///
+    /// Model defaults are derived from the Claude models actually configured in
+    /// `~/.aicore/config.yaml`: for each sub-family (opus / sonnet / haiku) the
+    /// newest configured version becomes the corresponding `ANTHROPIC_*_MODEL`
+    /// env var. Aborts if no Claude models are configured.
+    ///
     /// Also configures .claude.json to skip onboarding.
     pub fn configure_claude_code(&self) -> Result<()> {
         let home = std::env::var("HOME").context("HOME environment variable not set")?;
@@ -227,8 +343,21 @@ impl CommandHandler {
 
         let base_url = format!("http://localhost:{}/v1", addr.port());
 
+        // Derive per-family Claude model env vars from the configured models.
+        let claude_models = ClaudeModelChoices::from_models(&self.config.models);
+        if claude_models.is_empty() {
+            anyhow::bail!(
+                "No Claude models configured under `models:` in your aicore config \
+                 (typically ~/.aicore/config.yaml). Add at least one entry whose \
+                 `name` starts with `claude-opus-`, `claude-sonnet-`, or \
+                 `claude-haiku-` (e.g., `claude-opus-4-8`, `claude-sonnet-4-6`, \
+                 `claude-haiku-4-5`), then re-run `acr configure claude`."
+            );
+        }
+
         // --- Configure settings.json ---
-        let settings_modified = Self::configure_settings_file(&settings_path, &base_url, api_key)?;
+        let settings_modified =
+            Self::configure_settings_file(&settings_path, &base_url, api_key, &claude_models)?;
 
         // --- Configure .claude.json (onboarding) ---
         let onboarding_modified = Self::configure_onboarding_file(&onboarding_path)?;
@@ -256,6 +385,7 @@ impl CommandHandler {
         settings_path: &PathBuf,
         base_url: &str,
         api_key: &str,
+        claude_models: &ClaudeModelChoices,
     ) -> Result<bool> {
         // Read existing settings or start fresh
         let mut settings: serde_json::Value = if settings_path.exists() {
@@ -293,31 +423,15 @@ impl CommandHandler {
             .context("env is not a JSON object")?;
 
         // Required env vars — always written
-        let required_env: Vec<(&str, String)> = vec![
+        let mut required_env: Vec<(&str, String)> = vec![
             ("ANTHROPIC_BASE_URL", base_url.to_string()),
             ("ANTHROPIC_AUTH_TOKEN", api_key.to_string()),
             ("DISABLE_TELEMETRY", "1".to_string()),
             ("DISABLE_ERROR_REPORTING", "1".to_string()),
             ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_string()),
             ("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1".to_string()),
-            ("ANTHROPIC_MODEL", "claude-opus-latest[1m]".to_string()),
-            (
-                "ANTHROPIC_DEFAULT_SONNET_MODEL",
-                "claude-sonnet-latest".to_string(),
-            ),
-            (
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-                "claude-haiku-latest".to_string(),
-            ),
-            (
-                "ANTHROPIC_DEFAULT_OPUS_MODEL",
-                "claude-opus-latest[1m]".to_string(),
-            ),
-            (
-                "ANTHROPIC_SMALL_FAST_MODEL",
-                "claude-haiku-latest".to_string(),
-            ),
         ];
+        required_env.extend(claude_models.env_vars());
 
         // Recommended env vars — only set if absent
         let recommended_env: Vec<(&str, String)> = vec![("ENABLE_TOOL_SEARCH", "true".to_string())];
@@ -1085,8 +1199,125 @@ impl CommandHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::CommandHandler;
+    use super::{ClaudeModelChoices, CommandHandler, pick_newest_in_family, with_1m_suffix};
+    use crate::config::Model;
     use tempfile::TempDir;
+
+    fn make_model(name: &str) -> Model {
+        Model {
+            name: name.to_string(),
+            aicore_model_name: None,
+            aliases: Vec::new(),
+            pricing: None,
+        }
+    }
+
+    fn opus_sonnet_haiku_choices() -> ClaudeModelChoices {
+        ClaudeModelChoices {
+            opus: Some("claude-opus-4-8".to_string()),
+            sonnet: Some("claude-sonnet-4-6".to_string()),
+            haiku: Some("claude-haiku-4-5".to_string()),
+        }
+    }
+
+    #[test]
+    fn pick_newest_in_family_picks_highest_minor() {
+        let models = vec![
+            make_model("claude-opus-4-6"),
+            make_model("claude-opus-4-8"),
+            make_model("claude-opus-4-7"),
+            make_model("claude-sonnet-4-6"),
+        ];
+        assert_eq!(
+            pick_newest_in_family(&models, "opus"),
+            Some("claude-opus-4-8".to_string())
+        );
+        assert_eq!(
+            pick_newest_in_family(&models, "sonnet"),
+            Some("claude-sonnet-4-6".to_string())
+        );
+        assert_eq!(pick_newest_in_family(&models, "haiku"), None);
+    }
+
+    #[test]
+    fn pick_newest_in_family_uses_numeric_not_lexicographic_ordering() {
+        // Lexicographically "4-10" < "4-2"; numerically "4-10" > "4-2".
+        let models = vec![
+            make_model("claude-opus-4-2"),
+            make_model("claude-opus-4-10"),
+        ];
+        assert_eq!(
+            pick_newest_in_family(&models, "opus"),
+            Some("claude-opus-4-10".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_newest_in_family_skips_unparseable_and_preview_suffixes() {
+        let models = vec![
+            make_model("claude-opus"),
+            make_model("claude-opus-4"),
+            make_model("claude-opus-4-8-preview"),
+            make_model("claude-opus-4-7"),
+        ];
+        assert_eq!(
+            pick_newest_in_family(&models, "opus"),
+            Some("claude-opus-4-7".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_model_choices_is_empty_when_no_models_match() {
+        let choices = ClaudeModelChoices::from_models(&[make_model("gpt-5.5")]);
+        assert!(choices.is_empty());
+    }
+
+    #[test]
+    fn claude_model_choices_env_vars_skips_missing_families() {
+        let choices = ClaudeModelChoices {
+            opus: Some("claude-opus-4-8".to_string()),
+            sonnet: None,
+            haiku: None,
+        };
+        let vars: Vec<(&str, String)> = choices.env_vars();
+        let keys: Vec<&str> = vars.iter().map(|(k, _)| *k).collect();
+        // Only the opus-derived env vars should be present.
+        assert!(keys.contains(&"ANTHROPIC_MODEL"));
+        assert!(keys.contains(&"ANTHROPIC_DEFAULT_OPUS_MODEL"));
+        assert!(keys.contains(&"ANTHROPIC_SMALL_FAST_MODEL"));
+        assert!(!keys.contains(&"ANTHROPIC_DEFAULT_SONNET_MODEL"));
+        assert!(!keys.contains(&"ANTHROPIC_DEFAULT_HAIKU_MODEL"));
+        // The primary and small-fast vars fall back to opus when no haiku/sonnet.
+        let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
+        assert_eq!(map["ANTHROPIC_MODEL"], "claude-opus-4-8[1m]");
+        assert_eq!(map["ANTHROPIC_SMALL_FAST_MODEL"], "claude-opus-4-8[1m]");
+    }
+
+    #[test]
+    fn claude_model_choices_env_vars_prefers_haiku_for_small_fast() {
+        let choices = opus_sonnet_haiku_choices();
+        let map: std::collections::HashMap<_, _> = choices.env_vars().into_iter().collect();
+        assert_eq!(map["ANTHROPIC_MODEL"], "claude-opus-4-8[1m]");
+        assert_eq!(map["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-4-8[1m]");
+        assert_eq!(map["ANTHROPIC_DEFAULT_SONNET_MODEL"], "claude-sonnet-4-6[1m]");
+        // haiku is 200k-native — no [1m] appended.
+        assert_eq!(map["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "claude-haiku-4-5");
+        // SMALL_FAST prefers haiku.
+        assert_eq!(map["ANTHROPIC_SMALL_FAST_MODEL"], "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn with_1m_suffix_appends_only_for_1m_models() {
+        assert_eq!(with_1m_suffix("claude-opus-4-8"), "claude-opus-4-8[1m]");
+        assert_eq!(with_1m_suffix("claude-sonnet-4-6"), "claude-sonnet-4-6[1m]");
+        // 200k-native — no suffix.
+        assert_eq!(with_1m_suffix("claude-haiku-4-5"), "claude-haiku-4-5");
+        // Unknown model — no suffix (catalog miss is treated as "don't know, don't add").
+        assert_eq!(
+            with_1m_suffix("claude-some-unknown-2099"),
+            "claude-some-unknown-2099"
+        );
+    }
 
     #[test]
     fn test_configure_settings_file_creates_all_required_fields() {
@@ -1094,10 +1325,12 @@ mod tests {
         let settings_path = dir.path().join(".claude").join("settings.json");
         std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
 
+        let choices = opus_sonnet_haiku_choices();
         let modified = CommandHandler::configure_settings_file(
             &settings_path,
             "http://localhost:8900/v1",
             "test-key",
+            &choices,
         )
         .unwrap();
 
@@ -1119,22 +1352,22 @@ mod tests {
             "1"
         );
         assert_eq!(parsed["env"]["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1");
-        assert_eq!(parsed["env"]["ANTHROPIC_MODEL"], "claude-opus-latest[1m]");
+        assert_eq!(parsed["env"]["ANTHROPIC_MODEL"], "claude-opus-4-8[1m]");
         assert_eq!(
             parsed["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
-            "claude-sonnet-latest"
+            "claude-sonnet-4-6[1m]"
         );
         assert_eq!(
             parsed["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
-            "claude-haiku-latest"
+            "claude-haiku-4-5"
         );
         assert_eq!(
             parsed["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
-            "claude-opus-latest[1m]"
+            "claude-opus-4-8[1m]"
         );
         assert_eq!(
             parsed["env"]["ANTHROPIC_SMALL_FAST_MODEL"],
-            "claude-haiku-latest"
+            "claude-haiku-4-5"
         );
 
         // Recommended env vars
@@ -1170,6 +1403,7 @@ mod tests {
             &settings_path,
             "http://localhost:8900/v1",
             "test-key",
+            &opus_sonnet_haiku_choices(),
         )
         .unwrap();
 
