@@ -155,7 +155,10 @@ static MODEL_CONTEXT_CAPS: &[(&str, ContextCaps)] = &[
     ("claude-opus-4-6", cap(1_000_000)),
     ("claude-sonnet-4-6", cap(1_000_000)),
     // 1M via context-1m-2025-08-07 beta (200k native, beta unlocks 1M):
-    ("claude-sonnet-4-5", cap_beta(1_000_000, api::CONTEXT_1M_BETA)),
+    (
+        "claude-sonnet-4-5",
+        cap_beta(1_000_000, api::CONTEXT_1M_BETA),
+    ),
     ("claude-sonnet-4", cap_beta(1_000_000, api::CONTEXT_1M_BETA)),
     // 200k models (no extended-context beta available):
     ("claude-opus-4-5", cap(200_000)),
