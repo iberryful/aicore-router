@@ -44,11 +44,11 @@ impl ClaudeModelChoices {
 
     /// Build the `ANTHROPIC_*` env-var pairs for Claude Code's `settings.json`.
     ///
-    /// Each `ANTHROPIC_DEFAULT_*_MODEL` is emitted only when a model exists for
-    /// that sub-family. `ANTHROPIC_MODEL` defaults to opus → sonnet → haiku in
-    /// availability order; `ANTHROPIC_SMALL_FAST_MODEL` prefers haiku → sonnet
-    /// → opus. Model names are written verbatim — appending the `[1m]` client
-    /// hint is left to the user, since acr itself strips the suffix server-side.
+    /// Each `ANTHROPIC_DEFAULT_*_MODEL` is emitted only when its sub-family is
+    /// configured; `ANTHROPIC_MODEL` falls back opus → sonnet → haiku. The
+    /// deprecated `ANTHROPIC_SMALL_FAST_MODEL` is intentionally not written (the
+    /// Haiku slot replaced it). Names are verbatim — the `[1m]` hint is the
+    /// client's to append, since acr strips it server-side.
     pub fn env_vars(&self) -> Vec<(&'static str, String)> {
         let mut out: Vec<(&'static str, String)> = Vec::new();
 
@@ -64,11 +64,26 @@ impl ClaudeModelChoices {
         if let Some(name) = &self.haiku {
             out.push(("ANTHROPIC_DEFAULT_HAIKU_MODEL", name.clone()));
         }
-        if let Some(name) = self.small_fast_model() {
-            out.push(("ANTHROPIC_SMALL_FAST_MODEL", name.to_string()));
-        }
 
         out
+    }
+
+    /// Model keys `configure claude` may own in `settings.json`: the set
+    /// `env_vars()` can emit, plus deprecated keys to prune on re-run. Derived
+    /// from `env_vars()` so the live set can't drift.
+    fn manageable_model_keys() -> Vec<&'static str> {
+        let mut keys: Vec<&'static str> = Self {
+            opus: Some(String::new()),
+            sonnet: Some(String::new()),
+            haiku: Some(String::new()),
+        }
+        .env_vars()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+        // Deprecated; replaced by ANTHROPIC_DEFAULT_HAIKU_MODEL — prune on re-run.
+        keys.push("ANTHROPIC_SMALL_FAST_MODEL");
+        keys
     }
 
     fn primary_model(&self) -> Option<&str> {
@@ -76,13 +91,6 @@ impl ClaudeModelChoices {
             .as_deref()
             .or(self.sonnet.as_deref())
             .or(self.haiku.as_deref())
-    }
-
-    fn small_fast_model(&self) -> Option<&str> {
-        self.haiku
-            .as_deref()
-            .or(self.sonnet.as_deref())
-            .or(self.opus.as_deref())
     }
 }
 
@@ -427,6 +435,18 @@ impl CommandHandler {
         let recommended_env: Vec<(&str, String)> = vec![("ENABLE_TOOL_SEARCH", "true".to_string())];
 
         let mut modified = false;
+
+        // Prune managed model keys we aren't writing this run (the insert loop
+        // below only adds/updates). Drops stale `ANTHROPIC_DEFAULT_*_MODEL` for
+        // removed families and the deprecated `ANTHROPIC_SMALL_FAST_MODEL`.
+        let written_keys: std::collections::HashSet<&str> =
+            required_env.iter().map(|(k, _)| *k).collect();
+        for key in ClaudeModelChoices::manageable_model_keys() {
+            if !written_keys.contains(key) && env_obj.remove(key).is_some() {
+                println!("  Removed {key}");
+                modified = true;
+            }
+        }
 
         for (key, value) in &required_env {
             let old_value = env_obj.get(*key).and_then(|v| v.as_str()).map(String::from);
@@ -1292,25 +1312,24 @@ mod tests {
         // Only the opus-derived env vars should be present.
         assert!(keys.contains(&"ANTHROPIC_MODEL"));
         assert!(keys.contains(&"ANTHROPIC_DEFAULT_OPUS_MODEL"));
-        assert!(keys.contains(&"ANTHROPIC_SMALL_FAST_MODEL"));
         assert!(!keys.contains(&"ANTHROPIC_DEFAULT_SONNET_MODEL"));
         assert!(!keys.contains(&"ANTHROPIC_DEFAULT_HAIKU_MODEL"));
-        // The primary and small-fast vars fall back to opus when no haiku/sonnet.
+        // Deprecated small-fast var never written; no haiku → slot unset.
+        assert!(!keys.contains(&"ANTHROPIC_SMALL_FAST_MODEL"));
         let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
         assert_eq!(map["ANTHROPIC_MODEL"], "claude-opus-4-8");
-        assert_eq!(map["ANTHROPIC_SMALL_FAST_MODEL"], "claude-opus-4-8");
     }
 
     #[test]
-    fn claude_model_choices_env_vars_prefers_haiku_for_small_fast() {
+    fn claude_model_choices_env_vars_omits_deprecated_small_fast() {
         let choices = opus_sonnet_haiku_choices();
         let map: std::collections::HashMap<_, _> = choices.env_vars().into_iter().collect();
         assert_eq!(map["ANTHROPIC_MODEL"], "claude-opus-4-8");
         assert_eq!(map["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-4-8");
         assert_eq!(map["ANTHROPIC_DEFAULT_SONNET_MODEL"], "claude-sonnet-4-6");
+        // Deprecated small-fast var no longer emitted.
         assert_eq!(map["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "claude-haiku-4-5");
-        // SMALL_FAST prefers haiku.
-        assert_eq!(map["ANTHROPIC_SMALL_FAST_MODEL"], "claude-haiku-4-5");
+        assert!(!map.contains_key("ANTHROPIC_SMALL_FAST_MODEL"));
     }
 
     #[test]
@@ -1359,9 +1378,12 @@ mod tests {
             parsed["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
             "claude-opus-4-8"
         );
-        assert_eq!(
-            parsed["env"]["ANTHROPIC_SMALL_FAST_MODEL"],
-            "claude-haiku-4-5"
+        // The deprecated small-fast var is not written.
+        assert!(
+            !parsed["env"]
+                .as_object()
+                .unwrap()
+                .contains_key("ANTHROPIC_SMALL_FAST_MODEL")
         );
 
         // Recommended env vars
@@ -1417,6 +1439,54 @@ mod tests {
             parsed["env"]["ANTHROPIC_BASE_URL"],
             "http://localhost:8900/v1"
         );
+    }
+
+    #[test]
+    fn test_configure_settings_prunes_stale_model_keys() {
+        let dir = TempDir::new().unwrap();
+        let settings_path = dir.path().join(".claude").join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+
+        // Prior run wrote opus + haiku + deprecated small-fast; haiku since removed.
+        let existing = serde_json::json!({
+            "env": {
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-7",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5",
+                "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-4-5",
+            }
+        });
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        // Now only opus is configured.
+        let choices = ClaudeModelChoices {
+            opus: Some("claude-opus-4-8".to_string()),
+            sonnet: None,
+            haiku: None,
+        };
+        CommandHandler::configure_settings_file(
+            &settings_path,
+            "http://localhost:8900/v1",
+            "test-key",
+            &choices,
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&settings_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let env = parsed["env"].as_object().unwrap();
+
+        // Stale haiku pruned; opus updated.
+        assert!(!env.contains_key("ANTHROPIC_DEFAULT_HAIKU_MODEL"));
+        assert_eq!(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-4-8");
+        // No sonnet configured → never written.
+        assert!(!env.contains_key("ANTHROPIC_DEFAULT_SONNET_MODEL"));
+        // Deprecated small-fast var migrated out on re-run.
+        assert!(!env.contains_key("ANTHROPIC_SMALL_FAST_MODEL"));
+        assert_eq!(env["ANTHROPIC_MODEL"], "claude-opus-4-8");
     }
 
     #[test]
