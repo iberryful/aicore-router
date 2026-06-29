@@ -17,7 +17,7 @@ use crate::constants::api::{
     ANTHROPIC_BETA_HEADER, ANTHROPIC_DEFAULT_MAX_TOKENS, ANTHROPIC_TO_BEDROCK_BETA_REMAP,
     ANTHROPIC_VERSION, BUDGET_RESERVE_MARGIN, MIN_BUDGET_TOKENS_FOR_THINKING,
 };
-use crate::constants::models::CLAUDE_OPUS_4_7;
+use crate::constants::models::{CLAUDE_OPUS_4_7, CLAUDE_OPUS_4_8};
 
 /// Prepare a Claude request body for Bedrock.
 ///
@@ -28,7 +28,7 @@ use crate::constants::models::CLAUDE_OPUS_4_7;
 /// 4. Inject `ttl: "1h"` into ephemeral cache_control blocks (extends Bedrock's prompt
 ///    cache from 5min default to 1h — net win for acr's interactive workload).
 /// 5. Clamp / disable `thinking` to satisfy Bedrock's budget constraints.
-/// 6. Apply Opus 4.7-specific shape overrides last so they see the post-clamp `thinking`.
+/// 6. Apply adaptive-thinking model overrides last so they see the post-clamp `thinking`.
 pub fn prepare(body: &mut Value, model: &str) -> Result<()> {
     validate_messages(body)?;
 
@@ -52,8 +52,8 @@ pub fn prepare(body: &mut Value, model: &str) -> Result<()> {
     inject_cache_ttl(obj);
     clamp_thinking(obj);
 
-    if is_opus_4_7(model) {
-        apply_opus_4_7_overrides(obj);
+    if requires_adaptive_thinking(model) {
+        apply_adaptive_thinking_overrides(obj);
     }
 
     Ok(())
@@ -264,29 +264,32 @@ fn clamp_thinking(obj: &mut Map<String, Value>) {
     }
 }
 
-/// Reports whether the resolved client-facing model name is Claude Opus 4.7.
-/// Receives the normalized name (e.g. `claude-opus-4-7`), not the AI Core internal name.
+/// Reports whether the resolved client-facing model requires acr's
+/// adaptive-thinking transform. Receives the normalized name (e.g.
+/// `claude-opus-4-7`), not the AI Core internal name.
 ///
-/// **TODO**: revisit gate when Opus 4.8+ ships. Bedrock deprecates
-/// `temperature` / `top_p` / `top_k` at the model level for 4.7 (verified via
-/// empirical probe against AI Core); future versions will likely keep the same
-/// constraint and will silently bypass the strip in `apply_opus_4_7_overrides`
-/// if not added here. hai-proxy and LiteLLM both have the same exact-match
-/// shape and will need the same update.
-fn is_opus_4_7(model: &str) -> bool {
-    model == CLAUDE_OPUS_4_7
+/// Both Opus 4.7 and Opus 4.8 reject `thinking.type.enabled` upstream and
+/// require `thinking.type.adaptive`, and both deprecate `temperature` /
+/// `top_p` / `top_k` at the model level (verified via empirical probe against
+/// AI Core gpt-5.5-style 400 responses). Cross-checked against litellm's
+/// `anthropic/common_utils.py::_supports_sampling_params`, which groups
+/// Opus 4.7, Opus 4.8, and Fable 5 together for the same reason. hai-proxy
+/// and LiteLLM track the same set; add new entries here when they ship.
+fn requires_adaptive_thinking(model: &str) -> bool {
+    matches!(model, CLAUDE_OPUS_4_7 | CLAUDE_OPUS_4_8)
 }
 
-/// Apply Opus 4.7-specific request body overrides:
+/// Apply adaptive-thinking-model request body overrides:
 ///
-/// * Strip `temperature`, `top_p`, `top_k`. Opus 4.7 controls its own sampling under
-///   adaptive thinking; clients that send these otherwise hit upstream rejection.
+/// * Strip `temperature`, `top_p`, `top_k`. These models control their own
+///   sampling under adaptive thinking; clients that send these otherwise hit
+///   upstream rejection.
 /// * Convert `thinking: {type: "enabled", budget_tokens: N}` to `thinking: {type: "adaptive"}`.
 ///   Adaptive, disabled, or missing thinking is left unchanged.
 ///
 /// Idempotent. Must run **after** `clamp_thinking` so any thinking-disabling caused by
 /// insufficient `max_tokens` has already taken effect.
-fn apply_opus_4_7_overrides(obj: &mut Map<String, Value>) {
+fn apply_adaptive_thinking_overrides(obj: &mut Map<String, Value>) {
     obj.remove("temperature");
     obj.remove("top_p");
     obj.remove("top_k");
@@ -304,19 +307,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_opus_4_7_predicate() {
-        assert!(is_opus_4_7("claude-opus-4-7"));
-        assert!(!is_opus_4_7("claude-opus-4-6"));
-        assert!(!is_opus_4_7("claude-sonnet-4-6"));
+    fn requires_adaptive_thinking_predicate() {
+        assert!(requires_adaptive_thinking("claude-opus-4-7"));
+        assert!(requires_adaptive_thinking("claude-opus-4-8"));
+        assert!(!requires_adaptive_thinking("claude-opus-4-6"));
+        assert!(!requires_adaptive_thinking("claude-sonnet-4-6"));
         assert!(
-            !is_opus_4_7("anthropic--claude-4.7-opus"),
+            !requires_adaptive_thinking("anthropic--claude-4.7-opus"),
             "predicate keys on resolved client name, not internal"
         );
-        assert!(!is_opus_4_7(""));
+        assert!(
+            !requires_adaptive_thinking("anthropic--claude-4.8-opus"),
+            "predicate keys on resolved client name, not internal"
+        );
+        assert!(!requires_adaptive_thinking(""));
     }
 
     #[test]
-    fn opus_4_7_overrides_strip_sampling_params() {
+    fn adaptive_thinking_overrides_strip_sampling_params() {
         let mut body = json!({
             "max_tokens": 2048,
             "temperature": 0.7,
@@ -325,7 +333,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
         });
         let obj = body.as_object_mut().unwrap();
-        apply_opus_4_7_overrides(obj);
+        apply_adaptive_thinking_overrides(obj);
 
         assert!(!obj.contains_key("temperature"));
         assert!(!obj.contains_key("top_p"));
@@ -335,12 +343,12 @@ mod tests {
     }
 
     #[test]
-    fn opus_4_7_overrides_convert_enabled_thinking_to_adaptive() {
+    fn adaptive_thinking_overrides_convert_enabled_thinking_to_adaptive() {
         let mut body = json!({
             "thinking": {"type": "enabled", "budget_tokens": 5000},
         });
         let obj = body.as_object_mut().unwrap();
-        apply_opus_4_7_overrides(obj);
+        apply_adaptive_thinking_overrides(obj);
 
         let thinking = obj["thinking"].as_object().unwrap();
         assert_eq!(thinking["type"], json!("adaptive"));
@@ -348,33 +356,33 @@ mod tests {
     }
 
     #[test]
-    fn opus_4_7_overrides_leave_adaptive_thinking_unchanged() {
+    fn adaptive_thinking_overrides_leave_adaptive_thinking_unchanged() {
         let mut body = json!({"thinking": {"type": "adaptive"}});
         let obj = body.as_object_mut().unwrap();
-        apply_opus_4_7_overrides(obj);
+        apply_adaptive_thinking_overrides(obj);
 
         assert_eq!(obj["thinking"], json!({"type": "adaptive"}));
     }
 
     #[test]
-    fn opus_4_7_overrides_handle_missing_thinking() {
+    fn adaptive_thinking_overrides_handle_missing_thinking() {
         let mut body = json!({"max_tokens": 2048});
         let obj = body.as_object_mut().unwrap();
-        apply_opus_4_7_overrides(obj);
+        apply_adaptive_thinking_overrides(obj);
 
         assert!(!obj.contains_key("thinking"));
     }
 
     #[test]
-    fn opus_4_7_overrides_idempotent() {
+    fn adaptive_thinking_overrides_idempotent() {
         let mut body = json!({
             "temperature": 0.7,
             "thinking": {"type": "enabled", "budget_tokens": 5000},
         });
         let obj = body.as_object_mut().unwrap();
-        apply_opus_4_7_overrides(obj);
+        apply_adaptive_thinking_overrides(obj);
         let after_first = obj.clone();
-        apply_opus_4_7_overrides(obj);
+        apply_adaptive_thinking_overrides(obj);
         assert_eq!(*obj, after_first);
     }
 
@@ -389,6 +397,27 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
         });
         prepare(&mut body, "claude-opus-4-7").unwrap();
+
+        let obj = body.as_object().unwrap();
+        assert!(!obj.contains_key("temperature"));
+        assert!(!obj.contains_key("top_p"));
+        assert!(!obj.contains_key("top_k"));
+        let thinking = obj["thinking"].as_object().unwrap();
+        assert_eq!(thinking["type"], json!("adaptive"));
+        assert!(!thinking.contains_key("budget_tokens"));
+    }
+
+    #[test]
+    fn prepare_opus_4_8_full_overrides() {
+        let mut body = json!({
+            "max_tokens": 4096,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "top_k": 40,
+            "thinking": {"type": "enabled", "budget_tokens": 2000},
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        prepare(&mut body, "claude-opus-4-8").unwrap();
 
         let obj = body.as_object().unwrap();
         assert!(!obj.contains_key("temperature"));

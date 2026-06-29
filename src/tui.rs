@@ -262,13 +262,24 @@ impl TuiApp {
 
         let result = self.run_loop(&mut terminal);
 
-        // Always restore terminal state, even if the loop errored
-        let _ = disable_raw_mode();
+        // Restore terminal state, even if the loop errored.
+        //
+        // Order matters: `DisableMouseCapture` and `LeaveAlternateScreen` must
+        // be sent while raw mode is still on, so the escape sequences are
+        // processed as escapes by the terminal rather than echoed as input.
+        // After that, drain any in-flight events the terminal queued during
+        // shutdown (motion events from mode 1003 are the usual culprit — they
+        // arrive as `65;<col>;<row>M` strings if not consumed before
+        // `disable_raw_mode` flushes the input buffer back to the shell).
         let _ = execute!(
             terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
+            DisableMouseCapture,
+            LeaveAlternateScreen
         );
+        while event::poll(Duration::ZERO).unwrap_or(false) {
+            let _ = event::read();
+        }
+        let _ = disable_raw_mode();
         let _ = terminal.show_cursor();
 
         result

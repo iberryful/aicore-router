@@ -50,8 +50,8 @@ The OpenAI family covers `gpt-*`, `text-embedding-*`, and the `o`-series reasoni
 
 acr's wire format is the public LLM API shape; the AI Core endpoint behind it has its own quirks. acr smooths these over so clients don't have to:
 
-- **Anthropic via Bedrock InvokeModel.** acr stamps `anthropic_version: bedrock-2023-05-31` and routes to `/invoke`, not the AI Core Converse endpoint (which is also exposed but lags native features). Strips the `cache_control.scope` field that Claude Code 2.1.88+ sends but Bedrock rejects — including on `tools[]` definitions, system blocks, and message content. Always injects `ttl: "1h"` into ephemeral `cache_control` blocks (1h cache vs the 5-min default — major win for IDE/agent sessions). Validates and clamps the `thinking.budget_tokens` against `max_tokens`. For `claude-opus-4-7` strips `temperature` / `top_p` / `top_k` and converts `thinking: enabled` → `thinking: adaptive` (4.7 deprecates explicit sampling at the model level, even outside thinking mode). Translates the `Anthropic-Beta` header through a remap table — known names (e.g., `advanced-tool-use-2025-11-20` → `tool-search-tool-2025-10-19`) are rewritten; unknown names pass through unchanged so Bedrock decides.
-- **Auto max-context.** Each Claude request automatically gets the maximum context window the resolved model is capable of: native 1M models (Sonnet 4.6, Opus 4.6/4.7) need no header; Sonnet 4 / 4.5 get the `context-1m-2025-08-07` beta auto-injected; Haiku and older Opus 4 stay at 200k. The `[1m]` suffix on a model name (e.g. `claude-sonnet-4-5[1m]`) is silently accepted for backward compatibility but no longer functionally required.
+- **Anthropic via Bedrock InvokeModel.** acr stamps `anthropic_version: bedrock-2023-05-31` and routes to `/invoke`, not the AI Core Converse endpoint (which is also exposed but lags native features). Strips the `cache_control.scope` field that Claude Code 2.1.88+ sends but Bedrock rejects — including on `tools[]` definitions, system blocks, and message content. Always injects `ttl: "1h"` into ephemeral `cache_control` blocks (1h cache vs the 5-min default — major win for IDE/agent sessions). Validates and clamps the `thinking.budget_tokens` against `max_tokens`. For `claude-opus-4-7` and `claude-opus-4-8` strips `temperature` / `top_p` / `top_k` and converts `thinking: enabled` → `thinking: adaptive` (these models deprecate explicit sampling at the model level, even outside thinking mode). Translates the `Anthropic-Beta` header through a remap table — known names (e.g., `advanced-tool-use-2025-11-20` → `tool-search-tool-2025-10-19`) are rewritten; unknown names pass through unchanged so Bedrock decides.
+- **Auto max-context.** Each Claude request automatically gets the maximum context window the resolved model is capable of: native 1M models (Sonnet 4.6, Opus 4.6/4.7/4.8) need no header; Sonnet 4 / 4.5 get the `context-1m-2025-08-07` beta auto-injected; Haiku and older Opus 4 stay at 200k. The `[1m]` suffix on a model name (e.g. `claude-opus-4-8[1m]`) is silently accepted by acr for backward compatibility — it's a no-op on the server side. **Note**: clients (e.g., Claude Code) may still parse `[1m]` themselves to drive UI context-window display and client-side history budgeting, so keep it in client env vars even though acr doesn't require it.
 - **OpenAI via Azure (Chat Completions).** Renames legacy `max_tokens` → `max_completion_tokens` (canonical since GPT-4o 2024-08-06+, required for o-series and GPT-5). For streaming requests, sets `stream_options.include_usage = true` so the final SSE chunk carries token counts. Normalizes a Codex-CLI bug where a preamble assistant message is inserted between `assistant(tool_calls)` and `tool(response)`. None of these apply to the Responses API path below.
 - **OpenAI Responses API (Codex CLI v0.130+).** `POST /v1/responses` is near-passthrough: acr filters `tools[]` to AI Core's accepted set (`type: function` only — last verified against gpt-5.5 on 2026-05-26; the upstream rejects `custom`, `web_search`, `tool_search`, `local_shell`, `image_generation`, `mcp`, `code_interpreter`, `file_search`, etc., and Codex CLI offers no flag to suppress them) and resets `tool_choice` to `"auto"` if it referenced a dropped tool. Everything else is forwarded unmodified. Token usage is read from the Responses-specific `usage.input_tokens` / `usage.output_tokens` / `usage.input_tokens_details.cached_tokens` shape (different field names from Chat Completions). Streaming events flow through unmodified once the stream is committed (see the mid-stream rate-limit bullet below for the peek step that runs before commit); usage is recorded from any terminal frame — `response.completed`, `response.incomplete` (e.g., `max_output_tokens` reached), or `response.failed` (upstream error) — so partial-stream token counts still hit the quota and DB log. The sibling `POST /v1/responses/compact` is also passthrough; Codex's auto-compact-remote feature works through it (always unary, no streaming).
 - **Gemini via Vertex.** Strips `id` from `functionResponse` parts (AI Core wrapper rejects it). Rewrites `thinkingConfig.thinkingBudget: 0` → `-1` so "let the model decide" doesn't get read as "thinking disabled" (a deliberate convenience over strict transparency, matching common SDK convention).
@@ -347,7 +347,7 @@ acr logs clean --days 7
 
 Auto-configure coding tools to use this router:
 ```bash
-acr configure claude-code
+acr configure claude
 acr configure opencode
 ```
 
@@ -535,11 +535,11 @@ acr automatically enables the maximum context window the resolved Claude model i
 
 | Model family | Max context | How |
 |---|---|---|
-| Sonnet 4.6, Opus 4.6, Opus 4.7 | 1M tokens | Native — no header needed |
+| Sonnet 4.6, Opus 4.6, Opus 4.7, Opus 4.8 | 1M tokens | Native — no header needed |
 | Sonnet 4, Sonnet 4.5 | 1M tokens | acr auto-injects `Anthropic-Beta: context-1m-2025-08-07` |
 | Opus 4 / 4.1 / 4.5, Haiku 4.x, Claude 3 Haiku | 200k tokens | No 1M-context beta available |
 
-The `[1m]` suffix on a model name (e.g. `claude-sonnet-4-5[1m]`) is silently accepted for backward compatibility but no longer functionally required — capability-driven injection makes it a no-op.
+The `[1m]` suffix on a model name (e.g. `claude-opus-4-8[1m]`) is silently accepted by acr for backward compatibility — it's a no-op on the server side. Clients (e.g., Claude Code) may still parse `[1m]` for UI context-window display and client-side history budgeting, so keep it in client env vars even though acr doesn't require it.
 
 ### Fallback Models
 
