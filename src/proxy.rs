@@ -447,7 +447,13 @@ impl ProxyRequest {
     ) -> Result<(Response, TokenStats)> {
         let content_type = extract_content_type(&response);
 
-        let body = response.bytes().await?;
+        let mut body = response.bytes().await?;
+        if matches!(self.family, LlmFamily::OpenAiResponses)
+            && let Some(rewritten) =
+                crate::transforms::openai_responses::rewrite_response_body(&body)
+        {
+            body = axum::body::Bytes::from(rewritten);
+        }
 
         // Extract token stats from non-streaming response
         let token_stats = match std::str::from_utf8(&body) {
@@ -517,6 +523,8 @@ impl ProxyRequest {
             // and the same line-extraction logic below picks them up first.
             let mut byte_buf: Vec<u8> = prebuffered;
             let mut token_stats = TokenStats::default();
+            let mut responses_tool_search_bridge =
+                crate::transforms::openai_responses::ToolSearchStreamBridge::default();
             let mut client_gone = false;
             let mut stream_error = false;
 
@@ -541,7 +549,15 @@ impl ProxyRequest {
                     if let Some(data) = line.strip_prefix(STREAM_DATA_PREFIX)
                         && !data.is_empty()
                     {
-                        let bytes = format_sse_event(data, &family, is_claude, &mut token_stats);
+                        let Some(bytes) = format_sse_event(
+                            data,
+                            &family,
+                            is_claude,
+                            &mut token_stats,
+                            &mut responses_tool_search_bridge,
+                        ) else {
+                            continue;
+                        };
                         if tx.send(Ok(bytes)).await.is_err() {
                             tracing::debug!("Client disconnected during streaming");
                             client_gone = true;
@@ -580,8 +596,14 @@ impl ProxyRequest {
                 let line = remaining.trim();
                 if let Some(data) = line.strip_prefix(STREAM_DATA_PREFIX)
                     && !data.is_empty()
+                    && let Some(bytes) = format_sse_event(
+                        data,
+                        &family,
+                        is_claude,
+                        &mut token_stats,
+                        &mut responses_tool_search_bridge,
+                    )
                 {
-                    let bytes = format_sse_event(data, &family, is_claude, &mut token_stats);
                     let _ = tx.send(Ok(bytes)).await;
                 }
             }
@@ -962,20 +984,27 @@ fn format_sse_event(
     family: &LlmFamily,
     is_claude: bool,
     token_stats: &mut TokenStats,
-) -> axum::body::Bytes {
+    responses_tool_search_bridge: &mut crate::transforms::openai_responses::ToolSearchStreamBridge,
+) -> Option<axum::body::Bytes> {
     if let Some(stats) = extract_token_stats(data, family) {
         *token_stats = stats;
     }
 
+    let data = if matches!(family, LlmFamily::OpenAiResponses) {
+        responses_tool_search_bridge.rewrite_sse_data(data)?
+    } else {
+        data.to_string()
+    };
+
     let mut output = String::new();
     if is_claude
-        && let Ok(parsed) = serde_json::from_str::<Value>(data)
+        && let Ok(parsed) = serde_json::from_str::<Value>(&data)
         && let Some(event_type) = parsed.get("type").and_then(|v| v.as_str())
     {
         output.push_str(&format!("event: {event_type}\n"));
     }
     output.push_str(&format!("{STREAM_DATA_PREFIX}{data}\n\n"));
-    axum::body::Bytes::from(output)
+    Some(axum::body::Bytes::from(output))
 }
 
 /// Extract token usage from a single SSE `data:` payload. Public so e2e tests
