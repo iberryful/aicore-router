@@ -524,7 +524,7 @@ impl ProxyRequest {
             let mut byte_buf: Vec<u8> = prebuffered;
             let mut token_stats = TokenStats::default();
             let mut responses_tool_search_bridge =
-                crate::transforms::openai_responses::ToolSearchStreamBridge::default();
+                crate::transforms::openai_responses::ClientToolStreamBridge::default();
             let mut client_gone = false;
             let mut stream_error = false;
 
@@ -984,7 +984,7 @@ fn format_sse_event(
     family: &LlmFamily,
     is_claude: bool,
     token_stats: &mut TokenStats,
-    responses_tool_search_bridge: &mut crate::transforms::openai_responses::ToolSearchStreamBridge,
+    responses_tool_search_bridge: &mut crate::transforms::openai_responses::ClientToolStreamBridge,
 ) -> Option<axum::body::Bytes> {
     if let Some(stats) = extract_token_stats(data, family) {
         *token_stats = stats;
