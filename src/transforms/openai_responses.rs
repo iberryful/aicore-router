@@ -364,6 +364,15 @@ fn reconstruct_apply_patch_call(obj: &mut Map<String, Value>) {
     );
     obj.insert("input".to_string(), Value::String(input));
     obj.remove("arguments");
+    // A custom_tool_call id must begin with `ctc` (upstream returns an `fc_`
+    // function-call id). Without this, AI Core 400s when Codex echoes the item
+    // back in `input[]` on the next turn: "Expected an ID that begins with
+    // 'ctc'". Mirrors the `tsc_` prefix for tool_search_call.
+    if let Some(id) = obj.get("id").and_then(|v| v.as_str())
+        && !id.starts_with("ctc_")
+    {
+        obj.insert("id".to_string(), Value::String(format!("ctc_{id}")));
+    }
 }
 
 #[cfg(test)]
@@ -649,6 +658,9 @@ mod tests {
         assert_eq!(item["type"], json!("custom_tool_call"));
         assert_eq!(item["name"], json!("apply_patch"));
         assert_eq!(item["call_id"], json!("call_ap"));
+        // A custom_tool_call id must begin with `ctc` (AI Core rejects the
+        // upstream `fc_` id when Codex echoes the item back in `input[]`).
+        assert!(item["id"].as_str().unwrap().starts_with("ctc_"));
         assert!(
             item["input"]
                 .as_str()
@@ -676,6 +688,7 @@ mod tests {
         let value: Value = serde_json::from_str(&rewritten).unwrap();
         assert_eq!(value["item"]["type"], json!("custom_tool_call"));
         assert_eq!(value["item"]["name"], json!("apply_patch"));
+        assert!(value["item"]["id"].as_str().unwrap().starts_with("ctc_"));
 
         let delta = json!({
             "type": "response.function_call_arguments.delta",
