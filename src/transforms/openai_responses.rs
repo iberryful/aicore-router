@@ -52,6 +52,7 @@ pub fn prepare(body: &mut Value) -> Result<()> {
     };
 
     bridge_client_tools_request(obj);
+    normalize_input_item_ids(obj);
     let kept_function_names = filter_tools(obj);
     fixup_tool_choice(obj, &kept_function_names);
 
@@ -302,6 +303,46 @@ pub fn rewrite_response_body(body: &[u8]) -> Option<Vec<u8>> {
         changed |= rewrite_bridged_item(item);
     }
     changed.then(|| serde_json::to_vec(&value).ok()).flatten()
+}
+
+/// The id prefix AI Core requires for a bridged tool-call item when Codex
+/// replays it in `input[]`. Mirrors the prefixes the response path stamps.
+fn required_id_prefix(item_type: &str) -> Option<&'static str> {
+    match item_type {
+        "custom_tool_call" => Some("ctc_"),
+        "tool_search_call" => Some("tsc_"),
+        _ => None,
+    }
+}
+
+/// Re-prefix bridged tool-call ids in the request `input[]`.
+///
+/// Codex replays prior tool-call items in `input[]` on every turn. Items acr's
+/// response path produced today already carry the right prefix, but items from
+/// history created by an older acr (or before the prefix fix) still carry the
+/// raw upstream `fc_` id, and AI Core 400s: "Expected an ID that begins with
+/// 'ctc'". Normalizing here fixes replayed history at the point of validation.
+fn normalize_input_item_ids(obj: &mut Map<String, Value>) {
+    let Some(Value::Array(input)) = obj.get_mut("input") else {
+        return;
+    };
+    for item in input.iter_mut() {
+        let Some(item_obj) = item.as_object_mut() else {
+            continue;
+        };
+        let Some(prefix) = item_obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .and_then(required_id_prefix)
+        else {
+            continue;
+        };
+        if let Some(id) = item_obj.get("id").and_then(|v| v.as_str())
+            && !id.starts_with(prefix)
+        {
+            item_obj.insert("id".to_string(), Value::String(format!("{prefix}{id}")));
+        }
+    }
 }
 
 fn rewrite_bridged_item(item: &mut Value) -> bool {
@@ -696,5 +737,29 @@ mod tests {
             "delta": "{\"input\":"
         });
         assert!(bridge.rewrite_sse_data(&delta.to_string()).is_none());
+    }
+
+    #[test]
+    fn normalizes_replayed_bridged_tool_call_ids_in_input() {
+        // Codex replays prior tool-call items in `input[]`. Items created by an
+        // older acr carry raw upstream `fc_` ids, which AI Core rejects
+        // ("Expected an ID that begins with 'ctc'"). prepare() must re-prefix.
+        let mut body = json!({
+            "model": "gpt-5.5",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "custom_tool_call", "id": "fc_abc", "call_id": "c1", "name": "apply_patch", "input": "*** Begin Patch\n*** End Patch"},
+                {"type": "custom_tool_call_output", "call_id": "c1", "output": "ok"},
+                {"type": "tool_search_call", "id": "fc_def", "call_id": "c2", "arguments": {}},
+                {"type": "custom_tool_call", "id": "ctc_already", "call_id": "c3", "name": "apply_patch", "input": "x"}
+            ]
+        });
+        prepare(&mut body).unwrap();
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items[1]["id"], json!("ctc_fc_abc")); // custom_tool_call re-prefixed
+        assert_eq!(items[3]["id"], json!("tsc_fc_def")); // tool_search_call re-prefixed
+        assert_eq!(items[4]["id"], json!("ctc_already")); // already-prefixed untouched
+        // Non tool-call items untouched.
+        assert_eq!(items[0]["role"], json!("user"));
     }
 }
