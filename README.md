@@ -166,6 +166,8 @@ models:
 
 ### API Endpoints
 
+Request bodies are accepted up to 100 MiB so large model contexts and Codex tool results can be proxied without hitting the router's previous 10 MiB ceiling.
+
 #### OpenAI Compatible API
 ```bash
 # Chat completions
