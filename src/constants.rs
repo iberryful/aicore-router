@@ -223,6 +223,7 @@ pub mod config {
     pub const DEFAULT_LOG_LEVEL: &str = "info";
     pub const DEFAULT_RESOURCE_GROUP: &str = "default";
     pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 300; // 5 minutes
+    pub const MAX_REQUEST_BODY_SIZE_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 }
 
 #[cfg(test)]

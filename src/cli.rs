@@ -10,6 +10,7 @@ use crate::{
     balancer::LoadBalancer,
     commands::CommandHandler,
     config::Config,
+    constants::config::MAX_REQUEST_BODY_SIZE_BYTES,
     metrics::MetricsService,
     rate_limit::AuthRateLimiter,
     registry::ModelRegistry,
@@ -442,8 +443,7 @@ impl Cli {
             request_limiter,
         };
 
-        let app = create_router(state)
-            .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
+        let app = apply_request_body_limit(create_router(state))
             .layer(CorsLayer::permissive())
             .layer(TraceLayer::new_for_http());
 
@@ -532,5 +532,54 @@ impl Cli {
             _ = ctrl_c => { tracing::info!("Received Ctrl+C, shutting down..."); }
             _ = terminate => { tracing::info!("Received SIGTERM, shutting down..."); }
         }
+    }
+}
+
+fn apply_request_body_limit(app: axum::Router) -> axum::Router {
+    app.layer(axum::extract::DefaultBodyLimit::max(
+        MAX_REQUEST_BODY_SIZE_BYTES,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{Json, Router, http::StatusCode, routing::post};
+    use serde_json::Value;
+
+    use super::*;
+
+    const LEGACY_REQUEST_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
+
+    async fn consume_json(Json(_): Json<Value>) -> StatusCode {
+        StatusCode::NO_CONTENT
+    }
+
+    #[tokio::test]
+    async fn request_body_limit_accepts_payload_larger_than_legacy_cap() {
+        let app = apply_request_body_limit(Router::new().route("/", post(consume_json)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+
+        let body = format!(
+            r#"{{"input":"{}"}}"#,
+            "x".repeat(LEGACY_REQUEST_BODY_LIMIT_BYTES)
+        );
+        assert!(body.len() > LEGACY_REQUEST_BODY_LIMIT_BYTES);
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .expect("send oversized request");
+
+        server.abort();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 }
