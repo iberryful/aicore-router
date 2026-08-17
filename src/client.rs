@@ -115,15 +115,28 @@ impl AiCoreClient {
             .ok_or_else(|| anyhow::anyhow!("Failed to get authentication token"))
     }
 
+    fn with_provider_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.provider.is_joule() {
+            request.header(
+                crate::joule::CLIENT_VERSION_HEADER,
+                crate::joule::CLIENT_VERSION,
+            )
+        } else {
+            request
+        }
+    }
+
     pub async fn list_resource_groups(&self) -> Result<ResourceGroupList> {
         let token = self.get_token().await?;
         let url = format!("{}/v2/admin/resourceGroups", self.provider.genai_api_url);
 
         let response = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {token}"))
-            .header("Content-Type", "application/json")
+            .with_provider_headers(
+                self.client
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json"),
+            )
             .send()
             .await
             .context("Failed to request resource groups")?;
@@ -150,11 +163,12 @@ impl AiCoreClient {
         let token = self.get_token().await?;
         let url = format!("{}/v2/lm/deployments", self.provider.genai_api_url);
 
-        let mut request = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {token}"))
-            .header("Content-Type", "application/json");
+        let mut request = self.with_provider_headers(
+            self.client
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json"),
+        );
 
         let rg = resource_group.unwrap_or(&self.provider.resource_group);
         request = request.header("AI-Resource-Group", rg);

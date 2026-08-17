@@ -55,6 +55,20 @@ impl Cli {
                     );
                     std::process::exit(1);
                 }
+                ("auth", auth_matches) => {
+                    if let Some((action, action_matches)) = auth_matches.subcommand() {
+                        let provider = action_matches
+                            .get_one::<String>("provider")
+                            .map(String::as_str);
+                        return match action {
+                            "login" => handler.auth_login(provider).await,
+                            "logout" => handler.auth_logout(provider),
+                            _ => unreachable!("clap restricts auth subcommands"),
+                        };
+                    }
+                    eprintln!("Unknown auth subcommand. Use 'acr auth login' or 'acr auth logout'");
+                    std::process::exit(1);
+                }
                 ("diagnose", _) => {
                     return handler.diagnose(config_path);
                 }
@@ -203,6 +217,24 @@ impl Cli {
                         .value_name("RESOURCE_GROUP")
                         .help("Resource group to filter deployments"),
                 ),
+            )
+            .subcommand(
+                Command::new("auth")
+                    .about("Manage provider authentication")
+                    .subcommand(
+                        Command::new("login")
+                            .about("Sign in to a Joule provider and save its refresh token")
+                            .arg(Arg::new("provider").value_name("PROVIDER").help(
+                                "Joule provider name (optional when exactly one is configured)",
+                            )),
+                    )
+                    .subcommand(
+                        Command::new("logout")
+                            .about("Remove a Joule provider's saved refresh token")
+                            .arg(Arg::new("provider").value_name("PROVIDER").help(
+                                "Joule provider name (optional when exactly one is configured)",
+                            )),
+                    ),
             )
             .subcommand(
                 Command::new("configure")
@@ -552,6 +584,19 @@ mod tests {
 
     async fn consume_json(Json(_): Json<Value>) -> StatusCode {
         StatusCode::NO_CONTENT
+    }
+
+    #[test]
+    fn auth_login_accepts_optional_provider_name() {
+        let matches = Cli::build_command()
+            .try_get_matches_from(["acr", "auth", "login", "joule"])
+            .unwrap();
+        let (_, auth) = matches.subcommand().unwrap();
+        let (_, login) = auth.subcommand().unwrap();
+        assert_eq!(
+            login.get_one::<String>("provider").map(String::as_str),
+            Some("joule")
+        );
     }
 
     #[tokio::test]

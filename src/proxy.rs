@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::balancer::LoadBalancer;
-use crate::config::{Config, Provider};
+use crate::config::{Config, Provider, ProviderAuth};
 use crate::constants::{api::*, models::*};
 use crate::metrics::MetricsService;
 use crate::registry::ModelRegistry;
@@ -103,6 +103,7 @@ pub struct ProxyRequest {
     pub model: String,          // Resolved/normalized model name
     pub original_model: String, // Original requested model name
     pub provider_name: String,  // Provider handling this request
+    pub provider_auth: ProviderAuth,
     pub resource_group: String,
     pub anthropic_beta: Vec<String>, // Bedrock-mapped beta features from Anthropic-Beta header
 }
@@ -217,6 +218,7 @@ impl<'a> ProxyRequestBuilder<'a> {
             model: normalized_model,
             original_model: self.params.model.clone(),
             provider_name: provider.name.clone(),
+            provider_auth: provider.auth,
             resource_group: provider.resource_group.clone(),
             anthropic_beta,
         })
@@ -308,6 +310,12 @@ impl ProxyRequest {
             AI_CLIENT_TYPE_HEADER,
             HeaderValue::from_static(AI_CLIENT_TYPE_VALUE),
         );
+        if self.provider_auth == ProviderAuth::Joule {
+            headers.insert(
+                crate::joule::CLIENT_VERSION_HEADER,
+                HeaderValue::from_static(crate::joule::CLIENT_VERSION),
+            );
+        }
 
         tracing::debug!(
             "Proxying request to: {} (model: {}, stream: {})",

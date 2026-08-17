@@ -6,6 +6,7 @@ pub mod config;
 pub mod constants;
 #[cfg(feature = "db")]
 pub mod database;
+pub mod joule;
 pub mod metrics;
 pub mod proxy;
 pub mod quota;

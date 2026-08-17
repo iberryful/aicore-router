@@ -45,6 +45,8 @@ pub struct Config {
 pub struct Provider {
     /// Unique identifier for this provider
     pub name: String,
+    /// Authentication flow used for this provider.
+    pub auth: ProviderAuth,
     /// UAA OAuth token URL
     pub uaa_token_url: String,
     /// UAA client ID
@@ -68,6 +70,7 @@ impl std::fmt::Debug for Provider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Provider")
             .field("name", &self.name)
+            .field("auth", &self.auth)
             .field("uaa_token_url", &self.uaa_token_url)
             .field("uaa_client_id", &self.uaa_client_id)
             .field("uaa_client_secret", &"[REDACTED]")
@@ -76,6 +79,26 @@ impl std::fmt::Debug for Provider {
             .field("weight", &self.weight)
             .field("enabled", &self.enabled)
             .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuth {
+    #[default]
+    ClientCredentials,
+    Joule,
+}
+
+impl Provider {
+    pub fn is_joule(&self) -> bool {
+        self.auth == ProviderAuth::Joule
+    }
+
+    pub fn oauth_issuer_url(&self) -> Option<&str> {
+        self.is_joule()
+            .then(|| self.uaa_token_url.strip_suffix("/oauth2/token"))
+            .flatten()
     }
 }
 
@@ -168,14 +191,21 @@ fn default_retention_days() -> u32 {
 pub struct ProviderConfig {
     /// Unique identifier for this provider
     pub name: String,
+    /// Authentication mode. Omit for the existing UAA client-credentials flow.
+    #[serde(default)]
+    pub auth: ProviderAuth,
     /// UAA OAuth token URL
-    pub uaa_token_url: String,
+    #[serde(default)]
+    pub uaa_token_url: Option<String>,
     /// UAA client ID
-    pub uaa_client_id: String,
+    #[serde(default)]
+    pub uaa_client_id: Option<String>,
     /// UAA client secret
-    pub uaa_client_secret: String,
+    #[serde(default)]
+    pub uaa_client_secret: Option<String>,
     /// AI Core API base URL
-    pub genai_api_url: String,
+    #[serde(default)]
+    pub genai_api_url: Option<String>,
     /// Resource group for this provider
     #[serde(default)]
     pub resource_group: Option<String>,
@@ -493,14 +523,69 @@ impl Config {
     fn from_file_and_env(file_config: ConfigFile) -> Result<Self> {
         // Build providers list from config file
         let mut providers: Vec<Provider> = Vec::new();
+        let mut joule_managed_config = None;
 
         for p in file_config.providers {
+            let provider_name = p.name.clone();
+            let (uaa_token_url, uaa_client_id, uaa_client_secret, genai_api_url) = match p.auth {
+                ProviderAuth::ClientCredentials => {
+                    let token_url =
+                        required_provider_field(&provider_name, "uaa_token_url", p.uaa_token_url)?;
+                    (
+                        normalize_oauth_token_url(token_url),
+                        required_provider_field(&provider_name, "uaa_client_id", p.uaa_client_id)?,
+                        required_provider_field(
+                            &provider_name,
+                            "uaa_client_secret",
+                            p.uaa_client_secret,
+                        )?,
+                        required_provider_field(&provider_name, "genai_api_url", p.genai_api_url)?,
+                    )
+                }
+                ProviderAuth::Joule => {
+                    let needs_managed_config = p.uaa_token_url.is_none()
+                        || p.uaa_client_id.is_none()
+                        || p.genai_api_url.is_none();
+                    if needs_managed_config && joule_managed_config.is_none() {
+                        joule_managed_config = Some(
+                                crate::joule::JouleManagedConfig::load().with_context(|| {
+                                    format!(
+                                        "Failed to load Joule managed configuration for provider '{provider_name}'"
+                                    )
+                                })?,
+                            );
+                    }
+                    let managed = joule_managed_config.as_ref();
+                    (
+                        p.uaa_token_url.unwrap_or_else(|| {
+                            format!(
+                                "{}/oauth2/token",
+                                managed.expect("managed Joule config loaded").cis_url
+                            )
+                        }),
+                        p.uaa_client_id.unwrap_or_else(|| {
+                            managed
+                                .expect("managed Joule config loaded")
+                                .client_id
+                                .clone()
+                        }),
+                        String::new(),
+                        p.genai_api_url.unwrap_or_else(|| {
+                            format!(
+                                "{}/ai-core",
+                                managed.expect("managed Joule config loaded").gateway_url
+                            )
+                        }),
+                    )
+                }
+            };
             providers.push(Provider {
                 name: p.name,
-                uaa_token_url: normalize_oauth_token_url(p.uaa_token_url),
-                uaa_client_id: p.uaa_client_id,
-                uaa_client_secret: p.uaa_client_secret,
-                genai_api_url: p.genai_api_url,
+                auth: p.auth,
+                uaa_token_url,
+                uaa_client_id,
+                uaa_client_secret,
+                genai_api_url: genai_api_url.trim_end_matches('/').to_string(),
                 resource_group: p.resource_group.unwrap_or_else(default_resource_group),
                 weight: p.weight,
                 enabled: p.enabled,
@@ -593,6 +678,20 @@ impl Config {
     }
 }
 
+fn required_provider_field(
+    provider_name: &str,
+    field_name: &str,
+    value: Option<String>,
+) -> Result<String> {
+    value.filter(|v| !v.trim().is_empty()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Provider '{}' requires '{}' for client_credentials authentication",
+            provider_name,
+            field_name
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,6 +768,7 @@ models:
             "https://test.example.com/oauth/token"
         );
         assert_eq!(config.providers[0].uaa_client_id, "test-client-id");
+        assert_eq!(config.providers[0].auth, ProviderAuth::ClientCredentials);
         assert_eq!(
             config.providers[0].genai_api_url,
             "https://api.test.example.com"
@@ -679,6 +779,40 @@ models:
         assert_eq!(
             config.models[0].aicore_model_name,
             Some("test-aicore-model".to_string())
+        );
+    }
+
+    #[test]
+    fn test_joule_provider_config_with_explicit_values() {
+        let yaml_content = r#"
+providers:
+  - name: joule
+    auth: joule
+    uaa_token_url: https://identity.example.com/oauth2/token
+    uaa_client_id: public-client
+    genai_api_url: https://gateway.example.com/ai-core
+api_keys:
+  - test-api-key
+models:
+  - name: claude-opus-4-7
+    aicore_model_name: anthropic--claude-4.7-opus
+"#;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("joule.yaml");
+        fs::write(&config_path, yaml_content).unwrap();
+
+        let config = Config::load(Some(config_path.to_str().unwrap())).unwrap();
+        let provider = &config.providers[0];
+        assert_eq!(provider.auth, ProviderAuth::Joule);
+        assert_eq!(provider.uaa_client_secret, "");
+        assert_eq!(
+            provider.oauth_issuer_url(),
+            Some("https://identity.example.com")
+        );
+        assert_eq!(
+            provider.genai_api_url,
+            "https://gateway.example.com/ai-core"
         );
     }
 
@@ -763,10 +897,11 @@ api_keys:
             bind: "0.0.0.0:3000".to_string(),
             providers: vec![ProviderConfig {
                 name: "test".to_string(),
-                uaa_token_url: "https://example.com".to_string(),
-                uaa_client_id: "client123".to_string(),
-                uaa_client_secret: "secret456".to_string(),
-                genai_api_url: "https://api.example.com".to_string(),
+                auth: ProviderAuth::ClientCredentials,
+                uaa_token_url: Some("https://example.com".to_string()),
+                uaa_client_id: Some("client123".to_string()),
+                uaa_client_secret: Some("secret456".to_string()),
+                genai_api_url: Some("https://api.example.com".to_string()),
                 resource_group: Some("test-group".to_string()),
                 weight: 1,
                 enabled: true,

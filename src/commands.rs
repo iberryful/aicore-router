@@ -136,6 +136,49 @@ impl CommandHandler {
         Ok(Self { client, config })
     }
 
+    pub async fn auth_login(&self, provider_name: Option<&str>) -> Result<()> {
+        let provider = self.joule_provider(provider_name)?;
+        crate::joule::login(provider).await
+    }
+
+    pub fn auth_logout(&self, provider_name: Option<&str>) -> Result<()> {
+        let provider = self.joule_provider(provider_name)?;
+        crate::joule::logout(provider)?;
+        println!(
+            "Removed Joule credentials from macOS Keychain for provider '{}'.",
+            provider.name
+        );
+        Ok(())
+    }
+
+    fn joule_provider(&self, provider_name: Option<&str>) -> Result<&crate::config::Provider> {
+        if let Some(name) = provider_name {
+            let provider = self
+                .config
+                .providers
+                .iter()
+                .find(|provider| provider.name == name)
+                .with_context(|| format!("Provider '{name}' is not configured"))?;
+            if !provider.is_joule() {
+                anyhow::bail!("Provider '{name}' does not use Joule authentication");
+            }
+            return Ok(provider);
+        }
+
+        let mut providers = self
+            .config
+            .providers
+            .iter()
+            .filter(|provider| provider.is_joule());
+        let provider = providers
+            .next()
+            .context("No Joule provider is configured")?;
+        if providers.next().is_some() {
+            anyhow::bail!("Multiple Joule providers are configured; specify a provider name");
+        }
+        Ok(provider)
+    }
+
     /// Get a client for the provider that owns the given resource group.
     /// Falls back to the default client if no match is found.
     fn client_for_resource_group(&self, resource_group: &str) -> AiCoreClient {
@@ -1134,8 +1177,8 @@ impl CommandHandler {
         println!("\nProviders ({}):", self.config.providers.len());
         for p in &self.config.providers {
             println!(
-                "  {} - {} (rg: {}, weight: {}, enabled: {})",
-                p.name, p.genai_api_url, p.resource_group, p.weight, p.enabled
+                "  {} - {} (auth: {:?}, rg: {}, weight: {}, enabled: {})",
+                p.name, p.genai_api_url, p.auth, p.resource_group, p.weight, p.enabled
             );
         }
 
@@ -1517,6 +1560,7 @@ mod tests {
         let config = crate::config::Config {
             providers: vec![crate::config::Provider {
                 name: "test".to_string(),
+                auth: crate::config::ProviderAuth::ClientCredentials,
                 uaa_token_url: "https://test.com/oauth/token".to_string(),
                 uaa_client_id: "client".to_string(),
                 uaa_client_secret: "secret".to_string(),

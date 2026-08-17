@@ -44,6 +44,11 @@ shellexpand = "3.1.2"
 comfy-table = "7"
 governor = "0.10.4"
 regex = "1.12.3"
+base64 = "0.22"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "4.1.6", default-features = false, features = ["v1"] }
+plist = "1"
 
 [profile.release]
 strip = true

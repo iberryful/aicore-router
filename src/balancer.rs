@@ -98,6 +98,7 @@ mod tests {
     fn create_test_provider(name: &str, enabled: bool) -> Provider {
         Provider {
             name: name.to_string(),
+            auth: crate::config::ProviderAuth::ClientCredentials,
             uaa_token_url: format!("https://{}.example.com/oauth/token", name),
             uaa_client_id: format!("{}-client", name),
             uaa_client_secret: format!("{}-secret", name),

@@ -17,7 +17,7 @@ A high-performance Rust-based proxy service for SAP AI Core, providing unified a
 - **Cost Estimation**: Per-model pricing config with `--cost` flag for estimated spend breakdown
 - **Terminal UI Dashboard**: Real-time TUI with metrics, active requests, and log viewer (`--tui` flag)
 - **CLI Administration**: Inspect deployments, resource groups, configure tools, view usage, and run diagnostics
-- **OAuth Token Management**: Automatic token refresh with SAP UAA and per-provider caching
+- **OAuth Token Management**: Automatic token refresh with SAP UAA or Joule Desktop OAuth; Joule refresh tokens use macOS Keychain
 - **High Performance**: Built with Rust and async/await for maximum throughput
 - **Simple Configuration**: Single YAML config file with CLI flag overrides
 
@@ -254,6 +254,15 @@ Print diagnostic information about the configuration:
 acr diagnose
 ```
 
+### Provider Authentication
+
+```bash
+acr auth login [provider]
+acr auth logout [provider]
+```
+
+The provider name is optional when exactly one Joule provider is configured.
+
 ### List Deployments
 
 List all deployments in a resource group:
@@ -362,10 +371,11 @@ The router supports multiple AI Core providers for load balancing and redundancy
 | Field | Required | Description |
 |-------|----------|-------------|
 | `name` | Yes | Unique identifier for this provider |
-| `uaa_token_url` | Yes | SAP UAA OAuth token endpoint |
-| `uaa_client_id` | Yes | OAuth client ID |
-| `uaa_client_secret` | Yes | OAuth client secret |
-| `genai_api_url` | Yes | SAP AI Core API base URL |
+| `auth` | No | `client_credentials` (default) or `joule` |
+| `uaa_token_url` | Client credentials only | SAP UAA OAuth token endpoint |
+| `uaa_client_id` | Client credentials only | OAuth client ID |
+| `uaa_client_secret` | Client credentials only | OAuth client secret |
+| `genai_api_url` | Client credentials only | SAP AI Core API base URL |
 | `resource_group` | Yes | AI Core resource group |
 | `weight` | No | Load balancing weight (default: 1) |
 | `enabled` | No | Whether this provider is active (default: true) |
@@ -387,6 +397,29 @@ providers:
     resource_group: rg2
     enabled: true
 ```
+
+### Joule Desktop OAuth (macOS)
+
+acr can use the same public OAuth/PKCE flow as Joule Desktop without reading
+Joule's encrypted database or cached tokens. The gateway URL, Cloud Identity
+Service URL, and public client ID are read from Joule's managed preferences.
+
+```yaml
+providers:
+  - name: joule
+    auth: joule
+    resource_group: default
+```
+
+Sign in once:
+
+```bash
+acr auth login joule
+```
+
+The refresh token is stored in macOS Keychain. Access tokens stay in memory and
+are refreshed automatically; rotated refresh tokens replace the Keychain value.
+Use `acr auth logout joule` to remove the saved credential.
 
 ### Load Balancing
 

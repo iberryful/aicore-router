@@ -10,7 +10,7 @@ use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::config::Provider;
+use crate::config::{Provider, ProviderAuth};
 
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
@@ -88,6 +88,11 @@ impl TokenManager {
 
         let token_key = {
             let mut hasher = Sha256::new();
+            hasher.update(match provider.auth {
+                ProviderAuth::ClientCredentials => b"client_credentials".as_slice(),
+                ProviderAuth::Joule => b"joule".as_slice(),
+            });
+            hasher.update(b"\0");
             hasher.update(provider.uaa_token_url.as_bytes());
             hasher.update(b"\0");
             hasher.update(provider.uaa_client_id.as_bytes());
@@ -126,13 +131,17 @@ impl TokenManager {
         }
 
         // Refresh token
-        let new_token = self
-            .refresh_token(
-                &provider.uaa_token_url,
-                &provider.uaa_client_id,
-                &provider.uaa_client_secret,
-            )
-            .await?;
+        let new_token = match provider.auth {
+            ProviderAuth::ClientCredentials => {
+                self.refresh_client_credentials(
+                    &provider.uaa_token_url,
+                    &provider.uaa_client_id,
+                    &provider.uaa_client_secret,
+                )
+                .await?
+            }
+            ProviderAuth::Joule => self.refresh_joule_token(provider).await?,
+        };
 
         let token_value = new_token.token.clone();
 
@@ -145,7 +154,7 @@ impl TokenManager {
         Ok(Some(token_value))
     }
 
-    async fn refresh_token(
+    async fn refresh_client_credentials(
         &self,
         url: &str,
         client_id: &str,
@@ -191,6 +200,32 @@ impl TokenManager {
             token_response.expires_in
         );
 
+        Ok(TokenInfo {
+            token: token_response.access_token,
+            expires_at,
+        })
+    }
+
+    async fn refresh_joule_token(&self, provider: &Provider) -> Result<TokenInfo> {
+        let refresh_token = crate::joule::load_refresh_token(provider)?.with_context(|| {
+            format!(
+                "No Joule credentials found for provider '{}'. Run: acr auth login {}",
+                provider.name, provider.name
+            )
+        })?;
+        let token_response =
+            crate::joule::refresh_access_token(&self.client, provider, &refresh_token).await?;
+        if let Some(rotated_refresh_token) = token_response.refresh_token.as_deref()
+            && rotated_refresh_token != refresh_token
+        {
+            crate::joule::save_refresh_token(provider, rotated_refresh_token)?;
+        }
+        let expires_at = Utc::now() + chrono::Duration::seconds(token_response.expires_in as i64);
+        tracing::debug!(
+            "Joule token refreshed for provider '{}' (expires in {}s)",
+            provider.name,
+            token_response.expires_in
+        );
         Ok(TokenInfo {
             token: token_response.access_token,
             expires_at,
