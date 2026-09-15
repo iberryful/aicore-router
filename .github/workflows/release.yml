@@ -20,12 +20,14 @@ jobs:
             os: ubuntu-latest
             binary_name: acr
             archive_name: acr-linux-x86_64.tar.gz
+            use_cross: true
 
           # Linux ARM64 (static binary with musl)
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             binary_name: acr
             archive_name: acr-linux-aarch64.tar.gz
+            use_cross: true
 
           # macOS x86_64
           - target: x86_64-apple-darwin
@@ -62,30 +64,27 @@ jobs:
         run: rustup toolchain install stable --component llvm-tools-preview
 
       - name: Add target
+        if: ${{ !matrix.use_cross }}
         run: rustup target add ${{ matrix.target }}
 
-      - name: Install musl tools (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
-      - name: Install cross-compilation tools (Linux ARM64)
-        if: runner.os == 'Linux' && matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          sudo ln -sf /usr/bin/aarch64-linux-gnu-gcc /usr/local/bin/aarch64-linux-musl-gcc
+      - name: Install cross (Linux static musl targets)
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
 
       - name: Use Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
-      - name: Build binary
+      - name: Build binary (cross)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build binary (cargo)
+        if: ${{ !matrix.use_cross }}
         run: cargo build --release --target ${{ matrix.target }}
-        env:
-          # Set linker for ARM64 musl builds
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
 
       - name: Create archive (Unix)
         if: runner.os != 'Windows'
