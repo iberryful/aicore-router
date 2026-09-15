@@ -1191,7 +1191,12 @@ impl CommandHandler {
             } else {
                 format!(" aliases: [{}]", m.aliases.join(", "))
             };
-            println!("  {} -> {}{}", m.name, aicore_name, aliases);
+            let providers = if m.providers.is_empty() {
+                String::new()
+            } else {
+                format!(" providers: [{}]", m.providers.join(", "))
+            };
+            println!("  {} -> {}{}{}", m.name, aicore_name, providers, aliases);
         }
 
         // API keys
@@ -1261,6 +1266,7 @@ mod tests {
             name: name.to_string(),
             aicore_model_name: None,
             aliases: Vec::new(),
+            providers: Vec::new(),
             pricing: None,
         }
     }

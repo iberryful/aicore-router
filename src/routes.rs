@@ -213,10 +213,15 @@ async fn execute_proxy_request(
 
     let builder = ProxyRequestBuilder::new(params);
 
-    // Get providers in load-balanced order. `LoadBalancer::new` rejects empty
-    // / all-disabled provider lists at startup, so this iterator is non-empty
-    // by construction.
-    let providers = state.load_balancer.get_ordered_providers();
+    // Resolve aliases/fallbacks before provider selection so a configured
+    // model's provider allowlist applies to every client-facing model name.
+    let provider_restriction = provider_restriction_for_model(model, &state.model_registry)?;
+    let providers = match provider_restriction {
+        Some(provider_names) => state
+            .load_balancer
+            .get_ordered_providers_for(provider_names),
+        None => state.load_balancer.get_ordered_providers(),
+    };
 
     let mut last_error: Option<AppError> = None;
 
@@ -365,6 +370,17 @@ async fn execute_proxy_request(
             "No providers could handle the request"
         ))),
     }
+}
+
+fn provider_restriction_for_model<'a>(
+    requested_model: &str,
+    registry: &'a ModelRegistry,
+) -> Result<Option<&'a [String]>, AppError> {
+    let normalized = crate::proxy::normalize_model(requested_model, registry)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(registry
+        .find_model_config(&normalized)
+        .and_then(|model| (!model.providers.is_empty()).then_some(model.providers.as_slice())))
 }
 
 pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
@@ -663,6 +679,45 @@ impl IntoResponse for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{FallbackModels, Model};
+    use crate::token::TokenManager;
+
+    fn registry_with_provider_restriction() -> ModelRegistry {
+        ModelRegistry::new(
+            vec![Model {
+                name: "claude-opus-4-7".to_string(),
+                aicore_model_name: Some("anthropic--claude-4.7-opus".to_string()),
+                aliases: vec!["claude-4.7-opus-*".to_string()],
+                providers: vec!["lenny".to_string(), "dev".to_string()],
+                pricing: None,
+            }],
+            FallbackModels {
+                claude: Some("claude-opus-4-7".to_string()),
+                ..FallbackModels::default()
+            },
+            vec![],
+            TokenManager::new(vec!["test".to_string()]),
+            300,
+        )
+    }
+
+    #[test]
+    fn provider_restriction_applies_to_exact_alias_and_family_fallback() {
+        let registry = registry_with_provider_restriction();
+        let expected = ["lenny".to_string(), "dev".to_string()];
+
+        for requested in [
+            "claude-opus-4-7",
+            "claude-4.7-opus-20260817",
+            "claude-unknown-model",
+        ] {
+            assert_eq!(
+                provider_restriction_for_model(requested, &registry).unwrap(),
+                Some(expected.as_slice()),
+                "requested model: {requested}"
+            );
+        }
+    }
 
     #[test]
     fn parse_model_operation_accepts_well_formed_input() {

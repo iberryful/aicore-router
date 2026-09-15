@@ -270,9 +270,25 @@ pub struct Model {
     /// Example: ["claude-sonnet-4-5-*", "claude-4-sonnet"]
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Optional ordered provider allowlist. Empty means all enabled providers.
+    #[serde(default)]
+    pub providers: Vec<String>,
     /// Pricing per 1M tokens for cost estimation.
     #[serde(default)]
     pub pricing: Option<ModelPricing>,
+}
+
+impl Model {
+    pub fn routes_to_provider(&self, provider: &Provider) -> bool {
+        provider.enabled
+            && if self.providers.is_empty() {
+                provider.weight > 0
+            } else {
+                self.providers
+                    .iter()
+                    .any(|configured| configured == &provider.name)
+            }
+    }
 }
 
 /// Configuration for fallback models per model family.
@@ -662,6 +678,61 @@ impl Config {
             );
         }
 
+        let mut configured_providers = std::collections::HashSet::new();
+        let mut enabled_providers = std::collections::HashSet::new();
+        let mut default_providers = std::collections::HashSet::new();
+        for provider in &self.providers {
+            if !configured_providers.insert(provider.name.as_str()) {
+                anyhow::bail!(
+                    "Provider names must be unique; '{}' is duplicated",
+                    provider.name
+                );
+            }
+            if provider.enabled {
+                enabled_providers.insert(provider.name.as_str());
+                if provider.weight > 0 {
+                    default_providers.insert(provider.name.as_str());
+                }
+            }
+        }
+
+        for model in &self.models {
+            let mut seen = std::collections::HashSet::new();
+            for provider_name in &model.providers {
+                if !configured_providers.contains(provider_name.as_str()) {
+                    anyhow::bail!(
+                        "Model '{}' references unknown provider '{}'",
+                        model.name,
+                        provider_name
+                    );
+                }
+                if !seen.insert(provider_name.as_str()) {
+                    anyhow::bail!(
+                        "Model '{}' lists provider '{}' more than once",
+                        model.name,
+                        provider_name
+                    );
+                }
+            }
+            if !model.providers.is_empty()
+                && !model
+                    .providers
+                    .iter()
+                    .any(|provider| enabled_providers.contains(provider.as_str()))
+            {
+                anyhow::bail!(
+                    "Model '{}' has no enabled provider in its provider allowlist",
+                    model.name
+                );
+            }
+            if model.providers.is_empty() && default_providers.is_empty() {
+                anyhow::bail!(
+                    "Model '{}' has no default provider because every enabled provider has weight 0",
+                    model.name
+                );
+            }
+        }
+
         // Fallback models must reference models in the models list
         let model_names: Vec<&str> = self.models.iter().map(|m| m.name.as_str()).collect();
         for (family, fb) in self.fallback_models.iter() {
@@ -817,6 +888,194 @@ models:
     }
 
     #[test]
+    fn test_model_provider_allowlist_parses_in_order() {
+        let yaml_content = r#"
+providers:
+  - name: lenny
+    uaa_token_url: https://lenny.example.com/oauth/token
+    uaa_client_id: lenny-client
+    uaa_client_secret: lenny-secret
+    genai_api_url: https://lenny.example.com
+  - name: dev
+    uaa_token_url: https://dev.example.com/oauth/token
+    uaa_client_id: dev-client
+    uaa_client_secret: dev-secret
+    genai_api_url: https://dev.example.com
+api_keys:
+  - test-api-key
+models:
+  - name: claude-opus-4-7
+    aicore_model_name: anthropic--claude-4.7-opus
+    providers:
+      - lenny
+      - dev
+    aliases:
+      - claude-4.7-opus-*
+"#;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("model-providers.yaml");
+        fs::write(&config_path, yaml_content).unwrap();
+
+        let config = Config::load(Some(config_path.to_str().unwrap())).unwrap();
+        assert_eq!(
+            config.models[0].providers,
+            vec!["lenny".to_string(), "dev".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_model_provider_allowlist_rejects_unknown_and_duplicate_names() {
+        let base = r#"
+providers:
+  - name: lenny
+    uaa_token_url: https://lenny.example.com/oauth/token
+    uaa_client_id: lenny-client
+    uaa_client_secret: lenny-secret
+    genai_api_url: https://lenny.example.com
+api_keys:
+  - test-api-key
+models:
+  - name: claude-opus-4-7
+    providers:
+"#;
+
+        for (suffix, expected) in [
+            ("      - missing\n", "references unknown provider 'missing'"),
+            (
+                "      - lenny\n      - lenny\n",
+                "lists provider 'lenny' more than once",
+            ),
+        ] {
+            let temp_dir = TempDir::new().unwrap();
+            let config_path = temp_dir.path().join("invalid-model-providers.yaml");
+            fs::write(&config_path, format!("{base}{suffix}")).unwrap();
+            let error = Config::load(Some(config_path.to_str().unwrap())).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn test_model_provider_allowlist_accepts_enabled_zero_weight_provider() {
+        let yaml_content = r#"
+providers:
+  - name: lenny
+    uaa_token_url: https://lenny.example.com/oauth/token
+    uaa_client_id: lenny-client
+    uaa_client_secret: lenny-secret
+    genai_api_url: https://lenny.example.com
+    weight: 0
+api_keys:
+  - test-api-key
+models:
+  - name: claude-opus-4-7
+    providers:
+      - lenny
+"#;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zero-weight-model-provider.yaml");
+        fs::write(&config_path, yaml_content).unwrap();
+        let config = Config::load(Some(config_path.to_str().unwrap())).unwrap();
+        assert_eq!(config.models[0].providers, vec!["lenny"]);
+        assert!(config.models[0].routes_to_provider(&config.providers[0]));
+    }
+
+    #[test]
+    fn test_unrestricted_model_rejects_only_zero_weight_default_pool() {
+        let yaml_content = r#"
+providers:
+  - name: lenny
+    uaa_token_url: https://lenny.example.com/oauth/token
+    uaa_client_id: lenny-client
+    uaa_client_secret: lenny-secret
+    genai_api_url: https://lenny.example.com
+    weight: 0
+api_keys:
+  - test-api-key
+models:
+  - name: claude-opus-4-7
+"#;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zero-weight-default-provider.yaml");
+        fs::write(&config_path, yaml_content).unwrap();
+        let error = Config::load(Some(config_path.to_str().unwrap())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("every enabled provider has weight 0"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn test_model_provider_allowlist_rejects_disabled_provider() {
+        let yaml_content = r#"
+providers:
+  - name: lenny
+    uaa_token_url: https://lenny.example.com/oauth/token
+    uaa_client_id: lenny-client
+    uaa_client_secret: lenny-secret
+    genai_api_url: https://lenny.example.com
+    weight: 0
+    enabled: false
+api_keys:
+  - test-api-key
+models:
+  - name: claude-opus-4-7
+    providers:
+      - lenny
+"#;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("disabled-model-provider.yaml");
+        fs::write(&config_path, yaml_content).unwrap();
+        let error = Config::load(Some(config_path.to_str().unwrap())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("has no enabled provider in its provider allowlist"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn test_model_routes_to_provider_weight_and_enabled_semantics() {
+        let provider = |name: &str, weight: u32, enabled: bool| Provider {
+            name: name.to_string(),
+            auth: ProviderAuth::ClientCredentials,
+            uaa_token_url: "https://example.com/oauth/token".to_string(),
+            uaa_client_id: "client".to_string(),
+            uaa_client_secret: "secret".to_string(),
+            genai_api_url: "https://example.com".to_string(),
+            resource_group: "default".to_string(),
+            weight,
+            enabled,
+        };
+        let unrestricted = Model {
+            name: "unrestricted".to_string(),
+            aicore_model_name: None,
+            aliases: vec![],
+            providers: vec![],
+            pricing: None,
+        };
+        let restricted = Model {
+            name: "restricted".to_string(),
+            aicore_model_name: None,
+            aliases: vec![],
+            providers: vec!["opt-in".to_string()],
+            pricing: None,
+        };
+
+        assert!(unrestricted.routes_to_provider(&provider("default", 1, true)));
+        assert!(!unrestricted.routes_to_provider(&provider("opt-in", 0, true)));
+        assert!(restricted.routes_to_provider(&provider("opt-in", 0, true)));
+        assert!(!restricted.routes_to_provider(&provider("default", 1, true)));
+        assert!(!restricted.routes_to_provider(&provider("opt-in", 0, false)));
+    }
+
+    #[test]
     fn test_config_missing_providers() {
         let yaml_content = r#"
 port: 8080
@@ -911,6 +1170,7 @@ api_keys:
                 name: "model1".to_string(),
                 aicore_model_name: Some("aicore-model-1".to_string()),
                 aliases: vec![],
+                providers: vec![],
                 pricing: None,
             }],
             refresh_interval_secs: None,

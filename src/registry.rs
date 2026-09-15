@@ -204,6 +204,16 @@ impl ModelRegistry {
             if !provider.enabled {
                 continue;
             }
+            let provider_is_used = if self.config_models.is_empty() {
+                provider.weight > 0
+            } else {
+                self.config_models
+                    .iter()
+                    .any(|model| model.routes_to_provider(provider))
+            };
+            if !provider_is_used {
+                continue;
+            }
 
             // Create a client for this provider
             let client = AiCoreClient::from_provider(provider.clone(), self.token_manager.clone());
@@ -235,7 +245,7 @@ impl ModelRegistry {
                             .iter()
                             .find(|m| {
                                 let aicore_name = m.aicore_model_name.as_ref().unwrap_or(&m.name);
-                                aicore_name == &deployed_model
+                                aicore_name == &deployed_model && m.routes_to_provider(provider)
                             })
                             .map(|m| m.name.clone())
                             .unwrap_or_else(|| "-".to_string());
@@ -251,6 +261,9 @@ impl ModelRegistry {
 
                     // Resolve config models to deployments
                     for model_config in &self.config_models {
+                        if !model_config.routes_to_provider(provider) {
+                            continue;
+                        }
                         let aicore_model_name = model_config
                             .aicore_model_name
                             .as_ref()
@@ -513,6 +526,7 @@ mod tests {
             name: "claude-sonnet-4-5".to_string(),
             aicore_model_name: None,
             aliases: vec!["claude-4-sonnet".to_string()],
+            providers: vec![],
             pricing: None,
         }];
         let registry = create_test_registry(models);
@@ -528,6 +542,7 @@ mod tests {
             name: "claude-sonnet-4-5".to_string(),
             aicore_model_name: None,
             aliases: vec!["claude-sonnet-4-5-*".to_string()],
+            providers: vec![],
             pricing: None,
         }];
         let registry = create_test_registry(models);
@@ -544,12 +559,14 @@ mod tests {
                 name: "claude-general".to_string(),
                 aicore_model_name: None,
                 aliases: vec!["claude-*".to_string()],
+                providers: vec![],
                 pricing: None,
             },
             Model {
                 name: "claude-sonnet-4-5".to_string(),
                 aicore_model_name: None,
                 aliases: vec!["claude-sonnet-4-5-*".to_string()],
+                providers: vec![],
                 pricing: None,
             },
         ];
@@ -572,6 +589,7 @@ mod tests {
             name: "claude-sonnet-4-5".to_string(),
             aicore_model_name: None,
             aliases: vec!["claude-sonnet-4-5-*".to_string()],
+            providers: vec![],
             pricing: None,
         }];
         let registry = create_test_registry(models);
@@ -590,6 +608,7 @@ mod tests {
                 "claude-4-sonnet".to_string(),
                 "sonnet-4.5".to_string(),
             ],
+            providers: vec![],
             pricing: None,
         }];
         let registry = create_test_registry(models);
@@ -611,5 +630,83 @@ mod tests {
             registry.find_model_by_alias("sonnet-4.5").map(|m| &m.name),
             Some(&"claude-sonnet-4-5".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn deployment_resolution_skips_providers_not_allowed_for_model() {
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+        use serde_json::json;
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(json!({"access_token": "test-token", "expires_in": 3600}))
+        }
+
+        async fn deployments() -> Json<serde_json::Value> {
+            Json(json!({
+                "count": 1,
+                "resources": [{
+                    "id": "deployment-opus-47",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "modifiedAt": "2026-01-01T00:00:00Z",
+                    "status": "RUNNING",
+                    "details": {"resources": {"backendDetails": {"model": {
+                        "name": "anthropic--claude-4.7-opus",
+                        "version": "1"
+                    }}}},
+                    "scenarioId": "foundation-models",
+                    "configurationId": "config-opus-47"
+                }]
+            }))
+        }
+
+        let app = Router::new()
+            .route("/oauth/token", post(token))
+            .route("/v2/lm/deployments", get(deployments));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let provider = |name: &str, weight: u32| Provider {
+            name: name.to_string(),
+            auth: crate::config::ProviderAuth::ClientCredentials,
+            uaa_token_url: format!("http://{address}/oauth/token"),
+            uaa_client_id: format!("{name}-client"),
+            uaa_client_secret: format!("{name}-secret"),
+            genai_api_url: format!("http://{address}"),
+            resource_group: "default".to_string(),
+            weight,
+            enabled: true,
+        };
+        let registry = ModelRegistry::new(
+            vec![Model {
+                name: "claude-opus-4-7".to_string(),
+                aicore_model_name: Some("anthropic--claude-4.7-opus".to_string()),
+                aliases: vec![],
+                providers: vec!["lenny".to_string()],
+                pricing: None,
+            }],
+            FallbackModels::default(),
+            vec![provider("lenny", 0), provider("dev", 1)],
+            TokenManager::new(vec!["test".to_string()]),
+            300,
+        );
+
+        registry.refresh_deployments().await.unwrap();
+        assert_eq!(
+            registry
+                .get_deployment_for_provider("claude-opus-4-7", "lenny")
+                .await
+                .as_deref(),
+            Some("deployment-opus-47")
+        );
+        assert!(
+            registry
+                .get_deployment_for_provider("claude-opus-4-7", "dev")
+                .await
+                .is_none()
+        );
+        server.abort();
     }
 }

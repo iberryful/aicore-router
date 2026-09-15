@@ -685,7 +685,7 @@ impl ProxyRequest {
 /// 2. Alias pattern match against configured `models[].aliases`
 /// 3. Family-fallback (claude/gemini/gpt/text) to a configured default
 /// 4. Pass-through unchanged
-fn normalize_model(model: &str, registry: &ModelRegistry) -> Result<String> {
+pub(crate) fn normalize_model(model: &str, registry: &ModelRegistry) -> Result<String> {
     let base_model = model.strip_suffix(EXTENDED_CONTEXT_SUFFIX).unwrap_or(model);
 
     // 1. Exact match - if the model exists in config, use it directly
@@ -1182,6 +1182,7 @@ mod tests {
             name: "claude-opus-4-7".to_string(),
             aicore_model_name: None,
             aliases: vec![],
+            providers: vec![],
             pricing: None,
         }];
         let registry = create_test_registry(models);
@@ -1196,6 +1197,7 @@ mod tests {
             name: "claude-opus-4-7".to_string(),
             aicore_model_name: None,
             aliases: vec![],
+            providers: vec![],
             pricing: None,
         }];
         let registry = create_test_registry(models);
@@ -1210,6 +1212,7 @@ mod tests {
             name: "claude-opus-4-7".to_string(),
             aicore_model_name: None,
             aliases: vec!["claude-opus-4-7-*".to_string()],
+            providers: vec![],
             pricing: None,
         }];
         let registry = create_test_registry(models);
@@ -1225,6 +1228,7 @@ mod tests {
             name: "claude-sonnet-4-5".to_string(),
             aicore_model_name: None,
             aliases: vec![],
+            providers: vec![],
             pricing: None,
         }];
         let registry = ModelRegistry::new(
@@ -1252,6 +1256,7 @@ mod tests {
             name: "gpt-4o".to_string(),
             aicore_model_name: None,
             aliases: vec![],
+            providers: vec![],
             pricing: None,
         }];
         let registry = create_test_registry(models);

@@ -377,7 +377,7 @@ The router supports multiple AI Core providers for load balancing and redundancy
 | `uaa_client_secret` | Client credentials only | OAuth client secret |
 | `genai_api_url` | Client credentials only | SAP AI Core API base URL |
 | `resource_group` | Yes | AI Core resource group |
-| `weight` | No | Load balancing weight (default: 1) |
+| `weight` | No | `0` makes the provider opt-in: skipped by default, but usable when explicitly listed in `models[].providers`; positive values preserve existing routing (default: 1) |
 | `enabled` | No | Whether this provider is active (default: true) |
 
 ```yaml
@@ -525,9 +525,26 @@ models:
   # Mapped: when AI Core uses a different model name
   - name: claude-sonnet-4-6
     aicore_model_name: anthropic--claude-4.6-sonnet
+
+  # Provider-restricted: route only through these providers, in this order
+  - name: claude-opus-4-7
+    aicore_model_name: anthropic--claude-4.7-opus
+    providers:
+      - lenny
+      - dev
+    aliases:
+      - claude-4.7-opus-*
+      - claude-opus-4-7-*
 ```
 
 If no models are configured, the router will automatically discover them from your AI Core deployments.
+
+When `providers` is omitted or empty, the model can use every enabled provider.
+When specified, round-robin or fallback ordering is applied only within that
+list. A single provider disables cross-provider load balancing and fallback for
+that model. An enabled provider with `weight: 0` is opt-in and becomes eligible
+only when explicitly listed here. Unknown or duplicate provider names are
+rejected during config validation.
 
 ### Model Aliases
 

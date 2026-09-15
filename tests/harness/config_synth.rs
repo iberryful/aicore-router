@@ -170,6 +170,9 @@ fn render_yaml(user: &Config, port: u16, db_path: &Path) -> String {
     yaml.push_str("providers:\n");
     for p in &user.providers {
         yaml.push_str(&format!("  - name: {}\n", yaml_escape(&p.name)));
+        if p.is_joule() {
+            yaml.push_str("    auth: joule\n");
+        }
         yaml.push_str(&format!(
             "    uaa_token_url: {}\n",
             yaml_escape(&p.uaa_token_url)
@@ -178,10 +181,12 @@ fn render_yaml(user: &Config, port: u16, db_path: &Path) -> String {
             "    uaa_client_id: {}\n",
             yaml_escape(&p.uaa_client_id)
         ));
-        yaml.push_str(&format!(
-            "    uaa_client_secret: {}\n",
-            yaml_escape(&p.uaa_client_secret)
-        ));
+        if !p.is_joule() {
+            yaml.push_str(&format!(
+                "    uaa_client_secret: {}\n",
+                yaml_escape(&p.uaa_client_secret)
+            ));
+        }
         yaml.push_str(&format!(
             "    genai_api_url: {}\n",
             yaml_escape(&p.genai_api_url)
@@ -207,6 +212,12 @@ fn render_yaml(user: &Config, port: u16, db_path: &Path) -> String {
             yaml.push_str("    aliases:\n");
             for alias in &m.aliases {
                 yaml.push_str(&format!("      - {}\n", yaml_escape(alias)));
+            }
+        }
+        if !m.providers.is_empty() {
+            yaml.push_str("    providers:\n");
+            for provider in &m.providers {
+                yaml.push_str(&format!("      - {}\n", yaml_escape(provider)));
             }
         }
     }
