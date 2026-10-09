@@ -79,15 +79,30 @@ load_balancing: round_robin
 # -----------------------------------------------------------------------------
 # Providers
 # -----------------------------------------------------------------------------
-# Multiple SAP AI Core providers for load balancing and redundancy.
-# Each provider represents an AI Core tenant/resource group with its own
-# OAuth credentials.
+# Providers are load-balanced / failed-over in the same pool. Two kinds:
+#
+#   kind: aicore      (default) — a SAP AI Core tenant/resource group with its
+#                     own OAuth credentials; deployments are discovered
+#                     automatically and requests are transformed to AI Core's
+#                     native shapes.
+#
+#   kind: passthrough — a generic OpenAI-compatible upstream (another acr
+#                     instance, a multi-dialect gateway, etc.). Requests are
+#                     relayed in their original dialect (OpenAI / Anthropic /
+#                     Gemini) with a static key. No OAuth, no deployment
+#                     discovery, no body transform (except normalizing the
+#                     model name to match the upstream's advertised id). The
+#                     upstream's models are
+#                     discovered via its per-dialect `/v1/models` (and
+#                     `/v1beta/models`) endpoints, and requests are forwarded to
+#                     the mirrored canonical route (`/v1/chat/completions`,
+#                     `/v1/messages`, etc.).
 providers:
   - name: primary
     uaa_token_url: https://your-tenant.authentication.sap.hana.ondemand.com
     uaa_client_id: "sb-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx!bXXXXXX|xsuaa_std!bXXXXXX"
     uaa_client_secret: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx$xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-    genai_api_url: https://api.ai.intprod-eu12.eu-central-1.aws.ml.hana.ondemand.com
+    genai_api_url: https://api.ai.<region>.aws.ml.hana.ondemand.com
     resource_group: default
     weight: 1       # Load balancing weight (higher = more traffic)
     enabled: true   # Set to false to temporarily disable this provider
@@ -96,10 +111,37 @@ providers:
     uaa_token_url: https://another-tenant.authentication.sap.hana.ondemand.com
     uaa_client_id: "sb-yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy!bYYYYYY|xsuaa_std!bYYYYYY"
     uaa_client_secret: "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy$yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
-    genai_api_url: https://api.ai.internalprod.eu-central-1.aws.ml.hana.ondemand.com
+    genai_api_url: https://api.ai.<region>.aws.ml.hana.ondemand.com
     resource_group: dev
     weight: 1
     enabled: true
+
+  # Passthrough example: relay to another acr instance (plain OpenAI-compatible).
+  # A plain acr serves OpenAI at the root and Anthropic/Gemini under /anthropic
+  # and /gemini, which are the defaults — so no prefixes are needed here.
+  - name: downstream-acr
+    kind: passthrough
+    base_url: http://downstream-acr:8900  # no /inference/deployments suffix
+    api_key: "sk-your-downstream-key"     # forwarded verbatim to the upstream
+    auth_header: x-api-key                # optional; "authorization" (default) sends "Bearer <key>"
+    weight: 1
+    enabled: true
+
+  # Passthrough example: a multi-dialect gateway that namespaces each dialect.
+  # Only OpenAI needs an override here; Anthropic/Gemini keep the defaults
+  # (/anthropic, /gemini), which such gateways also use.
+  - name: gateway
+    kind: passthrough
+    base_url: http://127.0.0.1:6655
+    api_key: "sk-your-key"
+    auth_header: x-api-key
+    prefixes:
+      openai: /openai                     # -> {base_url}/openai/v1/chat/completions
+      # anthropic: /anthropic             # default
+      # gemini: /gemini                   # default
+    weight: 1
+    enabled: true
+
 
 # -----------------------------------------------------------------------------
 # Model Mappings

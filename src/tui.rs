@@ -1,7 +1,7 @@
 //! Terminal UI dashboard for monitoring the AI Core Router.
 //!
 //! Feature-gated behind `tui` feature flag. Uses ratatui + crossterm.
-//! Visual design closely mirrors hai-cli's Go TUI (tview + tcell).
+//! Visual design closely mirrors a reference Go TUI (tview + tcell).
 
 use std::collections::VecDeque;
 use std::io;
@@ -30,7 +30,7 @@ use crate::quota::QuotaManager;
 use crate::registry::ModelRegistry;
 
 // ── Theme ────────────────────────────────────────────────────────────
-// RGB palette matching hai-cli's dark theme with cyan/teal accents.
+// RGB palette: a dark theme with cyan/teal accents.
 
 mod theme {
     use ratatui::style::Color;

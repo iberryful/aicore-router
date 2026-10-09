@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use axum::{
     body::Body,
-    http::{HeaderMap, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::Response,
 };
 use futures::stream::StreamExt;
@@ -106,6 +106,10 @@ pub struct ProxyRequest {
     pub provider_auth: ProviderAuth,
     pub resource_group: String,
     pub anthropic_beta: Vec<String>, // Bedrock-mapped beta features from Anthropic-Beta header
+    /// When set, this request targets a passthrough (OpenAI-compatible) upstream:
+    /// the `(header-name, header-value)` pair authenticates to it, and the AI Core
+    /// headers (`ai-resource-group`, Joule client-version) are skipped.
+    pub passthrough_auth: Option<(String, String)>,
 }
 
 /// Input parameters for building a ProxyRequest
@@ -158,6 +162,44 @@ impl<'a> ProxyRequestBuilder<'a> {
             None => determine_family(&normalized_model)?,
         };
         let stream = extract_stream_flag(&self.params.body, &family, &self.params.action);
+
+        // Passthrough providers relay the request in its original dialect to a
+        // generic OpenAI-compatible upstream: no AI Core body transform, no beta
+        // injection, a static key, and a canonical per-family URL that mirrors
+        // acr's own inbound routes.
+        if provider.is_passthrough() {
+            let mut body = self.params.body.clone();
+            // Send the exact model id the upstream advertised (alias-resolved,
+            // `[1m]` stripped) so it matches what /v1/models returned upstream.
+            if let Some(obj) = body.as_object_mut()
+                && obj.contains_key("model")
+            {
+                obj.insert("model".to_string(), json!(normalized_model));
+            }
+            let url = build_passthrough_url(
+                &normalized_model,
+                &self.params.action,
+                &provider.base_url,
+                &provider.prefixes,
+                &family,
+                stream,
+            );
+            return Ok(ProxyRequest {
+                family,
+                method: self.params.method.clone(),
+                body,
+                stream,
+                url,
+                token,
+                model: normalized_model,
+                original_model: self.params.model.clone(),
+                provider_name: provider.name.clone(),
+                provider_auth: provider.auth,
+                resource_group: String::new(),
+                anthropic_beta: vec![],
+                passthrough_auth: Some(provider.passthrough_auth_header()),
+            });
+        }
 
         // Step 5: Prepare request body
         let mut body = self.params.body.clone();
@@ -221,6 +263,7 @@ impl<'a> ProxyRequestBuilder<'a> {
             provider_auth: provider.auth,
             resource_group: provider.resource_group.clone(),
             anthropic_beta,
+            passthrough_auth: None,
         })
     }
 
@@ -245,6 +288,24 @@ impl<'a> ProxyRequestBuilder<'a> {
     ) -> Result<(String, String), AppError> {
         let normalized_model = normalize_model(&self.params.model, self.params.model_registry)
             .map_err(|e| AppError::BadRequest(e.to_string()))?;
+
+        // For a passthrough provider that a model's explicit `providers` allowlist
+        // names, trust the config and forward: the upstream owns its own naming and
+        // may accept clean names its `/v1/models` list doesn't advertise verbatim
+        // (e.g. a gateway accepts `claude-opus-4-8` though it lists `anthropic--claude-4.8-opus`).
+        // The deployment id is unused for passthrough (the URL is built from base+prefix).
+        if provider.is_passthrough()
+            && let Some(model_config) = self
+                .params
+                .model_registry
+                .find_model_config(&normalized_model)
+            && model_config
+                .providers
+                .iter()
+                .any(|p| p == &provider.name)
+        {
+            return Ok((normalized_model.clone(), normalized_model));
+        }
 
         // Try to get deployment for this specific provider
         if let Some(deployment_id) = self
@@ -297,24 +358,31 @@ impl ProxyRequest {
         let start_time = Instant::now();
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "authorization",
-            HeaderValue::from_str(&format!("Bearer {}", self.token))?,
-        );
-        headers.insert(
-            "ai-resource-group",
-            HeaderValue::from_str(&self.resource_group)?,
-        );
         headers.insert("content-type", HeaderValue::from_static("application/json"));
-        headers.insert(
-            AI_CLIENT_TYPE_HEADER,
-            HeaderValue::from_static(AI_CLIENT_TYPE_VALUE),
-        );
-        if self.provider_auth == ProviderAuth::Joule {
+        if let Some((name, value)) = &self.passthrough_auth {
             headers.insert(
-                crate::joule::CLIENT_VERSION_HEADER,
-                HeaderValue::from_static(crate::joule::CLIENT_VERSION),
+                HeaderName::from_bytes(name.as_bytes())?,
+                HeaderValue::from_str(value)?,
             );
+        } else {
+            headers.insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {}", self.token))?,
+            );
+            headers.insert(
+                "ai-resource-group",
+                HeaderValue::from_str(&self.resource_group)?,
+            );
+            headers.insert(
+                AI_CLIENT_TYPE_HEADER,
+                HeaderValue::from_static(AI_CLIENT_TYPE_VALUE),
+            );
+            if self.provider_auth == ProviderAuth::Joule {
+                headers.insert(
+                    crate::joule::CLIENT_VERSION_HEADER,
+                    HeaderValue::from_static(crate::joule::CLIENT_VERSION),
+                );
+            }
         }
 
         tracing::debug!(
@@ -1103,6 +1171,46 @@ fn extract_token_stats_from_body(body: &str, family: &LlmFamily) -> Option<Token
     }
 }
 
+/// Build the canonical OpenAI-compatible / Anthropic / Gemini URL for a
+/// passthrough upstream. The path mirrors acr's own inbound routes so a
+/// downstream acr (or a compatible proxy) receives the request in the same
+/// dialect the client sent it. Each dialect uses its own configured prefix
+/// (e.g. a multi-dialect gateway namespaces OpenAI under `/openai`).
+fn build_passthrough_url(
+    model: &str,
+    action: &Option<String>,
+    base_url: &str,
+    prefixes: &crate::config::PassthroughPrefixes,
+    family: &LlmFamily,
+    stream: bool,
+) -> String {
+    match family {
+        LlmFamily::Claude => format!("{base_url}{}/v1/messages", prefixes.anthropic),
+        LlmFamily::OpenAi => {
+            if model.starts_with(TEXT_PREFIX) {
+                format!("{base_url}{}/v1/embeddings", prefixes.openai)
+            } else {
+                format!("{base_url}{}/v1/chat/completions", prefixes.openai)
+            }
+        }
+        LlmFamily::OpenAiResponses => {
+            if action.as_deref() == Some("compact") {
+                format!("{base_url}{}/v1/responses/compact", prefixes.openai)
+            } else {
+                format!("{base_url}{}/v1/responses", prefixes.openai)
+            }
+        }
+        LlmFamily::Gemini => {
+            let action = action.as_deref().unwrap_or(if stream {
+                STREAM_GENERATE_CONTENT_ACTION
+            } else {
+                GENERATE_CONTENT_ACTION
+            });
+            format!("{base_url}{}/v1beta/models/{model}:{action}", prefixes.gemini)
+        }
+    }
+}
+
 fn build_url(
     model: &str,
     deployment_id: &str,
@@ -1495,6 +1603,81 @@ mod tests {
         .unwrap();
         assert!(url.ends_with("/responses?api-version=2025-04-01-preview"));
         assert!(!url.contains("/compact"));
+    }
+
+    #[test]
+    fn build_passthrough_url_mirrors_canonical_inbound_routes() {
+        let base = "http://downstream:8900";
+        // OpenAI-family routes use the (default empty) openai prefix -> root paths.
+        let cases = [
+            (
+                LlmFamily::OpenAi,
+                "gpt-5.5",
+                &None,
+                false,
+                "http://downstream:8900/v1/chat/completions",
+            ),
+            (
+                LlmFamily::OpenAi,
+                "text-embedding-3-large",
+                &None,
+                false,
+                "http://downstream:8900/v1/embeddings",
+            ),
+            (
+                LlmFamily::OpenAiResponses,
+                "gpt-5.5",
+                &None,
+                false,
+                "http://downstream:8900/v1/responses",
+            ),
+            (
+                LlmFamily::OpenAiResponses,
+                "gpt-5.5",
+                &Some("compact".to_string()),
+                false,
+                "http://downstream:8900/v1/responses/compact",
+            ),
+        ];
+        // acr-shaped defaults: OpenAI at the root, Anthropic/Gemini prefixed.
+        let prefixes = crate::config::PassthroughPrefixes::default();
+        // Verify the acr-shaped Anthropic/Gemini prefixes produce the routes acr serves.
+        assert_eq!(
+            build_passthrough_url("claude-opus-4-8", &None, base, &prefixes, &LlmFamily::Claude, false),
+            "http://downstream:8900/anthropic/v1/messages"
+        );
+        assert_eq!(
+            build_passthrough_url("gemini-2.5-pro", &None, base, &prefixes, &LlmFamily::Gemini, false),
+            "http://downstream:8900/gemini/v1beta/models/gemini-2.5-pro:generateContent"
+        );
+        for (family, model, action, stream, expected) in cases {
+            let url = build_passthrough_url(model, action, base, &prefixes, &family, stream);
+            assert_eq!(url, expected, "family {family:?} model {model}");
+        }
+    }
+
+    #[test]
+    fn build_passthrough_url_applies_per_family_prefixes() {
+        // A multi-dialect gateway namespaces every dialect: OpenAI under /openai,
+        // Anthropic under /anthropic, Gemini under /gemini.
+        let prefixes = crate::config::PassthroughPrefixes {
+            openai: "/openai".to_string(),
+            anthropic: "/anthropic".to_string(),
+            gemini: "/gemini".to_string(),
+        };
+        let base = "http://127.0.0.1:6655";
+        assert_eq!(
+            build_passthrough_url("gpt-4.1", &None, base, &prefixes, &LlmFamily::OpenAi, false),
+            "http://127.0.0.1:6655/openai/v1/chat/completions"
+        );
+        assert_eq!(
+            build_passthrough_url("claude-opus-4-8", &None, base, &prefixes, &LlmFamily::Claude, false),
+            "http://127.0.0.1:6655/anthropic/v1/messages"
+        );
+        assert_eq!(
+            build_passthrough_url("gemini-2.5-pro", &None, base, &prefixes, &LlmFamily::Gemini, true),
+            "http://127.0.0.1:6655/gemini/v1beta/models/gemini-2.5-pro:streamGenerateContent"
+        );
     }
 
     /// Build a synthetic `BoxStream` from a list of pre-baked chunks for

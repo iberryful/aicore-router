@@ -268,7 +268,13 @@ impl CommandHandler {
             self.list_deployments_for_resource_group(rg_name).await
         } else {
             // List deployments for all configured resource groups
-            for (i, provider) in self.config.providers.iter().enumerate() {
+            for (i, provider) in self
+                .config
+                .providers
+                .iter()
+                .filter(|p| !p.is_passthrough())
+                .enumerate()
+            {
                 if i > 0 {
                     println!();
                 }
@@ -1176,10 +1182,17 @@ impl CommandHandler {
         // Providers
         println!("\nProviders ({}):", self.config.providers.len());
         for p in &self.config.providers {
-            println!(
-                "  {} - {} (auth: {:?}, rg: {}, weight: {}, enabled: {})",
-                p.name, p.genai_api_url, p.auth, p.resource_group, p.weight, p.enabled
-            );
+            if p.is_passthrough() {
+                println!(
+                    "  {} - {} (kind: passthrough, auth_header: {}, weight: {}, enabled: {})",
+                    p.name, p.base_url, p.auth_header, p.weight, p.enabled
+                );
+            } else {
+                println!(
+                    "  {} - {} (auth: {:?}, rg: {}, weight: {}, enabled: {})",
+                    p.name, p.genai_api_url, p.auth, p.resource_group, p.weight, p.enabled
+                );
+            }
         }
 
         // Models
@@ -1564,16 +1577,13 @@ mod tests {
         unsafe { std::env::set_var("OPENCODE_CONFIG", config_path.to_str().unwrap()) };
 
         let config = crate::config::Config {
-            providers: vec![crate::config::Provider {
-                name: "test".to_string(),
-                auth: crate::config::ProviderAuth::ClientCredentials,
-                uaa_token_url: "https://test.com/oauth/token".to_string(),
-                uaa_client_id: "client".to_string(),
-                uaa_client_secret: "secret".to_string(),
-                genai_api_url: "https://api.test.com".to_string(),
-                resource_group: "default".to_string(),
-                weight: 1,
-                enabled: true,
+            providers: vec![{
+                let mut p = crate::config::test_aicore_provider("test");
+                p.uaa_token_url = "https://test.com/oauth/token".to_string();
+                p.uaa_client_id = "client".to_string();
+                p.uaa_client_secret = "secret".to_string();
+                p.genai_api_url = "https://api.test.com".to_string();
+                p
             }],
             api_keys: vec![crate::config::ApiKeyConfig {
                 key: "test-key".to_string(),

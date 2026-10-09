@@ -170,6 +170,26 @@ fn render_yaml(user: &Config, port: u16, db_path: &Path) -> String {
     yaml.push_str("providers:\n");
     for p in &user.providers {
         yaml.push_str(&format!("  - name: {}\n", yaml_escape(&p.name)));
+
+        // Passthrough providers carry a different field set (base_url + static
+        // key + per-dialect prefixes) instead of the AI Core OAuth/URL fields.
+        if p.is_passthrough() {
+            yaml.push_str("    kind: passthrough\n");
+            yaml.push_str(&format!("    base_url: {}\n", yaml_escape(&p.base_url)));
+            yaml.push_str(&format!("    api_key: {}\n", yaml_escape(&p.api_key)));
+            yaml.push_str(&format!("    auth_header: {}\n", yaml_escape(&p.auth_header)));
+            yaml.push_str("    prefixes:\n");
+            yaml.push_str(&format!("      openai: {}\n", yaml_escape(&p.prefixes.openai)));
+            yaml.push_str(&format!(
+                "      anthropic: {}\n",
+                yaml_escape(&p.prefixes.anthropic)
+            ));
+            yaml.push_str(&format!("      gemini: {}\n", yaml_escape(&p.prefixes.gemini)));
+            yaml.push_str(&format!("    weight: {}\n", p.weight));
+            yaml.push_str(&format!("    enabled: {}\n", p.enabled));
+            continue;
+        }
+
         if p.is_joule() {
             yaml.push_str("    auth: joule\n");
         }

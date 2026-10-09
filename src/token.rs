@@ -86,6 +86,11 @@ impl TokenManager {
             return Ok(None);
         }
 
+        // Passthrough providers use a static upstream key; no OAuth, no caching.
+        if provider.is_passthrough() {
+            return Ok(Some(provider.api_key.clone()));
+        }
+
         let token_key = {
             let mut hasher = Sha256::new();
             hasher.update(match provider.auth {

@@ -273,8 +273,9 @@ fn clamp_thinking(obj: &mut Map<String, Value>) {
 /// `top_p` / `top_k` at the model level (verified via empirical probe against
 /// AI Core gpt-5.5-style 400 responses). Cross-checked against litellm's
 /// `anthropic/common_utils.py::_supports_sampling_params`, which groups
-/// Opus 4.7, Opus 4.8, and Fable 5 together for the same reason. hai-proxy
-/// and LiteLLM track the same set; add new entries here when they ship.
+/// Opus 4.7, Opus 4.8, and Fable 5 together for the same reason. Other
+/// OpenAI-compatible proxies and LiteLLM track the same set; add new entries
+/// here when they ship.
 fn requires_adaptive_thinking(model: &str) -> bool {
     matches!(model, CLAUDE_OPUS_4_7 | CLAUDE_OPUS_4_8)
 }

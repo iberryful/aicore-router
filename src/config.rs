@@ -40,12 +40,15 @@ pub struct Config {
     pub quotas: QuotaConfig,
 }
 
-/// A single AI Core provider configuration
+/// A single provider configuration (either a SAP AI Core tenant or a generic
+/// OpenAI-compatible passthrough upstream).
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Provider {
     /// Unique identifier for this provider
     pub name: String,
-    /// Authentication flow used for this provider.
+    /// Backend kind: SAP AI Core (default) or a generic passthrough upstream.
+    pub kind: ProviderKind,
+    /// Authentication flow used for this provider (AI Core kinds only).
     pub auth: ProviderAuth,
     /// UAA OAuth token URL
     pub uaa_token_url: String,
@@ -55,6 +58,18 @@ pub struct Provider {
     pub uaa_client_secret: String,
     /// AI Core API base URL
     pub genai_api_url: String,
+    /// Passthrough: upstream base URL (empty for AI Core kinds).
+    pub base_url: String,
+    /// Passthrough: static API key forwarded upstream (empty for AI Core kinds).
+    pub api_key: String,
+    /// Passthrough: header used to forward the key. `authorization` (default) is
+    /// sent as `Bearer <key>`; any other header name sends the raw key value.
+    pub auth_header: String,
+    /// Passthrough: per-dialect path prefixes prepended to canonical routes.
+    /// Different upstreams namespace dialects differently (a plain acr serves
+    /// OpenAI at the root and Anthropic/Gemini under `/anthropic` and `/gemini`;
+    /// a multi-dialect gateway may namespace every dialect, e.g. `/openai`).
+    pub prefixes: PassthroughPrefixes,
     /// Resource group for this provider
     #[serde(default = "default_resource_group")]
     pub resource_group: String,
@@ -70,16 +85,33 @@ impl std::fmt::Debug for Provider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Provider")
             .field("name", &self.name)
+            .field("kind", &self.kind)
             .field("auth", &self.auth)
             .field("uaa_token_url", &self.uaa_token_url)
             .field("uaa_client_id", &self.uaa_client_id)
             .field("uaa_client_secret", &"[REDACTED]")
             .field("genai_api_url", &self.genai_api_url)
+            .field("base_url", &self.base_url)
+            .field("api_key", &"[REDACTED]")
+            .field("auth_header", &self.auth_header)
+            .field("prefixes", &self.prefixes)
             .field("resource_group", &self.resource_group)
             .field("weight", &self.weight)
             .field("enabled", &self.enabled)
             .finish()
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    /// SAP AI Core tenant (OAuth + deployment discovery + native transforms).
+    #[default]
+    Aicore,
+    /// Generic OpenAI-compatible upstream (another acr instance, a multi-dialect
+    /// gateway, etc.). Requests are relayed in their original dialect with a static key;
+    /// no OAuth, no deployment discovery, no body transform.
+    Passthrough,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -90,9 +122,70 @@ pub enum ProviderAuth {
     Joule,
 }
 
+/// Per-dialect path prefixes for a passthrough upstream. Defaults match a plain
+/// acr instance: OpenAI at the root, Anthropic under `/anthropic`, Gemini under
+/// `/gemini` (all three are served by acr, and the latter two are also how a
+/// multi-dialect gateway namespaces them — so only `openai` typically needs an
+/// override).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PassthroughPrefixes {
+    pub openai: String,
+    pub anthropic: String,
+    pub gemini: String,
+}
+
+impl Default for PassthroughPrefixes {
+    fn default() -> Self {
+        Self {
+            openai: String::new(),
+            anthropic: "/anthropic".to_string(),
+            gemini: "/gemini".to_string(),
+        }
+    }
+}
+
+/// File form of [`PassthroughPrefixes`]: each dialect is optional and falls back
+/// to the default when omitted.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PassthroughPrefixesConfig {
+    #[serde(default)]
+    pub openai: Option<String>,
+    #[serde(default)]
+    pub anthropic: Option<String>,
+    #[serde(default)]
+    pub gemini: Option<String>,
+}
+
+impl PassthroughPrefixesConfig {
+    /// Merge over the defaults, normalizing each provided prefix.
+    fn resolve(self) -> PassthroughPrefixes {
+        let d = PassthroughPrefixes::default();
+        PassthroughPrefixes {
+            openai: self.openai.map(normalize_prefix).unwrap_or(d.openai),
+            anthropic: self.anthropic.map(normalize_prefix).unwrap_or(d.anthropic),
+            gemini: self.gemini.map(normalize_prefix).unwrap_or(d.gemini),
+        }
+    }
+}
+
 impl Provider {
     pub fn is_joule(&self) -> bool {
         self.auth == ProviderAuth::Joule
+    }
+
+    pub fn is_passthrough(&self) -> bool {
+        self.kind == ProviderKind::Passthrough
+    }
+
+    /// The (header-name, header-value) pair used to authenticate to a
+    /// passthrough upstream. `authorization` is sent as `Bearer <key>`; any
+    /// other header name carries the raw key value (e.g. `x-api-key`).
+    pub fn passthrough_auth_header(&self) -> (String, String) {
+        if self.auth_header.eq_ignore_ascii_case("authorization") {
+            ("authorization".to_string(), format!("Bearer {}", self.api_key))
+        } else {
+            (self.auth_header.clone(), self.api_key.clone())
+        }
     }
 
     pub fn oauth_issuer_url(&self) -> Option<&str> {
@@ -191,6 +284,9 @@ fn default_retention_days() -> u32 {
 pub struct ProviderConfig {
     /// Unique identifier for this provider
     pub name: String,
+    /// Backend kind. Omit for a SAP AI Core provider (the default).
+    #[serde(default)]
+    pub kind: ProviderKind,
     /// Authentication mode. Omit for the existing UAA client-credentials flow.
     #[serde(default)]
     pub auth: ProviderAuth,
@@ -206,6 +302,18 @@ pub struct ProviderConfig {
     /// AI Core API base URL
     #[serde(default)]
     pub genai_api_url: Option<String>,
+    /// Passthrough: upstream base URL (required when kind = passthrough).
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Passthrough: static API key forwarded upstream (required when kind = passthrough).
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Passthrough: header used to forward the key (default `authorization`).
+    #[serde(default)]
+    pub auth_header: Option<String>,
+    /// Passthrough: per-dialect path prefixes (each defaults when omitted).
+    #[serde(default)]
+    pub prefixes: Option<PassthroughPrefixesConfig>,
     /// Resource group for this provider
     #[serde(default)]
     pub resource_group: Option<String>,
@@ -543,19 +651,48 @@ impl Config {
 
         for p in file_config.providers {
             let provider_name = p.name.clone();
+
+            // Passthrough providers skip the entire AI Core apparatus (OAuth,
+            // deployment discovery, native transforms) and relay requests to a
+            // generic OpenAI-compatible upstream with a static key.
+            if p.kind == ProviderKind::Passthrough {
+                let base_url =
+                    required_field(&provider_name, "base_url", p.base_url, "passthrough kind")?;
+                let api_key =
+                    required_field(&provider_name, "api_key", p.api_key, "passthrough kind")?;
+                providers.push(Provider {
+                    name: p.name,
+                    kind: ProviderKind::Passthrough,
+                    auth: ProviderAuth::ClientCredentials,
+                    uaa_token_url: String::new(),
+                    uaa_client_id: String::new(),
+                    uaa_client_secret: String::new(),
+                    genai_api_url: String::new(),
+                    base_url: base_url.trim_end_matches('/').to_string(),
+                    api_key,
+                    auth_header: p.auth_header.unwrap_or_else(default_auth_header),
+                    prefixes: p.prefixes.unwrap_or_default().resolve(),
+                    resource_group: p.resource_group.unwrap_or_else(default_resource_group),
+                    weight: p.weight,
+                    enabled: p.enabled,
+                });
+                continue;
+            }
+
             let (uaa_token_url, uaa_client_id, uaa_client_secret, genai_api_url) = match p.auth {
                 ProviderAuth::ClientCredentials => {
                     let token_url =
-                        required_provider_field(&provider_name, "uaa_token_url", p.uaa_token_url)?;
+                        required_field(&provider_name, "uaa_token_url", p.uaa_token_url, "client_credentials authentication")?;
                     (
                         normalize_oauth_token_url(token_url),
-                        required_provider_field(&provider_name, "uaa_client_id", p.uaa_client_id)?,
-                        required_provider_field(
+                        required_field(&provider_name, "uaa_client_id", p.uaa_client_id, "client_credentials authentication")?,
+                        required_field(
                             &provider_name,
                             "uaa_client_secret",
                             p.uaa_client_secret,
+                            "client_credentials authentication",
                         )?,
-                        required_provider_field(&provider_name, "genai_api_url", p.genai_api_url)?,
+                        required_field(&provider_name, "genai_api_url", p.genai_api_url, "client_credentials authentication")?,
                     )
                 }
                 ProviderAuth::Joule => {
@@ -597,11 +734,16 @@ impl Config {
             };
             providers.push(Provider {
                 name: p.name,
+                kind: ProviderKind::Aicore,
                 auth: p.auth,
                 uaa_token_url,
                 uaa_client_id,
                 uaa_client_secret,
                 genai_api_url: genai_api_url.trim_end_matches('/').to_string(),
+                base_url: String::new(),
+                api_key: String::new(),
+                auth_header: default_auth_header(),
+                prefixes: PassthroughPrefixes::default(),
                 resource_group: p.resource_group.unwrap_or_else(default_resource_group),
                 weight: p.weight,
                 enabled: p.enabled,
@@ -749,18 +891,58 @@ impl Config {
     }
 }
 
-fn required_provider_field(
+fn required_field(
     provider_name: &str,
     field_name: &str,
     value: Option<String>,
+    context: &str,
 ) -> Result<String> {
     value.filter(|v| !v.trim().is_empty()).ok_or_else(|| {
         anyhow::anyhow!(
-            "Provider '{}' requires '{}' for client_credentials authentication",
+            "Provider '{}' requires '{}' for {}",
             provider_name,
-            field_name
+            field_name,
+            context
         )
     })
+}
+
+fn default_auth_header() -> String {
+    "authorization".to_string()
+}
+
+/// Normalize a passthrough path prefix: trim whitespace and any trailing slash,
+/// and ensure a non-empty prefix starts with a leading slash. An empty prefix
+/// (e.g. the OpenAI root) stays empty.
+fn normalize_prefix(prefix: String) -> String {
+    let trimmed = prefix.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+#[cfg(test)]
+pub fn test_aicore_provider(name: &str) -> Provider {
+    Provider {
+        name: name.to_string(),
+        kind: ProviderKind::Aicore,
+        auth: ProviderAuth::ClientCredentials,
+        uaa_token_url: format!("https://{name}.example.com/oauth/token"),
+        uaa_client_id: format!("{name}-client"),
+        uaa_client_secret: format!("{name}-secret"),
+        genai_api_url: format!("https://api.{name}.example.com"),
+        base_url: String::new(),
+        api_key: String::new(),
+        auth_header: "authorization".to_string(),
+        prefixes: PassthroughPrefixes::default(),
+        resource_group: "default".to_string(),
+        weight: 1,
+        enabled: true,
+    }
 }
 
 #[cfg(test)]
@@ -1044,11 +1226,16 @@ models:
     fn test_model_routes_to_provider_weight_and_enabled_semantics() {
         let provider = |name: &str, weight: u32, enabled: bool| Provider {
             name: name.to_string(),
+            kind: ProviderKind::Aicore,
             auth: ProviderAuth::ClientCredentials,
             uaa_token_url: "https://example.com/oauth/token".to_string(),
             uaa_client_id: "client".to_string(),
             uaa_client_secret: "secret".to_string(),
             genai_api_url: "https://example.com".to_string(),
+            base_url: String::new(),
+            api_key: String::new(),
+            auth_header: default_auth_header(),
+            prefixes: PassthroughPrefixes::default(),
             resource_group: "default".to_string(),
             weight,
             enabled,
@@ -1156,11 +1343,16 @@ api_keys:
             bind: "0.0.0.0:3000".to_string(),
             providers: vec![ProviderConfig {
                 name: "test".to_string(),
+                kind: ProviderKind::Aicore,
                 auth: ProviderAuth::ClientCredentials,
                 uaa_token_url: Some("https://example.com".to_string()),
                 uaa_client_id: Some("client123".to_string()),
                 uaa_client_secret: Some("secret456".to_string()),
                 genai_api_url: Some("https://api.example.com".to_string()),
+                base_url: None,
+                api_key: None,
+                auth_header: None,
+                prefixes: None,
                 resource_group: Some("test-group".to_string()),
                 weight: 1,
                 enabled: true,
@@ -1473,11 +1665,21 @@ models:
         // Verify structure is parsed correctly
         assert_eq!(config.bind, "127.0.0.1:8900");
         assert_eq!(config.log_level, "info");
-        assert_eq!(config.providers.len(), 2);
+        assert_eq!(config.providers.len(), 4);
         assert_eq!(config.providers[0].name, "primary");
         assert_eq!(config.providers[1].name, "secondary");
         assert!(config.providers[0].enabled);
         assert!(config.providers[1].enabled);
+        assert!(!config.providers[0].is_passthrough());
+        // Passthrough providers parse and normalize correctly.
+        assert_eq!(config.providers[2].name, "downstream-acr");
+        assert!(config.providers[2].is_passthrough());
+        assert_eq!(config.providers[2].base_url, "http://downstream-acr:8900");
+        assert_eq!(config.providers[3].name, "gateway");
+        assert_eq!(config.providers[3].prefixes.openai, "/openai");
+        // Anthropic/Gemini keep their defaults so the gateway's Claude/Gemini dialects route too.
+        assert_eq!(config.providers[3].prefixes.anthropic, "/anthropic");
+        assert_eq!(config.providers[3].prefixes.gemini, "/gemini");
         assert_eq!(config.api_keys.len(), 4);
         assert!(!config.models.is_empty());
         assert_eq!(config.refresh_interval_secs, 300);
@@ -1720,5 +1922,125 @@ models:
 
         // Non-existent model
         assert!(config.get_model_pricing("unknown-model").is_none());
+    }
+
+    #[test]
+    fn test_normalize_prefix() {
+        assert_eq!(normalize_prefix(String::new()), "");
+        assert_eq!(normalize_prefix("  ".to_string()), "");
+        assert_eq!(normalize_prefix("/openai".to_string()), "/openai");
+        assert_eq!(normalize_prefix("openai".to_string()), "/openai");
+        assert_eq!(normalize_prefix("/openai/".to_string()), "/openai");
+        assert_eq!(normalize_prefix("/".to_string()), "");
+    }
+
+    #[test]
+    fn test_passthrough_prefixes_defaults_and_overrides() {
+        // Empty config = acr-shaped defaults.
+        let d = PassthroughPrefixesConfig::default().resolve();
+        assert_eq!(d.openai, "");
+        assert_eq!(d.anthropic, "/anthropic");
+        assert_eq!(d.gemini, "/gemini");
+
+        // Partial override normalizes and keeps other defaults.
+        let gateway = PassthroughPrefixesConfig {
+            openai: Some("openai/".to_string()),
+            anthropic: None,
+            gemini: None,
+        }
+        .resolve();
+        assert_eq!(gateway.openai, "/openai");
+        assert_eq!(gateway.anthropic, "/anthropic");
+        assert_eq!(gateway.gemini, "/gemini");
+    }
+
+    #[test]
+    fn test_passthrough_auth_header() {
+        let mut p = Provider {
+            name: "p".to_string(),
+            kind: ProviderKind::Passthrough,
+            auth: ProviderAuth::ClientCredentials,
+            uaa_token_url: String::new(),
+            uaa_client_id: String::new(),
+            uaa_client_secret: String::new(),
+            genai_api_url: String::new(),
+            base_url: "http://x".to_string(),
+            api_key: "secret".to_string(),
+            auth_header: "authorization".to_string(),
+            prefixes: PassthroughPrefixes::default(),
+            resource_group: "default".to_string(),
+            weight: 1,
+            enabled: true,
+        };
+        // authorization -> Bearer-prefixed
+        assert_eq!(
+            p.passthrough_auth_header(),
+            ("authorization".to_string(), "Bearer secret".to_string())
+        );
+        // any other header -> raw value
+        p.auth_header = "x-api-key".to_string();
+        assert_eq!(
+            p.passthrough_auth_header(),
+            ("x-api-key".to_string(), "secret".to_string())
+        );
+    }
+
+    #[test]
+    fn test_passthrough_provider_parses_and_resolves() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config_path = temp_dir.path().join("passthrough.yaml");
+        let yaml_content = r#"
+providers:
+  - name: downstream
+    kind: passthrough
+    base_url: http://downstream:8900/
+    api_key: test-key
+    auth_header: x-api-key
+  - name: gateway
+    kind: passthrough
+    base_url: http://127.0.0.1:6655
+    api_key: test-key
+    prefixes:
+      openai: /openai/
+api_keys:
+  - local-key
+"#;
+        fs::write(&config_path, yaml_content).expect("Failed to write config file");
+        let config = Config::load(Some(config_path.to_str().unwrap())).expect("load");
+
+        let downstream = &config.providers[0];
+        assert!(downstream.is_passthrough());
+        assert_eq!(downstream.base_url, "http://downstream:8900"); // trailing slash trimmed
+        assert_eq!(downstream.api_key, "test-key");
+        assert_eq!(downstream.auth_header, "x-api-key");
+        // acr-shaped defaults: OpenAI at the root.
+        assert_eq!(downstream.prefixes.openai, "");
+        assert_eq!(downstream.prefixes.anthropic, "/anthropic");
+
+        let gateway = &config.providers[1];
+        assert_eq!(gateway.prefixes.openai, "/openai"); // overridden + normalized
+        assert_eq!(gateway.prefixes.anthropic, "/anthropic"); // default kept
+        assert_eq!(gateway.auth_header, "authorization"); // default
+
+        // Non-fatal fields for AI Core are empty on a passthrough provider.
+        assert!(downstream.genai_api_url.is_empty());
+        assert!(downstream.uaa_token_url.is_empty());
+    }
+
+    #[test]
+    fn test_passthrough_provider_requires_base_url_and_api_key() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config_path = temp_dir.path().join("bad.yaml");
+        let yaml_content = r#"
+providers:
+  - name: downstream
+    kind: passthrough
+    api_key: test-key
+api_keys:
+  - local-key
+"#;
+        fs::write(&config_path, yaml_content).expect("Failed to write config file");
+        let err = Config::load(Some(config_path.to_str().unwrap())).unwrap_err();
+        assert!(err.to_string().contains("base_url"), "got: {err}");
     }
 }

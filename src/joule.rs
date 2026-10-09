@@ -431,16 +431,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
-        let provider = Provider {
-            name: "joule".to_string(),
-            auth: ProviderAuth::Joule,
-            uaa_token_url: format!("http://{address}/oauth2/token"),
-            uaa_client_id: "public-client".to_string(),
-            uaa_client_secret: String::new(),
-            genai_api_url: "https://gateway.example.com/ai-core".to_string(),
-            resource_group: "default".to_string(),
-            weight: 1,
-            enabled: true,
+        let provider = {
+            let mut p = crate::config::test_aicore_provider("joule");
+            p.auth = ProviderAuth::Joule;
+            p.uaa_token_url = format!("http://{address}/oauth2/token");
+            p.uaa_client_id = "public-client".to_string();
+            p.uaa_client_secret = String::new();
+            p.genai_api_url = "https://gateway.example.com/ai-core".to_string();
+            p
         };
 
         let response = refresh_access_token(&reqwest::Client::new(), &provider, "refresh-old")

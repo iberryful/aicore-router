@@ -215,6 +215,43 @@ impl ModelRegistry {
                 continue;
             }
 
+            // Passthrough providers advertise their models via OpenAI-compatible
+            // model-list endpoints (per dialect) rather than AI Core deployment
+            // discovery. Reconcile each advertised id against config models the
+            // same way AI Core deployments are matched: an advertised id equal to
+            // a model's `aicore_model_name` (or `name`) registers under the clean
+            // config `name`, so e.g. a client-facing `claude-opus-4-8` resolves on
+            // an upstream that advertises `anthropic--claude-4.8-opus`. Ids with no
+            // matching config model stay reachable under their advertised name.
+            if provider.is_passthrough() {
+                for id in fetch_passthrough_models(provider).await {
+                    let key = self
+                        .config_models
+                        .iter()
+                        .find(|m| {
+                            m.routes_to_provider(provider)
+                                && m.aicore_model_name.as_deref().unwrap_or(m.name.as_str()) == id
+                        })
+                        .map(|m| m.name.clone())
+                        .unwrap_or_else(|| id.clone());
+                    all_resolved
+                        .entry(key.clone())
+                        .or_default()
+                        .push(ResolvedDeployment {
+                            deployment_id: key.clone(),
+                            provider_name: provider.name.clone(),
+                        });
+                    table_rows.push((
+                        provider.name.clone(),
+                        "-".to_string(),
+                        "PASSTHROUGH".to_string(),
+                        id.clone(),
+                        key,
+                    ));
+                }
+                continue;
+            }
+
             // Create a client for this provider
             let client = AiCoreClient::from_provider(provider.clone(), self.token_manager.clone());
 
@@ -384,6 +421,162 @@ impl ModelRegistry {
         }
 
         Ok(())
+    }
+}
+
+/// Fetch every model id a passthrough upstream advertises, across dialects.
+///
+/// Polls the OpenAI-style list under the OpenAI prefix (which, for a plain acr
+/// with an empty prefix, is the unified `/v1/models` covering all families), the
+/// Anthropic-style list under the Anthropic prefix (present on multi-dialect
+/// gateways; typically absent on a plain acr), and the Gemini list.
+/// Each endpoint is best-effort: a non-200 or parse failure contributes nothing
+/// and is logged at debug, so a missing dialect never fails discovery.
+async fn fetch_passthrough_models(provider: &Provider) -> Vec<String> {
+    let client = reqwest::Client::new();
+    let (header_name, header_value) = provider.passthrough_auth_header();
+    let p = &provider.prefixes;
+    let mut ids: Vec<String> = Vec::new();
+
+    // Build (url, parser) pairs, deduplicating URLs that coincide when
+    // prefixes overlap (e.g. default openai "" and anthropic "/anthropic"
+    // never collide, but two empty prefixes would).
+    let openai_url = format!("{}{}/v1/models", provider.base_url, p.openai);
+    let anthropic_url = format!("{}{}/v1/models", provider.base_url, p.anthropic);
+    let gemini_url = format!("{}{}/v1beta/models", provider.base_url, p.gemini);
+
+    ids.extend(
+        fetch_openai_style_list(
+            &client,
+            &openai_url,
+            &header_name,
+            &header_value,
+            &provider.name,
+        )
+        .await,
+    );
+    if anthropic_url != openai_url {
+        ids.extend(
+            fetch_openai_style_list(
+                &client,
+                &anthropic_url,
+                &header_name,
+                &header_value,
+                &provider.name,
+            )
+            .await,
+        );
+    }
+    if gemini_url != openai_url && gemini_url != anthropic_url {
+        ids.extend(
+            fetch_gemini_style_list(
+                &client,
+                &gemini_url,
+                &header_name,
+                &header_value,
+                &provider.name,
+            )
+            .await,
+        );
+    }
+
+    // Dedup while preserving first-seen order (acr's unified list can overlap
+    // with a per-dialect list if prefixes coincide).
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
+    ids
+}
+
+/// GET an OpenAI-style `{data:[{id}]}` model list. Best-effort: returns empty on
+/// any error (endpoint absent for this dialect, transport failure, bad JSON).
+async fn fetch_openai_style_list(
+    client: &reqwest::Client,
+    url: &str,
+    header_name: &str,
+    header_value: &str,
+    provider_name: &str,
+) -> Vec<String> {
+    let json = match get_json(client, url, header_name, header_value, provider_name).await {
+        Some(json) => json,
+        None => return Vec::new(),
+    };
+    json.get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// GET a Gemini-style `{models:[{name:"models/<id>", baseModelId}]}` list.
+/// Prefers `baseModelId`, falling back to `name` with the `models/` prefix
+/// stripped. Best-effort like [`fetch_openai_style_list`].
+async fn fetch_gemini_style_list(
+    client: &reqwest::Client,
+    url: &str,
+    header_name: &str,
+    header_value: &str,
+    provider_name: &str,
+) -> Vec<String> {
+    let json = match get_json(client, url, header_name, header_value, provider_name).await {
+        Some(json) => json,
+        None => return Vec::new(),
+    };
+    json.get("models")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    m.get("baseModelId")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| {
+                            m.get("name")
+                                .and_then(|v| v.as_str())
+                                .map(|n| n.strip_prefix("models/").unwrap_or(n))
+                        })
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Shared GET+parse helper for passthrough discovery. Returns `None` (with a
+/// debug log) on any non-success status or decode error.
+async fn get_json(
+    client: &reqwest::Client,
+    url: &str,
+    header_name: &str,
+    header_value: &str,
+    provider_name: &str,
+) -> Option<serde_json::Value> {
+    let response = match client
+        .get(url)
+        .header(header_name, header_value)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("Passthrough '{provider_name}': GET {url} failed: {e}");
+            return None;
+        }
+    };
+    if !response.status().is_success() {
+        tracing::debug!(
+            "Passthrough '{provider_name}': GET {url} -> {} (dialect not present here)",
+            response.status()
+        );
+        return None;
+    }
+    match response.json::<serde_json::Value>().await {
+        Ok(json) => Some(json),
+        Err(e) => {
+            tracing::debug!("Passthrough '{provider_name}': GET {url} bad JSON: {e}");
+            None
+        }
     }
 }
 
@@ -670,11 +863,16 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
         let provider = |name: &str, weight: u32| Provider {
             name: name.to_string(),
+            kind: crate::config::ProviderKind::Aicore,
             auth: crate::config::ProviderAuth::ClientCredentials,
             uaa_token_url: format!("http://{address}/oauth/token"),
             uaa_client_id: format!("{name}-client"),
             uaa_client_secret: format!("{name}-secret"),
             genai_api_url: format!("http://{address}"),
+            base_url: String::new(),
+            api_key: String::new(),
+            auth_header: "authorization".to_string(),
+            prefixes: crate::config::PassthroughPrefixes::default(),
             resource_group: "default".to_string(),
             weight,
             enabled: true,

@@ -126,17 +126,9 @@ mod tests {
     use super::*;
 
     fn create_test_provider(name: &str, enabled: bool) -> Provider {
-        Provider {
-            name: name.to_string(),
-            auth: crate::config::ProviderAuth::ClientCredentials,
-            uaa_token_url: format!("https://{}.example.com/oauth/token", name),
-            uaa_client_id: format!("{}-client", name),
-            uaa_client_secret: format!("{}-secret", name),
-            genai_api_url: format!("https://api.{}.example.com", name),
-            resource_group: "default".to_string(),
-            weight: 1,
-            enabled,
-        }
+        let mut p = crate::config::test_aicore_provider(name);
+        p.enabled = enabled;
+        p
     }
 
     #[test]
