@@ -135,10 +135,10 @@ async fn execute_proxy_request(
         });
     }
 
-    // Reject the "internal" key from non-loopback IPs
+    // Reject the INTERNAL_API_KEY from non-loopback IPs
     let request_api_key = extract_api_key(headers);
     if let Some(ref key) = request_api_key
-        && key == "internal"
+        && key == crate::token::INTERNAL_API_KEY
     {
         // Fail closed on parse errors: an unparseable client_ip cannot be
         // validated as loopback, so refuse to honor the privileged "internal"

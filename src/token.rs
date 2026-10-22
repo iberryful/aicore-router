@@ -1,5 +1,10 @@
 //! Token management for OAuth authentication with multiple providers.
 
+/// Privileged API key accepted for server-internal calls (model registry
+/// refresh, startup token pre-warm, CLI admin operations). Rejected from
+/// non-loopback clients in the auth middleware.
+pub const INTERNAL_API_KEY: &str = "internal";
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
@@ -61,10 +66,9 @@ impl TokenManager {
         let input_bytes = api_key.as_bytes();
         let mut found = 0u8;
 
-        // Build a single iterator over "internal" + all stored keys
-        let internal_key: &str = "internal";
+        // Build a single iterator over INTERNAL_API_KEY + all stored keys
         let all_keys =
-            std::iter::once(internal_key).chain(self.api_keys.iter().map(|s| s.as_str()));
+            std::iter::once(INTERNAL_API_KEY).chain(self.api_keys.iter().map(|s| s.as_str()));
 
         for stored_key in all_keys {
             let stored_bytes = stored_key.as_bytes();
@@ -261,13 +265,13 @@ mod tests {
     #[test]
     fn test_internal_key_always_valid() {
         let tm = TokenManager::new(vec!["some-key".into()]);
-        assert!(tm.is_valid_api_key("internal"));
+        assert!(tm.is_valid_api_key(INTERNAL_API_KEY));
     }
 
     #[test]
     fn test_empty_api_keys() {
         let tm = TokenManager::new(vec![]);
         assert!(!tm.is_valid_api_key("any-key"));
-        assert!(tm.is_valid_api_key("internal"));
+        assert!(tm.is_valid_api_key(INTERNAL_API_KEY));
     }
 }

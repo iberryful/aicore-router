@@ -110,7 +110,7 @@ impl AiCoreClient {
 
     async fn get_token(&self) -> Result<String> {
         self.token_manager
-            .get_token_for_provider("internal", &self.provider)
+            .get_token_for_provider(crate::token::INTERNAL_API_KEY, &self.provider)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Failed to get authentication token"))
     }

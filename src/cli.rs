@@ -311,6 +311,26 @@ impl Cli {
         // Create token manager with API keys
         let token_manager = TokenManager::new(config.api_key_strings());
 
+        // Pre-warm Joule tokens so auth failures surface at startup rather
+        // than on the first proxied request.
+        for provider in config.providers.iter().filter(|p| p.enabled && p.is_joule()) {
+            match token_manager.get_token_for_provider(crate::token::INTERNAL_API_KEY, provider).await {
+                Ok(Some(_)) => {
+                    tracing::info!("Joule token refreshed for provider '{}'", provider.name);
+                }
+                Ok(None) => {} // should not happen for Joule providers
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to refresh Joule token for provider '{}': {:#}. \
+                         Run `acr auth login {}` to re-authenticate.",
+                        provider.name,
+                        e,
+                        provider.name,
+                    );
+                }
+            }
+        }
+
         // Create load balancer with providers and configured strategy.
         // Construction fails fast when no enabled providers remain — the
         // binary refuses to start in a non-functional state.
