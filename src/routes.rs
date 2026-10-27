@@ -224,6 +224,9 @@ async fn execute_proxy_request(
     };
 
     let mut last_error: Option<AppError> = None;
+    // Last transient upstream 5xx, kept so the client sees the real upstream
+    // error verbatim if every provider is exhausted.
+    let mut last_retryable: Option<Response> = None;
 
     // Try each provider in order until one succeeds or all are exhausted
     for (i, provider) in providers.enumerate() {
@@ -338,6 +341,28 @@ async fn execute_proxy_request(
                     }
                 }
 
+                // Transient upstream errors (gateway/capacity, not request-
+                // specific) are retriable: try the next credential/provider
+                // rather than returning them. 429 is handled separately below
+                // (with cooldown); these carry no cooldown since the backend is
+                // shared across a pool's credentials.
+                if !is_success
+                    && matches!(
+                        response.status(),
+                        StatusCode::BAD_GATEWAY
+                            | StatusCode::SERVICE_UNAVAILABLE
+                            | StatusCode::GATEWAY_TIMEOUT
+                    )
+                {
+                    tracing::warn!(
+                        "Provider '{}' returned {}, trying next provider",
+                        provider.name,
+                        response.status().as_u16()
+                    );
+                    last_retryable = Some(response);
+                    continue;
+                }
+
                 return Ok(response);
             }
             Ok(ProxyExecuteResult::RateLimited) => {
@@ -366,6 +391,11 @@ async fn execute_proxy_request(
 
     // All providers exhausted
     record_failure_metrics(&state.metrics).await;
+    // Prefer surfacing a real transient upstream error (5xx) verbatim over a
+    // synthesized one, so the client keeps the upstream's diagnostics.
+    if let Some(response) = last_retryable {
+        return Ok(response);
+    }
     match last_error {
         Some(AppError::RateLimited(_)) => Err(AppError::AllProvidersRateLimited),
         Some(e) => Err(e),
