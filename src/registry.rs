@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use crate::client::{AiCoreClient, DeploymentList};
+use crate::client::{AiCoreClient, Deployment, DeploymentList};
 use crate::config::{FallbackModels, Model, Provider};
 use crate::token::TokenManager;
 
@@ -294,16 +294,7 @@ impl ModelRegistry {
                     }
                 }
             };
-            // Build mapping from aicore model name -> (deployment_id, status)
-            let mut aicore_map: HashMap<String, (String, String)> = HashMap::new();
-            for deployment in &deployments.resources {
-                if let Some(model_name) = deployment.get_aicore_model_name() {
-                    aicore_map.insert(
-                        model_name,
-                        (deployment.id.clone(), deployment.status.clone()),
-                    );
-                }
-            }
+            let aicore_map = running_deployments_by_model(&deployments.resources);
 
             // Log all deployments once per pool (same ids behind every credential).
             if logged_pools.insert(provider.pool.clone()) {
@@ -342,9 +333,7 @@ impl ModelRegistry {
                     .as_ref()
                     .unwrap_or(&model_config.name);
 
-                if let Some((deployment_id, status)) = aicore_map.get(aicore_model_name)
-                    && status == crate::constants::deployment::RUNNING_STATUS
-                {
+                if let Some(deployment_id) = aicore_map.get(aicore_model_name) {
                     all_resolved
                         .entry(model_config.name.clone())
                         .or_default()
@@ -450,6 +439,33 @@ impl ModelRegistry {
 
         Ok(())
     }
+}
+
+/// Pick one RUNNING deployment id per aicore model name.
+///
+/// A shared resource group can hold many deployments of the same model (some
+/// STOPPED). Non-RUNNING deployments can't serve traffic, so they are ignored
+/// and never mask a RUNNING one. When several RUNNING deployments exist for a
+/// model, the lexicographically smallest id is chosen so the selection is
+/// stable across refreshes (a flapping choice would keep re-warming a different
+/// deployment's prompt cache).
+fn running_deployments_by_model(deployments: &[Deployment]) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    for deployment in deployments {
+        if deployment.status != crate::constants::deployment::RUNNING_STATUS {
+            continue;
+        }
+        if let Some(model_name) = deployment.get_aicore_model_name() {
+            map.entry(model_name)
+                .and_modify(|current| {
+                    if deployment.id < *current {
+                        *current = deployment.id.clone();
+                    }
+                })
+                .or_insert_with(|| deployment.id.clone());
+        }
+    }
+    map
 }
 
 /// Fetch every model id a passthrough upstream advertises, across dialects.
@@ -651,6 +667,44 @@ fn glob_matches(pattern: &str, input: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `Deployment` from an aicore model name, id, and status via the
+    /// same JSON shape AI Core returns (so `get_aicore_model_name` parses it).
+    fn deployment(id: &str, status: &str, model: &str) -> Deployment {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "modifiedAt": "2026-01-01T00:00:00Z",
+            "status": status,
+            "details": {"resources": {"backendDetails": {"model": {
+                "name": model,
+                "version": "1"
+            }}}},
+            "scenarioId": "foundation-models",
+            "configurationId": "cfg"
+        }))
+        .expect("valid deployment json")
+    }
+
+    #[test]
+    fn running_deployments_filters_non_running_and_picks_stable_id() {
+        // Model "m": two RUNNING (ids d-a, d-b) plus a STOPPED (d-z) listed last.
+        // Model "n": only a STOPPED deployment.
+        let deployments = vec![
+            deployment("d-b", "RUNNING", "vendor--m"),
+            deployment("d-a", "RUNNING", "vendor--m"),
+            deployment("d-z", "STOPPED", "vendor--m"),
+            deployment("n-stopped", "STOPPED", "vendor--n"),
+        ];
+
+        let map = running_deployments_by_model(&deployments);
+
+        // A STOPPED deployment listed last must not mask the RUNNING ones, and
+        // the smallest RUNNING id is chosen deterministically.
+        assert_eq!(map.get("vendor--m").map(String::as_str), Some("d-a"));
+        // A model with no RUNNING deployment resolves to nothing.
+        assert!(!map.contains_key("vendor--n"));
+    }
 
     #[test]
     fn test_glob_matches_trailing_wildcard() {
