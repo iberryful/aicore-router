@@ -9,7 +9,7 @@ A high-performance Rust-based proxy service for SAP AI Core, providing unified a
 - **Multi-Model Support**: OpenAI GPT, Claude (Anthropic), and Gemini (Google) APIs
 - **Streaming Support**: Real-time streaming responses for all supported models
 - **Dynamic Model Resolution**: Automatic discovery and mapping of models from AI Core deployments
-- **Multi-Provider Load Balancing**: Round-robin or fallback strategies across multiple AI Core tenants with automatic 429 retry
+- **Multi-Provider Load Balancing**: Ordered fallback across AI Core tenants, with weighted-random load balancing across a credential pool per backend and automatic 429 retry + cooldown
 - **Model Aliases**: Wildcard pattern matching (`*` may appear anywhere) to route variant model names to configured deployments
 - **Auto Max-Context**: Each Claude request automatically gets the maximum context window the model is capable of (1M for Sonnet 4+ / Opus 4.6+, with `context-1m-2025-08-07` beta auto-injected where needed)
 - **Token Quotas**: Per-API-key daily/monthly token limits with 429 rejection and Retry-After headers
@@ -130,7 +130,8 @@ quotas:
   daily_token_limit: 1000000
   monthly_token_limit: 20000000
 
-# Multiple AI Core providers for load balancing
+# Multiple AI Core providers; each is tried in order (fallback) and may carry a
+# credential pool that is load-balanced internally.
 providers:
   - name: provider1
     uaa_token_url: https://tenant1.authentication.sap.hana.ondemand.com/oauth/token
@@ -138,7 +139,6 @@ providers:
     uaa_client_secret: client-secret-1
     genai_api_url: https://api.ai.prod.sap.com
     resource_group: resource-group-1
-    weight: 1
     enabled: true
   - name: provider2
     uaa_token_url: https://tenant2.authentication.sap.hana.ondemand.com/oauth/token
@@ -146,7 +146,6 @@ providers:
     uaa_client_secret: client-secret-2
     genai_api_url: https://api.ai.prod.sap.com
     resource_group: resource-group-2
-    weight: 1
     enabled: true
 
 # Server configuration
@@ -370,18 +369,28 @@ The router supports multiple AI Core providers for load balancing and redundancy
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `name` | Yes | Unique identifier for this provider |
+| `name` | Yes | Unique identifier for this provider / pool |
 | `auth` | No | `client_credentials` (default) or `joule` |
-| `uaa_token_url` | Client credentials only | SAP UAA OAuth token endpoint |
-| `uaa_client_id` | Client credentials only | OAuth client ID |
-| `uaa_client_secret` | Client credentials only | OAuth client secret |
-| `genai_api_url` | Client credentials only | SAP AI Core API base URL |
-| `resource_group` | Yes | AI Core resource group |
-| `weight` | No | `0` makes the provider opt-in: skipped by default, but usable when explicitly listed in `models[].providers`; positive values preserve existing routing (default: 1) |
+| `uaa_token_url` | Client credentials only | SAP UAA OAuth token endpoint (pool default; a credential may override it) |
+| `uaa_client_id` | Single-credential only | OAuth client ID (omit when using `credentials` / `credentials_file`) |
+| `uaa_client_secret` | Single-credential only | OAuth client secret (omit when using `credentials` / `credentials_file`) |
+| `genai_api_url` | Client credentials only | SAP AI Core API base URL (shared by all credentials) |
+| `resource_group` | Yes | AI Core resource group (shared by all credentials) |
+| `credentials` | No | Inline credential pool: a list of `{ name, uaa_client_id, uaa_client_secret, uaa_token_url?, weight? }`. Mutually exclusive with `credentials_file`. |
+| `credentials_file` | No | Path to an external `{ credentials: [...] }` file (relative to the config file, or absolute; `~` expanded). Keeps a long list out of the main config. |
+| `cooldown_secs` | No | Seconds a credential is skipped after a 429 before being offered again (default: 30) |
 | `enabled` | No | Whether this provider is active (default: true) |
+
+Load balancing is two-level: providers (a model's `providers:` allowlist, or every
+enabled provider) are tried in **configured order as fallback**; within one
+provider's credential pool, requests are spread by **stateless weighted-random
+shuffle**, skipping any credential cooling down after a 429. `weight` is a
+per-credential field (`0` excludes a credential from the shuffle); a provider-level
+`weight` is rejected.
 
 ```yaml
 providers:
+  # Single-credential provider.
   - name: primary
     uaa_token_url: https://tenant1.authentication.sap.hana.ondemand.com/oauth/token
     uaa_client_id: client-id
@@ -389,12 +398,15 @@ providers:
     genai_api_url: https://api.ai.prod.sap.com
     resource_group: default
     enabled: true
-  - name: secondary
-    uaa_token_url: https://tenant2.authentication.sap.hana.ondemand.com/oauth/token
-    uaa_client_id: client-id-2
-    uaa_client_secret: secret-2
+  # Credential pool: one backend fronted by many OAuth credentials (separate quota
+  # buckets, shared tenant/resource-group/deployments/cache). Load-balanced by
+  # weighted shuffle; the long list lives in an external file.
+  - name: pooled
     genai_api_url: https://api.ai.prod.sap.com
-    resource_group: rg2
+    resource_group: default
+    uaa_token_url: https://tenant2.authentication.sap.hana.ondemand.com/oauth/token
+    credentials_file: ./pool-credentials.yaml
+    cooldown_secs: 30
     enabled: true
 ```
 
@@ -423,36 +435,30 @@ Use `acr auth logout joule` to remove the saved credential.
 
 ### Load Balancing
 
-The router supports two load balancing strategies, configured via the `load_balancing` option:
+Load balancing is two-level and has no configuration knob — the behavior below is
+fixed:
 
-```yaml
-# Options: round_robin (default), fallback
-load_balancing: round_robin
-```
-
-#### Strategies
-
-| Strategy | Description |
-|----------|-------------|
-| `round_robin` | Distribute requests evenly across providers. Each request goes to the next provider in rotation. |
-| `fallback` | Always try the first provider first. Only switch to the next provider if the current one returns 429 (rate limited). |
+- **Across providers** (a model's `providers:` allowlist, or every enabled provider
+  when none is given): **ordered fallback**. Providers are tried in configured
+  order; the router only advances to the next on a 429. Distinct backends mean
+  distinct prompt caches, so traffic is never sprayed across them.
+- **Within one provider's credential pool**: **stateless weighted-random shuffle**,
+  skipping any credential cooling down after a recent 429. A pool shares one
+  backend (tenant / resource group / deployments / cache), so spreading across its
+  credentials multiplies quota without fragmenting the cache.
 
 #### Behavior
 
-Both strategies include automatic failover:
+1. **429 fallback + cooldown**: on HTTP 429 the router retries the next credential
+   (then the next provider) and cools the throttled credential down for
+   `cooldown_secs` (default 30).
+2. **Model availability**: the router only offers a provider that has the requested
+   model deployed; otherwise it moves on.
+3. **Exhaustion**: if every candidate is rate limited, the router returns 429 to the
+   client.
 
-1. **429 Fallback**: If a provider returns HTTP 429 (rate limited), the router automatically retries with the next provider
-2. **Model Availability**: The router checks if the requested model is available on each provider before sending the request
-3. **Exhaustion Handling**: If all providers are rate limited, the router returns a 429 error to the client
-
-**Use `round_robin` when:**
-- You want to spread load evenly across multiple AI Core tenants
-- You want to maximize throughput by utilizing multiple rate limit pools
-
-**Use `fallback` when:**
-- You have a primary provider and want to use others only as backup
-- You want predictable routing (always same provider unless rate limited)
-- You have providers with different capabilities or costs
+Per-credential `weight` biases the shuffle (higher = more traffic); `weight: 0`
+keeps a credential configured but out of the rotation.
 
 ### Required Configuration
 

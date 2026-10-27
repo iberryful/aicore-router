@@ -26,9 +26,6 @@ pub struct Config {
     pub refresh_interval_secs: u64,
     #[serde(default)]
     pub fallback_models: FallbackModels,
-    /// Load balancing strategy for distributing requests across providers
-    #[serde(default)]
-    pub load_balancing: LoadBalancingStrategy,
     /// Request logging configuration
     #[serde(default)]
     pub log_requests: LogRequestsConfig,
@@ -73,9 +70,21 @@ pub struct Provider {
     /// Resource group for this provider
     #[serde(default = "default_resource_group")]
     pub resource_group: String,
-    /// Weight for load balancing (higher = more traffic)
+    /// Load-balancing weight of this credential within its pool (higher = more
+    /// traffic). `0` keeps the credential available for explicit targeting but
+    /// excludes it from the weighted shuffle.
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// Name of the pool this provider belongs to. For a single-credential
+    /// provider this equals `name`; for a credential pool, every expanded member
+    /// shares the pool name (which is what a model's `providers:` allowlist and
+    /// the default-pool grouping match against).
+    #[serde(default)]
+    pub pool: String,
+    /// Seconds to cool a credential down after it returns a 429 before the
+    /// balancer will offer it again.
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u64,
     /// Whether this provider is enabled
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -97,6 +106,8 @@ impl std::fmt::Debug for Provider {
             .field("prefixes", &self.prefixes)
             .field("resource_group", &self.resource_group)
             .field("weight", &self.weight)
+            .field("pool", &self.pool)
+            .field("cooldown_secs", &self.cooldown_secs)
             .field("enabled", &self.enabled)
             .finish()
     }
@@ -199,6 +210,10 @@ fn default_weight() -> u32 {
     1
 }
 
+fn default_cooldown_secs() -> u64 {
+    DEFAULT_COOLDOWN_SECS
+}
+
 fn default_enabled() -> bool {
     true
 }
@@ -221,9 +236,6 @@ pub struct ConfigFile {
     /// API keys for authenticating requests (supports both string and object formats)
     #[serde(default)]
     api_keys: Vec<ApiKeyEntry>,
-    /// Load balancing strategy
-    #[serde(default)]
-    pub load_balancing: LoadBalancingStrategy,
     /// Request logging configuration
     #[serde(default)]
     pub log_requests: Option<LogRequestsConfig>,
@@ -317,15 +329,56 @@ pub struct ProviderConfig {
     /// Resource group for this provider
     #[serde(default)]
     pub resource_group: Option<String>,
-    /// Weight for load balancing (higher = more traffic)
-    #[serde(default = "default_weight")]
-    pub weight: u32,
+    /// Provider-level weight is no longer supported — weight is a per-credential
+    /// property. Parsed only so we can emit a clear migration error if present.
+    #[serde(default)]
+    pub weight: Option<u32>,
+    /// Inline credential pool (AI Core kinds only). When set, the provider
+    /// load-balances across these credentials (same backend, shared cache).
+    #[serde(default)]
+    pub credentials: Option<Vec<Credential>>,
+    /// External credential-pool file (AI Core kinds only). Relative paths resolve
+    /// against the main config file's directory; `~` is expanded. Mutually
+    /// exclusive with inline `credentials`.
+    #[serde(default)]
+    pub credentials_file: Option<String>,
+    /// Seconds to cool a credential down after a 429 (pool-level default).
+    #[serde(default)]
+    pub cooldown_secs: Option<u64>,
     /// Whether this provider is enabled
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     /// Catch-all for unknown fields
     #[serde(flatten)]
     pub unknown: HashMap<String, serde_yaml_ng::Value>,
+}
+
+/// A single OAuth credential within an AI Core provider pool. All credentials in
+/// a pool front the same backend (tenant, `genai_api_url`, resource group), so
+/// the balancer may spread across them without fragmenting the prompt cache.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Credential {
+    /// Optional label, used to build the expanded member name `"{pool}/{name}"`.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// UAA client ID for this credential.
+    pub uaa_client_id: String,
+    /// UAA client secret for this credential.
+    #[serde(default)]
+    pub uaa_client_secret: String,
+    /// Optional per-credential token URL; inherits the pool's `uaa_token_url`.
+    #[serde(default)]
+    pub uaa_token_url: Option<String>,
+    /// Weight within the pool's weighted shuffle (`0` = excluded from shuffle).
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+}
+
+/// File form of a credential pool: `{ credentials: [...] }`.
+#[derive(Debug, Clone, Deserialize)]
+struct CredentialFile {
+    #[serde(default)]
+    credentials: Vec<Credential>,
 }
 
 /// Pricing per 1M tokens for cost estimation.
@@ -390,11 +443,14 @@ impl Model {
     pub fn routes_to_provider(&self, provider: &Provider) -> bool {
         provider.enabled
             && if self.providers.is_empty() {
-                provider.weight > 0
+                // No allowlist: every enabled provider is in the default pool.
+                true
             } else {
+                // Allowlist entries name pools; a pool's expanded members all
+                // carry the pool name in `pool`.
                 self.providers
                     .iter()
-                    .any(|configured| configured == &provider.name)
+                    .any(|configured| configured == &provider.pool)
             }
     }
 }
@@ -426,21 +482,6 @@ impl FallbackModels {
         .into_iter()
         .filter_map(|(family, model)| model.map(|m| (family, m)))
     }
-}
-
-/// Load balancing strategy for distributing requests across providers.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LoadBalancingStrategy {
-    /// Round-robin: Distribute requests evenly across providers.
-    /// Each request goes to the next provider in rotation.
-    /// If a provider returns 429, automatically falls back to the next provider.
-    #[default]
-    RoundRobin,
-    /// Fallback: Always try the first provider first.
-    /// Only switch to the next provider if the current one returns 429 (rate limited).
-    /// This prioritizes a primary provider while using others as backup.
-    Fallback,
 }
 
 /// Global quota configuration with daily and monthly token limits.
@@ -609,7 +650,11 @@ impl Config {
         // Warn about unknown fields (typos, deprecated keys, etc.)
         Self::warn_unknown_fields(&file_config);
 
-        Self::from_file_and_env(file_config)
+        let config_dir = Path::new(&config_file_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        Self::from_file_and_env(file_config, &config_dir)
     }
 
     /// Print warnings for any unrecognized fields in the config file.
@@ -644,13 +689,22 @@ impl Config {
             .as_ref()
     }
 
-    fn from_file_and_env(file_config: ConfigFile) -> Result<Self> {
+    fn from_file_and_env(file_config: ConfigFile, config_dir: &Path) -> Result<Self> {
         // Build providers list from config file
         let mut providers: Vec<Provider> = Vec::new();
         let mut joule_managed_config = None;
 
         for p in file_config.providers {
             let provider_name = p.name.clone();
+
+            // Hard cut-over: weight is a per-credential property now. A stray
+            // provider-level `weight` is almost always a stale config.
+            if p.weight.is_some() {
+                bail!(
+                    "Provider '{provider_name}': provider-level 'weight' is no longer supported; set 'weight' on each credential inside the pool instead"
+                );
+            }
+            let cooldown_secs = p.cooldown_secs.unwrap_or_else(default_cooldown_secs);
 
             // Passthrough providers skip the entire AI Core apparatus (OAuth,
             // deployment discovery, native transforms) and relay requests to a
@@ -661,7 +715,7 @@ impl Config {
                 let api_key =
                     required_field(&provider_name, "api_key", p.api_key, "passthrough kind")?;
                 providers.push(Provider {
-                    name: p.name,
+                    name: p.name.clone(),
                     kind: ProviderKind::Passthrough,
                     auth: ProviderAuth::ClientCredentials,
                     uaa_token_url: String::new(),
@@ -673,81 +727,129 @@ impl Config {
                     auth_header: p.auth_header.unwrap_or_else(default_auth_header),
                     prefixes: p.prefixes.unwrap_or_default().resolve(),
                     resource_group: p.resource_group.unwrap_or_else(default_resource_group),
-                    weight: p.weight,
+                    weight: default_weight(),
+                    pool: p.name,
+                    cooldown_secs,
                     enabled: p.enabled,
                 });
                 continue;
             }
 
-            let (uaa_token_url, uaa_client_id, uaa_client_secret, genai_api_url) = match p.auth {
-                ProviderAuth::ClientCredentials => {
-                    let token_url =
-                        required_field(&provider_name, "uaa_token_url", p.uaa_token_url, "client_credentials authentication")?;
-                    (
-                        normalize_oauth_token_url(token_url),
-                        required_field(&provider_name, "uaa_client_id", p.uaa_client_id, "client_credentials authentication")?,
-                        required_field(
-                            &provider_name,
-                            "uaa_client_secret",
-                            p.uaa_client_secret,
-                            "client_credentials authentication",
-                        )?,
-                        required_field(&provider_name, "genai_api_url", p.genai_api_url, "client_credentials authentication")?,
-                    )
+            let resource_group = p
+                .resource_group
+                .clone()
+                .unwrap_or_else(default_resource_group);
+
+            // Joule providers resolve a single credential from managed config;
+            // credential pools don't apply (no client secret to rotate).
+            if p.auth == ProviderAuth::Joule {
+                if p.credentials.is_some() || p.credentials_file.is_some() {
+                    bail!(
+                        "Provider '{provider_name}': credential pools are not supported for Joule auth"
+                    );
                 }
-                ProviderAuth::Joule => {
-                    let needs_managed_config = p.uaa_token_url.is_none()
-                        || p.uaa_client_id.is_none()
-                        || p.genai_api_url.is_none();
-                    if needs_managed_config && joule_managed_config.is_none() {
-                        joule_managed_config = Some(
-                                crate::joule::JouleManagedConfig::load().with_context(|| {
-                                    format!(
-                                        "Failed to load Joule managed configuration for provider '{provider_name}'"
-                                    )
-                                })?,
-                            );
-                    }
-                    let managed = joule_managed_config.as_ref();
-                    (
-                        p.uaa_token_url.unwrap_or_else(|| {
+                let needs_managed_config = p.uaa_token_url.is_none()
+                    || p.uaa_client_id.is_none()
+                    || p.genai_api_url.is_none();
+                if needs_managed_config && joule_managed_config.is_none() {
+                    joule_managed_config =
+                        Some(crate::joule::JouleManagedConfig::load().with_context(|| {
                             format!(
-                                "{}/oauth2/token",
-                                managed.expect("managed Joule config loaded").cis_url
+                                "Failed to load Joule managed configuration for provider '{provider_name}'"
                             )
-                        }),
-                        p.uaa_client_id.unwrap_or_else(|| {
-                            managed
-                                .expect("managed Joule config loaded")
-                                .client_id
-                                .clone()
-                        }),
-                        String::new(),
-                        p.genai_api_url.unwrap_or_else(|| {
-                            format!(
-                                "{}/ai-core",
-                                managed.expect("managed Joule config loaded").gateway_url
-                            )
-                        }),
-                    )
+                        })?);
                 }
-            };
-            providers.push(Provider {
-                name: p.name,
-                kind: ProviderKind::Aicore,
-                auth: p.auth,
-                uaa_token_url,
-                uaa_client_id,
-                uaa_client_secret,
-                genai_api_url: genai_api_url.trim_end_matches('/').to_string(),
-                base_url: String::new(),
-                api_key: String::new(),
-                auth_header: default_auth_header(),
-                prefixes: PassthroughPrefixes::default(),
-                resource_group: p.resource_group.unwrap_or_else(default_resource_group),
-                weight: p.weight,
-                enabled: p.enabled,
-            });
+                let managed = joule_managed_config.as_ref();
+                let uaa_token_url = p.uaa_token_url.unwrap_or_else(|| {
+                    format!(
+                        "{}/oauth2/token",
+                        managed.expect("managed Joule config loaded").cis_url
+                    )
+                });
+                let uaa_client_id = p.uaa_client_id.unwrap_or_else(|| {
+                    managed
+                        .expect("managed Joule config loaded")
+                        .client_id
+                        .clone()
+                });
+                let genai_api_url = p.genai_api_url.unwrap_or_else(|| {
+                    format!(
+                        "{}/ai-core",
+                        managed.expect("managed Joule config loaded").gateway_url
+                    )
+                });
+                providers.push(Provider {
+                    name: p.name.clone(),
+                    kind: ProviderKind::Aicore,
+                    auth: ProviderAuth::Joule,
+                    uaa_token_url,
+                    uaa_client_id,
+                    uaa_client_secret: String::new(),
+                    genai_api_url: genai_api_url.trim_end_matches('/').to_string(),
+                    base_url: String::new(),
+                    api_key: String::new(),
+                    auth_header: default_auth_header(),
+                    prefixes: PassthroughPrefixes::default(),
+                    resource_group,
+                    weight: default_weight(),
+                    pool: p.name,
+                    cooldown_secs,
+                    enabled: p.enabled,
+                });
+                continue;
+            }
+
+            // AI Core client-credentials: expand the credential pool into one
+            // runtime Provider per credential, all sharing the backend fields.
+            let genai_api_url = required_field(
+                &provider_name,
+                "genai_api_url",
+                p.genai_api_url.clone(),
+                "client_credentials authentication",
+            )?
+            .trim_end_matches('/')
+            .to_string();
+            let pool_token_url = p.uaa_token_url.clone();
+            let (credentials, is_pool) = resolve_credential_pool(&p, config_dir)?;
+
+            for (index, cred) in credentials.into_iter().enumerate() {
+                let cred_label = cred.name.clone().unwrap_or_else(|| index.to_string());
+                if is_pool && cred.uaa_client_secret.trim().is_empty() {
+                    eprintln!(
+                        "Warning: credential '{cred_label}' in pool '{provider_name}' has an empty secret; skipping"
+                    );
+                    continue;
+                }
+                let token_url = required_field(
+                    &provider_name,
+                    "uaa_token_url",
+                    cred.uaa_token_url.clone().or_else(|| pool_token_url.clone()),
+                    "client_credentials authentication",
+                )?;
+                let member_name = if is_pool {
+                    format!("{provider_name}/{cred_label}")
+                } else {
+                    provider_name.clone()
+                };
+                providers.push(Provider {
+                    name: member_name,
+                    kind: ProviderKind::Aicore,
+                    auth: ProviderAuth::ClientCredentials,
+                    uaa_token_url: normalize_oauth_token_url(token_url),
+                    uaa_client_id: cred.uaa_client_id,
+                    uaa_client_secret: cred.uaa_client_secret,
+                    genai_api_url: genai_api_url.clone(),
+                    base_url: String::new(),
+                    api_key: String::new(),
+                    auth_header: default_auth_header(),
+                    prefixes: PassthroughPrefixes::default(),
+                    resource_group: resource_group.clone(),
+                    weight: cred.weight,
+                    pool: provider_name.clone(),
+                    cooldown_secs,
+                    enabled: p.enabled,
+                });
+            }
         }
 
         if providers.is_empty() {
@@ -780,7 +882,6 @@ impl Config {
 
         let models = file_config.models;
         let fallback_models = file_config.fallback_models;
-        let load_balancing = file_config.load_balancing;
 
         // Resolve log_requests config
         let mut log_requests = file_config.log_requests.unwrap_or_default();
@@ -799,7 +900,6 @@ impl Config {
             log_level,
             refresh_interval_secs,
             fallback_models,
-            load_balancing,
             log_requests,
             openai_api_version,
             quotas,
@@ -820,39 +920,37 @@ impl Config {
             );
         }
 
-        let mut configured_providers = std::collections::HashSet::new();
-        let mut enabled_providers = std::collections::HashSet::new();
-        let mut default_providers = std::collections::HashSet::new();
+        let mut member_names = std::collections::HashSet::new();
+        let mut configured_pools = std::collections::HashSet::new();
+        let mut enabled_pools = std::collections::HashSet::new();
         for provider in &self.providers {
-            if !configured_providers.insert(provider.name.as_str()) {
+            if !member_names.insert(provider.name.as_str()) {
                 anyhow::bail!(
                     "Provider names must be unique; '{}' is duplicated",
                     provider.name
                 );
             }
+            configured_pools.insert(provider.pool.as_str());
             if provider.enabled {
-                enabled_providers.insert(provider.name.as_str());
-                if provider.weight > 0 {
-                    default_providers.insert(provider.name.as_str());
-                }
+                enabled_pools.insert(provider.pool.as_str());
             }
         }
 
         for model in &self.models {
             let mut seen = std::collections::HashSet::new();
-            for provider_name in &model.providers {
-                if !configured_providers.contains(provider_name.as_str()) {
+            for pool_name in &model.providers {
+                if !configured_pools.contains(pool_name.as_str()) {
                     anyhow::bail!(
                         "Model '{}' references unknown provider '{}'",
                         model.name,
-                        provider_name
+                        pool_name
                     );
                 }
-                if !seen.insert(provider_name.as_str()) {
+                if !seen.insert(pool_name.as_str()) {
                     anyhow::bail!(
                         "Model '{}' lists provider '{}' more than once",
                         model.name,
-                        provider_name
+                        pool_name
                     );
                 }
             }
@@ -860,16 +958,16 @@ impl Config {
                 && !model
                     .providers
                     .iter()
-                    .any(|provider| enabled_providers.contains(provider.as_str()))
+                    .any(|pool| enabled_pools.contains(pool.as_str()))
             {
                 anyhow::bail!(
                     "Model '{}' has no enabled provider in its provider allowlist",
                     model.name
                 );
             }
-            if model.providers.is_empty() && default_providers.is_empty() {
+            if model.providers.is_empty() && enabled_pools.is_empty() {
                 anyhow::bail!(
-                    "Model '{}' has no default provider because every enabled provider has weight 0",
+                    "Model '{}' has no default provider because no provider is enabled",
                     model.name
                 );
             }
@@ -907,6 +1005,72 @@ fn required_field(
     })
 }
 
+/// Resolve an AI Core provider's credential pool. Returns the credentials and
+/// whether this is a true pool (inline `credentials` / `credentials_file`) vs. a
+/// single back-compat credential drawn from the provider's top-level fields.
+/// Pool credentials with empty secrets are kept here and skipped by the caller;
+/// the back-compat single credential requires both id and secret.
+fn resolve_credential_pool(
+    p: &ProviderConfig,
+    config_dir: &Path,
+) -> Result<(Vec<Credential>, bool)> {
+    match (&p.credentials_file, &p.credentials) {
+        (Some(_), Some(_)) => bail!(
+            "Provider '{}': set either 'credentials' or 'credentials_file', not both",
+            p.name
+        ),
+        (Some(path), None) => {
+            let expanded = shellexpand::tilde(path);
+            let candidate = Path::new(expanded.as_ref());
+            let resolved = if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                config_dir.join(candidate)
+            };
+            let content = std::fs::read_to_string(&resolved).with_context(|| {
+                format!(
+                    "Provider '{}': failed to read credentials_file '{}'",
+                    p.name,
+                    resolved.display()
+                )
+            })?;
+            let file: CredentialFile = serde_yaml_ng::from_str(&content).with_context(|| {
+                format!(
+                    "Provider '{}': failed to parse credentials_file '{}'",
+                    p.name,
+                    resolved.display()
+                )
+            })?;
+            Ok((file.credentials, true))
+        }
+        (None, Some(creds)) => Ok((creds.clone(), true)),
+        (None, None) => {
+            let uaa_client_id = required_field(
+                &p.name,
+                "uaa_client_id",
+                p.uaa_client_id.clone(),
+                "client_credentials authentication",
+            )?;
+            let uaa_client_secret = required_field(
+                &p.name,
+                "uaa_client_secret",
+                p.uaa_client_secret.clone(),
+                "client_credentials authentication",
+            )?;
+            Ok((
+                vec![Credential {
+                    name: None,
+                    uaa_client_id,
+                    uaa_client_secret,
+                    uaa_token_url: None,
+                    weight: default_weight(),
+                }],
+                false,
+            ))
+        }
+    }
+}
+
 fn default_auth_header() -> String {
     "authorization".to_string()
 }
@@ -941,6 +1105,8 @@ pub fn test_aicore_provider(name: &str) -> Provider {
         prefixes: PassthroughPrefixes::default(),
         resource_group: "default".to_string(),
         weight: 1,
+        pool: name.to_string(),
+        cooldown_secs: DEFAULT_COOLDOWN_SECS,
         enabled: true,
     }
 }
@@ -1138,7 +1304,7 @@ models:
     }
 
     #[test]
-    fn test_model_provider_allowlist_accepts_enabled_zero_weight_provider() {
+    fn test_provider_level_weight_is_rejected() {
         let yaml_content = r#"
 providers:
   - name: lenny
@@ -1146,7 +1312,7 @@ providers:
     uaa_client_id: lenny-client
     uaa_client_secret: lenny-secret
     genai_api_url: https://lenny.example.com
-    weight: 0
+    weight: 1
 api_keys:
   - test-api-key
 models:
@@ -1156,15 +1322,19 @@ models:
 "#;
 
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("zero-weight-model-provider.yaml");
+        let config_path = temp_dir.path().join("provider-level-weight.yaml");
         fs::write(&config_path, yaml_content).unwrap();
-        let config = Config::load(Some(config_path.to_str().unwrap())).unwrap();
-        assert_eq!(config.models[0].providers, vec!["lenny"]);
-        assert!(config.models[0].routes_to_provider(&config.providers[0]));
+        let error = Config::load(Some(config_path.to_str().unwrap())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("provider-level 'weight' is no longer supported"),
+            "{error:#}"
+        );
     }
 
     #[test]
-    fn test_unrestricted_model_rejects_only_zero_weight_default_pool() {
+    fn test_unrestricted_model_rejects_when_no_enabled_provider() {
         let yaml_content = r#"
 providers:
   - name: lenny
@@ -1172,7 +1342,7 @@ providers:
     uaa_client_id: lenny-client
     uaa_client_secret: lenny-secret
     genai_api_url: https://lenny.example.com
-    weight: 0
+    enabled: false
 api_keys:
   - test-api-key
 models:
@@ -1180,13 +1350,13 @@ models:
 "#;
 
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("zero-weight-default-provider.yaml");
+        let config_path = temp_dir.path().join("no-enabled-default-provider.yaml");
         fs::write(&config_path, yaml_content).unwrap();
         let error = Config::load(Some(config_path.to_str().unwrap())).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("every enabled provider has weight 0"),
+                .contains("no default provider because no provider is enabled"),
             "{error:#}"
         );
     }
@@ -1200,7 +1370,6 @@ providers:
     uaa_client_id: lenny-client
     uaa_client_secret: lenny-secret
     genai_api_url: https://lenny.example.com
-    weight: 0
     enabled: false
 api_keys:
   - test-api-key
@@ -1223,8 +1392,8 @@ models:
     }
 
     #[test]
-    fn test_model_routes_to_provider_weight_and_enabled_semantics() {
-        let provider = |name: &str, weight: u32, enabled: bool| Provider {
+    fn test_model_routes_to_provider_pool_and_enabled_semantics() {
+        let provider = |name: &str, pool: &str, enabled: bool| Provider {
             name: name.to_string(),
             kind: ProviderKind::Aicore,
             auth: ProviderAuth::ClientCredentials,
@@ -1237,7 +1406,9 @@ models:
             auth_header: default_auth_header(),
             prefixes: PassthroughPrefixes::default(),
             resource_group: "default".to_string(),
-            weight,
+            weight: 1,
+            pool: pool.to_string(),
+            cooldown_secs: DEFAULT_COOLDOWN_SECS,
             enabled,
         };
         let unrestricted = Model {
@@ -1251,15 +1422,17 @@ models:
             name: "restricted".to_string(),
             aicore_model_name: None,
             aliases: vec![],
-            providers: vec!["opt-in".to_string()],
+            providers: vec!["special".to_string()],
             pricing: None,
         };
 
-        assert!(unrestricted.routes_to_provider(&provider("default", 1, true)));
-        assert!(!unrestricted.routes_to_provider(&provider("opt-in", 0, true)));
-        assert!(restricted.routes_to_provider(&provider("opt-in", 0, true)));
-        assert!(!restricted.routes_to_provider(&provider("default", 1, true)));
-        assert!(!restricted.routes_to_provider(&provider("opt-in", 0, false)));
+        // No allowlist: every enabled provider is in the default pool.
+        assert!(unrestricted.routes_to_provider(&provider("special/a", "special", true)));
+        assert!(!unrestricted.routes_to_provider(&provider("special/a", "special", false)));
+        // Allowlist matches on the pool name, so every member of that pool routes.
+        assert!(restricted.routes_to_provider(&provider("special/a", "special", true)));
+        assert!(!restricted.routes_to_provider(&provider("other/a", "other", true)));
+        assert!(!restricted.routes_to_provider(&provider("special/a", "special", false)));
     }
 
     #[test]
@@ -1354,7 +1527,10 @@ api_keys:
                 auth_header: None,
                 prefixes: None,
                 resource_group: Some("test-group".to_string()),
-                weight: 1,
+                weight: None,
+                credentials: None,
+                credentials_file: None,
+                cooldown_secs: None,
                 enabled: true,
                 unknown: HashMap::new(),
             }],
@@ -1368,14 +1544,14 @@ api_keys:
             refresh_interval_secs: None,
             fallback_models: FallbackModels::default(),
             api_keys: vec![ApiKeyEntry::Simple("key789".to_string())],
-            load_balancing: LoadBalancingStrategy::default(),
             log_requests: None,
             openai_api_version: None,
             quotas: QuotaConfig::default(),
             unknown: HashMap::new(),
         };
 
-        let config = Config::from_file_and_env(config_file).expect("Failed to create config");
+        let config = Config::from_file_and_env(config_file, Path::new("."))
+            .expect("Failed to create config");
 
         assert_eq!(config.bind, "0.0.0.0:3000");
         assert_eq!(config.providers.len(), 1);
@@ -1603,7 +1779,6 @@ providers:
     uaa_client_secret: secret1
     genai_api_url: https://api1.example.com
     resource_group: rg1
-    weight: 2
     enabled: true
   - name: provider2
     uaa_token_url: https://provider2.example.com/oauth/token
@@ -1611,7 +1786,6 @@ providers:
     uaa_client_secret: secret2
     genai_api_url: https://api2.example.com
     resource_group: rg2
-    weight: 1
     enabled: true
   - name: provider3-disabled
     uaa_token_url: https://provider3.example.com/oauth/token
@@ -1641,13 +1815,11 @@ models:
             "https://provider1.example.com/oauth/token"
         );
         assert_eq!(config.providers[0].resource_group, "rg1");
-        assert_eq!(config.providers[0].weight, 2);
         assert!(config.providers[0].enabled);
 
         // Check provider2
         assert_eq!(config.providers[1].name, "provider2");
         assert_eq!(config.providers[1].resource_group, "rg2");
-        assert_eq!(config.providers[1].weight, 1);
 
         // Check disabled provider
         assert_eq!(config.providers[2].name, "provider3-disabled");
@@ -1683,7 +1855,6 @@ models:
         assert_eq!(config.api_keys.len(), 4);
         assert!(!config.models.is_empty());
         assert_eq!(config.refresh_interval_secs, 300);
-        assert_eq!(config.load_balancing, LoadBalancingStrategy::RoundRobin);
         assert!(config.log_requests.enabled);
         assert_eq!(config.log_requests.retention_days, 30);
         assert_eq!(config.openai_api_version, "2025-04-01-preview");
@@ -1970,6 +2141,8 @@ models:
             prefixes: PassthroughPrefixes::default(),
             resource_group: "default".to_string(),
             weight: 1,
+            pool: "p".to_string(),
+            cooldown_secs: DEFAULT_COOLDOWN_SECS,
             enabled: true,
         };
         // authorization -> Bearer-prefixed

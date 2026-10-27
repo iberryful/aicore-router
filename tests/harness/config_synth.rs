@@ -161,67 +161,111 @@ fn render_yaml(user: &Config, port: u16, db_path: &Path) -> String {
     ));
     yaml.push_str("  retention_days: 1\n\n");
 
-    // Real providers (creds + URLs) lifted verbatim from the user's config.
-    yaml.push_str("load_balancing: ");
-    yaml.push_str(match user.load_balancing {
-        aicore_router::config::LoadBalancingStrategy::RoundRobin => "round_robin\n",
-        aicore_router::config::LoadBalancingStrategy::Fallback => "fallback\n",
-    });
-    yaml.push_str("providers:\n");
+    // Real providers (creds + URLs) lifted from the user's config, regrouped
+    // back into pools (the resolved Config has one Provider per credential).
+    // Models are pinned to the enabled AI Core pools below so the e2e suite
+    // exercises acr's transforms (passthrough relays verbatim and would bypass
+    // them); families with no enabled aicore backend simply don't resolve and
+    // their scenarios skip.
+    let mut pool_order: Vec<String> = Vec::new();
+    let mut pools: std::collections::HashMap<String, Vec<&aicore_router::config::Provider>> =
+        std::collections::HashMap::new();
     for p in &user.providers {
-        yaml.push_str(&format!("  - name: {}\n", yaml_escape(&p.name)));
+        if !pools.contains_key(&p.pool) {
+            pool_order.push(p.pool.clone());
+        }
+        pools.entry(p.pool.clone()).or_default().push(p);
+    }
+    // A pool is active if it has at least one enabled member in the user's config.
+    let pool_active = |members: &[&aicore_router::config::Provider]| -> bool {
+        members.iter().any(|m| m.enabled)
+    };
+    let enabled_aicore_pools: Vec<String> = pool_order
+        .iter()
+        .filter(|pool| {
+            let members = &pools[*pool];
+            !members[0].is_passthrough() && pool_active(members)
+        })
+        .cloned()
+        .collect();
+
+    yaml.push_str("providers:\n");
+    for pool in &pool_order {
+        let members = &pools[pool];
+        let rep = members[0];
+        let enabled = pool_active(members);
+        yaml.push_str(&format!("  - name: {}\n", yaml_escape(pool)));
 
         // Passthrough providers carry a different field set (base_url + static
         // key + per-dialect prefixes) instead of the AI Core OAuth/URL fields.
-        if p.is_passthrough() {
+        if rep.is_passthrough() {
             yaml.push_str("    kind: passthrough\n");
-            yaml.push_str(&format!("    base_url: {}\n", yaml_escape(&p.base_url)));
-            yaml.push_str(&format!("    api_key: {}\n", yaml_escape(&p.api_key)));
-            yaml.push_str(&format!("    auth_header: {}\n", yaml_escape(&p.auth_header)));
+            yaml.push_str(&format!("    base_url: {}\n", yaml_escape(&rep.base_url)));
+            yaml.push_str(&format!("    api_key: {}\n", yaml_escape(&rep.api_key)));
+            yaml.push_str(&format!("    auth_header: {}\n", yaml_escape(&rep.auth_header)));
             yaml.push_str("    prefixes:\n");
-            yaml.push_str(&format!("      openai: {}\n", yaml_escape(&p.prefixes.openai)));
+            yaml.push_str(&format!("      openai: {}\n", yaml_escape(&rep.prefixes.openai)));
             yaml.push_str(&format!(
                 "      anthropic: {}\n",
-                yaml_escape(&p.prefixes.anthropic)
+                yaml_escape(&rep.prefixes.anthropic)
             ));
-            yaml.push_str(&format!("      gemini: {}\n", yaml_escape(&p.prefixes.gemini)));
-            yaml.push_str(&format!("    weight: {}\n", p.weight));
-            yaml.push_str(&format!("    enabled: {}\n", p.enabled));
+            yaml.push_str(&format!("      gemini: {}\n", yaml_escape(&rep.prefixes.gemini)));
+            yaml.push_str(&format!("    enabled: {}\n", enabled));
             continue;
         }
 
-        if p.is_joule() {
+        if rep.is_joule() {
             yaml.push_str("    auth: joule\n");
         }
         yaml.push_str(&format!(
             "    uaa_token_url: {}\n",
-            yaml_escape(&p.uaa_token_url)
+            yaml_escape(&rep.uaa_token_url)
         ));
-        yaml.push_str(&format!(
-            "    uaa_client_id: {}\n",
-            yaml_escape(&p.uaa_client_id)
-        ));
-        if !p.is_joule() {
-            yaml.push_str(&format!(
-                "    uaa_client_secret: {}\n",
-                yaml_escape(&p.uaa_client_secret)
-            ));
-        }
         yaml.push_str(&format!(
             "    genai_api_url: {}\n",
-            yaml_escape(&p.genai_api_url)
+            yaml_escape(&rep.genai_api_url)
         ));
         yaml.push_str(&format!(
             "    resource_group: {}\n",
-            yaml_escape(&p.resource_group)
+            yaml_escape(&rep.resource_group)
         ));
-        yaml.push_str(&format!("    weight: {}\n", p.weight));
-        yaml.push_str(&format!("    enabled: {}\n", p.enabled));
+
+        let single = members.len() == 1 && members[0].name == *pool;
+        if rep.is_joule() {
+            // Joule resolves its single credential from managed config.
+        } else if single {
+            yaml.push_str(&format!(
+                "    uaa_client_id: {}\n",
+                yaml_escape(&rep.uaa_client_id)
+            ));
+            yaml.push_str(&format!(
+                "    uaa_client_secret: {}\n",
+                yaml_escape(&rep.uaa_client_secret)
+            ));
+        } else {
+            // Multi-credential pool: emit the credential list inline.
+            yaml.push_str("    credentials:\n");
+            for m in members {
+                let cred_name = m.name.strip_prefix(&format!("{pool}/")).unwrap_or(&m.name);
+                yaml.push_str(&format!("      - name: {}\n", yaml_escape(cred_name)));
+                yaml.push_str(&format!(
+                    "        uaa_client_id: {}\n",
+                    yaml_escape(&m.uaa_client_id)
+                ));
+                yaml.push_str(&format!(
+                    "        uaa_client_secret: {}\n",
+                    yaml_escape(&m.uaa_client_secret)
+                ));
+                yaml.push_str(&format!("        weight: {}\n", m.weight));
+            }
+        }
+        yaml.push_str(&format!("    enabled: {}\n", enabled));
     }
     yaml.push('\n');
 
-    // Models — names + aliases + aicore mapping. Pricing is irrelevant for
-    // e2e behavior, so we drop it to keep the synthesized YAML small.
+    // Models — names + aliases + aicore mapping. Pin each to the enabled aicore
+    // pools so transforms are exercised; when none is enabled, keep the model's
+    // own allowlist.
     yaml.push_str("models:\n");
     for m in &user.models {
         yaml.push_str(&format!("  - name: {}\n", yaml_escape(&m.name)));
@@ -234,9 +278,14 @@ fn render_yaml(user: &Config, port: u16, db_path: &Path) -> String {
                 yaml.push_str(&format!("      - {}\n", yaml_escape(alias)));
             }
         }
-        if !m.providers.is_empty() {
+        let allowlist = if enabled_aicore_pools.is_empty() {
+            &m.providers
+        } else {
+            &enabled_aicore_pools
+        };
+        if !allowlist.is_empty() {
             yaml.push_str("    providers:\n");
-            for provider in &m.providers {
+            for provider in allowlist {
                 yaml.push_str(&format!("      - {}\n", yaml_escape(provider)));
             }
         }

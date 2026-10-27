@@ -331,13 +331,11 @@ impl Cli {
             }
         }
 
-        // Create load balancer with providers and configured strategy.
-        // Construction fails fast when no enabled providers remain — the
-        // binary refuses to start in a non-functional state.
-        let load_balancer =
-            LoadBalancer::new(config.providers.clone(), config.load_balancing.clone())
-                .context("Failed to construct load balancer")?;
-        tracing::info!("Load balancing strategy: {:?}", config.load_balancing);
+        // Create load balancer from the expanded provider pools. Construction
+        // fails fast when no enabled providers remain — the binary refuses to
+        // start in a non-functional state.
+        let load_balancer = LoadBalancer::new(config.providers.clone())
+            .context("Failed to construct load balancer")?;
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(600))

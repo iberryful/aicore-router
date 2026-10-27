@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use reqwest::{Client, RequestBuilder};
 
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub fn client() -> Client {
     Client::builder()

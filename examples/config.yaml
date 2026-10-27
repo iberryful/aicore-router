@@ -68,23 +68,27 @@ quotas:
 # -----------------------------------------------------------------------------
 # Load Balancing Strategy
 # -----------------------------------------------------------------------------
-# How requests are distributed across providers.
-# Options:
-#   - round_robin (default): Distribute requests evenly across providers
-#   - fallback: Always try the first provider; only switch on 429 rate limit
-#
-# Both strategies include automatic failover on 429 (rate limited) responses.
-load_balancing: round_robin
+# How requests are distributed
+# -----------------------------------------------------------------------------
+# Two levels, matching the prompt-cache boundary:
+#   - Across providers (a model's `providers:` allowlist, or every enabled
+#     provider when none is given): ordered FALLBACK. Providers are tried in
+#     order; the router only advances to the next on a 429. Distinct backends =
+#     distinct caches, so traffic is never sprayed across them.
+#   - Within one provider's credential pool (see `credentials` below): stateless
+#     WEIGHTED-RANDOM shuffle, skipping any credential cooling down after a 429.
+#     The pool shares one backend/cache, so spreading is cache-safe.
+# There is no global strategy knob — the behavior above is fixed.
 
 # -----------------------------------------------------------------------------
 # Providers
 # -----------------------------------------------------------------------------
-# Providers are load-balanced / failed-over in the same pool. Two kinds:
+# Two kinds:
 #
 #   kind: aicore      (default) — a SAP AI Core tenant/resource group with its
 #                     own OAuth credentials; deployments are discovered
 #                     automatically and requests are transformed to AI Core's
-#                     native shapes.
+#                     native shapes. May carry a credential pool (see below).
 #
 #   kind: passthrough — a generic OpenAI-compatible upstream (another acr
 #                     instance, a multi-dialect gateway, etc.). Requests are
@@ -97,6 +101,25 @@ load_balancing: round_robin
 #                     `/v1beta/models`) endpoints, and requests are forwarded to
 #                     the mirrored canonical route (`/v1/chat/completions`,
 #                     `/v1/messages`, etc.).
+#
+# Credential pools (aicore only): one backend fronted by many OAuth credentials
+# (separate quota buckets, same tenant/resource-group/deployments, shared
+# cache). Give the shared backend fields on the provider and list credentials
+# inline under `credentials:`, or point `credentials_file:` at an external file
+# (`{ credentials: [...] }`; relative paths resolve against this config's
+# directory, `~` is expanded) so a long list stays out of the main config:
+#
+#   - name: starkiller
+#     kind: aicore
+#     genai_api_url: https://api.ai.<region>.aws.ml.hana.ondemand.com
+#     resource_group: default
+#     uaa_token_url: https://your-tenant.authentication.sap.hana.ondemand.com
+#     cooldown_secs: 30            # per-credential cooldown after a 429 (default 30)
+#     credentials_file: ./starkiller-pool.yaml
+#     # or inline:
+#     # credentials:
+#     #   - { name: dev,   uaa_client_id: "...", uaa_client_secret: "...", weight: 1 }
+#     #   - { name: fpa05, uaa_client_id: "...", uaa_client_secret: "...", weight: 1 }
 providers:
   - name: primary
     uaa_token_url: https://your-tenant.authentication.sap.hana.ondemand.com
@@ -104,7 +127,6 @@ providers:
     uaa_client_secret: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx$xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     genai_api_url: https://api.ai.<region>.aws.ml.hana.ondemand.com
     resource_group: default
-    weight: 1       # Load balancing weight (higher = more traffic)
     enabled: true   # Set to false to temporarily disable this provider
 
   - name: secondary
@@ -113,7 +135,6 @@ providers:
     uaa_client_secret: "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy$yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
     genai_api_url: https://api.ai.<region>.aws.ml.hana.ondemand.com
     resource_group: dev
-    weight: 1
     enabled: true
 
   # Passthrough example: relay to another acr instance (plain OpenAI-compatible).
@@ -124,7 +145,6 @@ providers:
     base_url: http://downstream-acr:8900  # no /inference/deployments suffix
     api_key: "sk-your-downstream-key"     # forwarded verbatim to the upstream
     auth_header: x-api-key                # optional; "authorization" (default) sends "Bearer <key>"
-    weight: 1
     enabled: true
 
   # Passthrough example: a multi-dialect gateway that namespaces each dialect.
@@ -139,7 +159,6 @@ providers:
       openai: /openai                     # -> {base_url}/openai/v1/chat/completions
       # anthropic: /anthropic             # default
       # gemini: /gemini                   # default
-    weight: 1
     enabled: true
 
 

@@ -26,8 +26,17 @@ use crate::harness::{
 #[tokio::test]
 async fn family_fallback_for_unknown_claude_name() {
     let acr = shared().await;
-    if acr.config.fallback_claude.is_none() {
-        skip("no Claude fallback configured");
+    let fallback = match acr.config.fallback_claude.as_deref() {
+        Some(m) => m,
+        None => {
+            skip("no Claude fallback configured");
+            return;
+        }
+    };
+    // The fallback model must have actually resolved on the live backend;
+    // skip if it didn't (e.g. the enabled aicore provider doesn't serve it).
+    if !acr.config.model_names.iter().any(|n| n == fallback) {
+        skip(&format!("Claude fallback '{fallback}' not resolved on live backend"));
         return;
     }
     let body = json!({

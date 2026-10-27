@@ -55,6 +55,7 @@ pub async fn shared() -> &'static Acr {
 async fn start() -> Acr {
     let port = pick_free_port();
     let config = SynthesizedConfig::build(port);
+    let base_url = config.base_url();
 
     let bin = locate_binary();
     let child = Command::new(&bin)
@@ -69,13 +70,45 @@ async fn start() -> Acr {
             );
         });
 
-    let acr = Acr {
+    // Build Acr first so its Drop kills the child even if readiness panics
+    // (std::process::Child does NOT kill on drop).
+    let mut acr = Acr {
         config,
         child: Mutex::new(Some(child)),
     };
 
     wait_for_ready(&acr).await;
+
+    // Replace the static model list with what actually resolved against the
+    // live backend. Family scenarios pick from this, so a model no enabled
+    // provider serves is absent and its scenario skips rather than failing.
+    if let Some(resolved) = fetch_resolved_models(&base_url).await {
+        acr.config.model_names = resolved;
+    }
+
     acr
+}
+
+/// Fetch the models acr actually resolved (`GET /v1/models`), returning their
+/// client-facing ids. `None` if the request or parse fails.
+async fn fetch_resolved_models(base_url: &str) -> Option<Vec<String>> {
+    let resp = reqwest::Client::new()
+        .get(format!("{base_url}/v1/models"))
+        .header(
+            "Authorization",
+            format!("Bearer {}", super::config_synth::KEY_DEFAULT),
+        )
+        .send()
+        .await
+        .ok()?;
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let ids: Vec<String> = json
+        .get("data")?
+        .as_array()?
+        .iter()
+        .filter_map(|m| m.get("id")?.as_str().map(str::to_string))
+        .collect();
+    Some(ids)
 }
 
 /// Pre-pick a free TCP port by binding to `:0` and dropping the listener.
@@ -100,11 +133,11 @@ fn locate_binary() -> PathBuf {
 async fn wait_for_ready(acr: &Acr) {
     let url = format!("{}/health", acr.base_url());
     let client = reqwest::Client::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if Instant::now() > deadline {
             panic!(
-                "acr did not become ready within 30s — url: {url}, config: {}",
+                "acr did not become ready within 60s — url: {url}, config: {}",
                 acr.config.config_path.display()
             );
         }

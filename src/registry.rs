@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use crate::client::AiCoreClient;
+use crate::client::{AiCoreClient, DeploymentList};
 use crate::config::{FallbackModels, Model, Provider};
 use crate::token::TokenManager;
 
@@ -199,18 +199,20 @@ impl ModelRegistry {
         // Collect rows for the summary table: (provider, deployment_id, status, deployed_model, config_model)
         let mut table_rows: Vec<(String, String, String, String, String)> = Vec::new();
 
+        // Credentials of one pool share a backend (genai_api_url + resource group)
+        // and thus the same deployments, so discover once per backend and reuse.
+        let mut discovery_cache: HashMap<(String, String), Arc<DeploymentList>> = HashMap::new();
+
         // Query each provider for deployments
         for provider in &self.providers {
             if !provider.enabled {
                 continue;
             }
-            let provider_is_used = if self.config_models.is_empty() {
-                provider.weight > 0
-            } else {
-                self.config_models
+            let provider_is_used = self.config_models.is_empty()
+                || self
+                    .config_models
                     .iter()
-                    .any(|model| model.routes_to_provider(provider))
-            };
+                    .any(|model| model.routes_to_provider(provider));
             if !provider_is_used {
                 continue;
             }
@@ -252,78 +254,90 @@ impl ModelRegistry {
                 continue;
             }
 
-            // Create a client for this provider
-            let client = AiCoreClient::from_provider(provider.clone(), self.token_manager.clone());
-
-            match client
-                .list_deployments(Some(&provider.resource_group))
-                .await
-            {
-                Ok(deployments) => {
-                    // Build mapping from aicore model name -> (deployment_id, status)
-                    let mut aicore_map: HashMap<String, (String, String)> = HashMap::new();
-                    for deployment in &deployments.resources {
-                        if let Some(model_name) = deployment.get_aicore_model_name() {
-                            aicore_map.insert(
-                                model_name,
-                                (deployment.id.clone(), deployment.status.clone()),
-                            );
-                        }
+            // Discover deployments once per backend (genai_api_url + resource
+            // group); pool credentials share a backend, so the first credential
+            // that succeeds populates the cache and the rest reuse it. On error
+            // we skip this credential — the next one in the pool retries.
+            let cache_key = (
+                provider.genai_api_url.clone(),
+                provider.resource_group.clone(),
+            );
+            let deployments = if let Some(cached) = discovery_cache.get(&cache_key) {
+                cached.clone()
+            } else {
+                let client =
+                    AiCoreClient::from_provider(provider.clone(), self.token_manager.clone());
+                match client.list_deployments(Some(&provider.resource_group)).await {
+                    Ok(deployments) => {
+                        let deployments = Arc::new(deployments);
+                        discovery_cache.insert(cache_key, deployments.clone());
+                        deployments
                     }
-
-                    // Log all deployments from this provider
-                    for deployment in &deployments.resources {
-                        let deployed_model = deployment
-                            .get_aicore_model_name()
-                            .unwrap_or_else(|| "N/A".to_string());
-                        // Find matching config model
-                        let config_model = self
-                            .config_models
-                            .iter()
-                            .find(|m| {
-                                let aicore_name = m.aicore_model_name.as_ref().unwrap_or(&m.name);
-                                aicore_name == &deployed_model && m.routes_to_provider(provider)
-                            })
-                            .map(|m| m.name.clone())
-                            .unwrap_or_else(|| "-".to_string());
-
-                        table_rows.push((
-                            provider.name.clone(),
-                            deployment.id.clone(),
-                            deployment.status.clone(),
-                            deployed_model,
-                            config_model,
-                        ));
-                    }
-
-                    // Resolve config models to deployments
-                    for model_config in &self.config_models {
-                        if !model_config.routes_to_provider(provider) {
-                            continue;
-                        }
-                        let aicore_model_name = model_config
-                            .aicore_model_name
-                            .as_ref()
-                            .unwrap_or(&model_config.name);
-
-                        if let Some((deployment_id, status)) = aicore_map.get(aicore_model_name)
-                            && status == crate::constants::deployment::RUNNING_STATUS
-                        {
-                            all_resolved
-                                .entry(model_config.name.clone())
-                                .or_default()
-                                .push(ResolvedDeployment {
-                                    deployment_id: deployment_id.clone(),
-                                    provider_name: provider.name.clone(),
-                                });
-                        }
+                    Err(e) => {
+                        error!(
+                            "Failed to query provider '{}': {}. Skipping this provider.",
+                            provider.name, e
+                        );
+                        continue;
                     }
                 }
-                Err(e) => {
-                    error!(
-                        "Failed to query provider '{}': {}. Skipping this provider.",
-                        provider.name, e
+            };
+            // Build mapping from aicore model name -> (deployment_id, status)
+            let mut aicore_map: HashMap<String, (String, String)> = HashMap::new();
+            for deployment in &deployments.resources {
+                if let Some(model_name) = deployment.get_aicore_model_name() {
+                    aicore_map.insert(
+                        model_name,
+                        (deployment.id.clone(), deployment.status.clone()),
                     );
+                }
+            }
+
+            // Log all deployments from this provider
+            for deployment in &deployments.resources {
+                let deployed_model = deployment
+                    .get_aicore_model_name()
+                    .unwrap_or_else(|| "N/A".to_string());
+                // Find matching config model
+                let config_model = self
+                    .config_models
+                    .iter()
+                    .find(|m| {
+                        let aicore_name = m.aicore_model_name.as_ref().unwrap_or(&m.name);
+                        aicore_name == &deployed_model && m.routes_to_provider(provider)
+                    })
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|| "-".to_string());
+
+                table_rows.push((
+                    provider.name.clone(),
+                    deployment.id.clone(),
+                    deployment.status.clone(),
+                    deployed_model,
+                    config_model,
+                ));
+            }
+
+            // Resolve config models to deployments
+            for model_config in &self.config_models {
+                if !model_config.routes_to_provider(provider) {
+                    continue;
+                }
+                let aicore_model_name = model_config
+                    .aicore_model_name
+                    .as_ref()
+                    .unwrap_or(&model_config.name);
+
+                if let Some((deployment_id, status)) = aicore_map.get(aicore_model_name)
+                    && status == crate::constants::deployment::RUNNING_STATUS
+                {
+                    all_resolved
+                        .entry(model_config.name.clone())
+                        .or_default()
+                        .push(ResolvedDeployment {
+                            deployment_id: deployment_id.clone(),
+                            provider_name: provider.name.clone(),
+                        });
                 }
             }
         }
@@ -875,6 +889,8 @@ mod tests {
             prefixes: crate::config::PassthroughPrefixes::default(),
             resource_group: "default".to_string(),
             weight,
+            pool: name.to_string(),
+            cooldown_secs: crate::constants::config::DEFAULT_COOLDOWN_SECS,
             enabled: true,
         };
         let registry = ModelRegistry::new(

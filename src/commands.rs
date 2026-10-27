@@ -1166,7 +1166,6 @@ impl CommandHandler {
         println!("  Bind:       {}", self.config.bind);
         println!("  Log Level:  {}", self.config.log_level);
         println!("  Refresh:    {}s", self.config.refresh_interval_secs);
-        println!("  LB Strategy:{:?}", self.config.load_balancing);
 
         // Port availability check
         let addr_available = std::net::TcpListener::bind(&*self.config.bind).is_ok();
@@ -1596,7 +1595,6 @@ mod tests {
             log_level: "info".to_string(),
             refresh_interval_secs: 300,
             fallback_models: crate::config::FallbackModels::default(),
-            load_balancing: crate::config::LoadBalancingStrategy::default(),
             log_requests: crate::config::LogRequestsConfig::default(),
             openai_api_version: crate::constants::api::DEFAULT_API_VERSION.to_string(),
             quotas: crate::config::QuotaConfig::default(),

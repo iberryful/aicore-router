@@ -223,6 +223,7 @@ pub mod config {
     pub const DEFAULT_LOG_LEVEL: &str = "info";
     pub const DEFAULT_RESOURCE_GROUP: &str = "default";
     pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 300; // 5 minutes
+    pub const DEFAULT_COOLDOWN_SECS: u64 = 30; // credential cooldown after a 429
     pub const MAX_REQUEST_BODY_SIZE_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 }
 

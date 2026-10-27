@@ -345,6 +345,9 @@ async fn execute_proxy_request(
                     "Provider '{}' returned 429, trying next provider",
                     provider.name
                 );
+                state
+                    .load_balancer
+                    .mark_cooldown(&provider.name, provider.cooldown_secs);
                 last_error = Some(AppError::RateLimited(provider.name.clone()));
                 continue;
             }
