@@ -1,1 +1,1 @@
-• Do not read .env and config.yaml
+• Do not read .env
