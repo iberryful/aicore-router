@@ -162,38 +162,22 @@ fn render_yaml(user: &Config, port: u16, db_path: &Path) -> String {
     yaml.push_str("  retention_days: 1\n\n");
 
     // Real providers (creds + URLs) lifted from the user's config, regrouped
-    // back into pools (the resolved Config has one Provider per credential).
-    // Models are pinned to the enabled AI Core pools below so the e2e suite
-    // exercises acr's transforms (passthrough relays verbatim and would bypass
-    // them); families with no enabled aicore backend simply don't resolve and
-    // their scenarios skip.
-    let mut pool_order: Vec<String> = Vec::new();
-    let mut pools: std::collections::HashMap<String, Vec<&aicore_router::config::Provider>> =
-        std::collections::HashMap::new();
-    for p in &user.providers {
-        if !pools.contains_key(&p.pool) {
-            pool_order.push(p.pool.clone());
-        }
-        pools.entry(p.pool.clone()).or_default().push(p);
-    }
-    // A pool is active if it has at least one enabled member in the user's config.
-    let pool_active = |members: &[&aicore_router::config::Provider]| -> bool {
-        members.iter().any(|m| m.enabled)
-    };
-    let enabled_aicore_pools: Vec<String> = pool_order
+    // back into pools via Config::provider_pools (the resolved Config has one
+    // Provider per credential). Models are pinned to the enabled AI Core pools
+    // below so the e2e suite exercises acr's transforms (passthrough relays
+    // verbatim and would bypass them); families with no enabled aicore backend
+    // simply don't resolve and their scenarios skip.
+    let pools = user.provider_pools();
+    let enabled_aicore_pools: Vec<String> = pools
         .iter()
-        .filter(|pool| {
-            let members = &pools[*pool];
-            !members[0].is_passthrough() && pool_active(members)
-        })
-        .cloned()
+        .filter(|(_, members)| !members[0].is_passthrough() && members.iter().any(|m| m.enabled))
+        .map(|(name, _)| name.to_string())
         .collect();
 
     yaml.push_str("providers:\n");
-    for pool in &pool_order {
-        let members = &pools[pool];
+    for (pool, members) in &pools {
         let rep = members[0];
-        let enabled = pool_active(members);
+        let enabled = members.iter().any(|m| m.enabled);
         yaml.push_str(&format!("  - name: {}\n", yaml_escape(pool)));
 
         // Passthrough providers carry a different field set (base_url + static

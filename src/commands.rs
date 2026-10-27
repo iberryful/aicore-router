@@ -1178,18 +1178,32 @@ impl CommandHandler {
             }
         );
 
-        // Providers
-        println!("\nProviders ({}):", self.config.providers.len());
-        for p in &self.config.providers {
-            if p.is_passthrough() {
+        // Providers — grouped by pool (a pool's credentials share a backend, so
+        // list the pool once with its credential count rather than per key).
+        let pools = self.config.provider_pools();
+        println!("\nProvider pools ({}):", pools.len());
+        for (pool, members) in &pools {
+            let rep = members[0];
+            let enabled = members.iter().filter(|m| m.enabled).count();
+            if rep.is_passthrough() {
                 println!(
-                    "  {} - {} (kind: passthrough, auth_header: {}, weight: {}, enabled: {})",
-                    p.name, p.base_url, p.auth_header, p.weight, p.enabled
+                    "  {} - {} (kind: passthrough, auth_header: {}, enabled: {})",
+                    pool, rep.base_url, rep.auth_header, rep.enabled
+                );
+            } else if members.len() == 1 {
+                println!(
+                    "  {} - {} (auth: {:?}, rg: {}, enabled: {})",
+                    pool, rep.genai_api_url, rep.auth, rep.resource_group, rep.enabled
                 );
             } else {
                 println!(
-                    "  {} - {} (auth: {:?}, rg: {}, weight: {}, enabled: {})",
-                    p.name, p.genai_api_url, p.auth, p.resource_group, p.weight, p.enabled
+                    "  {} - {} (auth: {:?}, rg: {}, {} credentials, {} enabled)",
+                    pool,
+                    rep.genai_api_url,
+                    rep.auth,
+                    rep.resource_group,
+                    members.len(),
+                    enabled
                 );
             }
         }

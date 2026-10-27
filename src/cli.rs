@@ -296,15 +296,31 @@ impl Cli {
         fmt().with_env_filter(env_filter).init();
 
         tracing::info!("Starting AI Core Router on {}", config.bind);
-        tracing::info!("Configured providers: {}", config.providers.len());
-        for provider in &config.providers {
-            tracing::info!(
-                "  Provider '{}': {} (resource_group: {}, enabled: {})",
-                provider.name,
-                provider.genai_api_url,
-                provider.resource_group,
-                provider.enabled
-            );
+        // Summarize by pool: a credential pool's members share a backend, so log
+        // one line per pool (with its credential count) rather than one per key.
+        let pools = config.provider_pools();
+        tracing::info!("Configured provider pools: {}", pools.len());
+        for (pool, members) in &pools {
+            let rep = members[0];
+            let enabled = members.iter().filter(|m| m.enabled).count();
+            if members.len() == 1 {
+                tracing::info!(
+                    "  Provider '{}': {} (resource_group: {}, enabled: {})",
+                    pool,
+                    rep.genai_api_url,
+                    rep.resource_group,
+                    rep.enabled
+                );
+            } else {
+                tracing::info!(
+                    "  Pool '{}': {} (resource_group: {}, {} credentials, {} enabled)",
+                    pool,
+                    rep.genai_api_url,
+                    rep.resource_group,
+                    members.len(),
+                    enabled
+                );
+            }
         }
         tracing::info!("Configured API keys: {}", config.api_keys.len());
 

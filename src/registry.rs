@@ -189,8 +189,15 @@ impl ModelRegistry {
     }
 
     async fn refresh_deployments(&self) -> Result<()> {
+        let pool_count = self
+            .providers
+            .iter()
+            .map(|p| p.pool.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         info!(
-            "Refreshing deployment mappings for {} providers...",
+            "Refreshing deployment mappings for {} pools ({} credentials)...",
+            pool_count,
             self.providers.len()
         );
 
@@ -198,6 +205,11 @@ impl ModelRegistry {
 
         // Collect rows for the summary table: (provider, deployment_id, status, deployed_model, config_model)
         let mut table_rows: Vec<(String, String, String, String, String)> = Vec::new();
+        // Pools already represented in the summary table. A pool's credentials
+        // all front the same backend and thus the same deployment ids, so the
+        // table lists each pool once (keyed by pool name) instead of repeating
+        // the full deployment set per credential.
+        let mut logged_pools: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Credentials of one pool share a backend (genai_api_url + resource group)
         // and thus the same deployments, so discover once per backend and reuse.
@@ -293,29 +305,31 @@ impl ModelRegistry {
                 }
             }
 
-            // Log all deployments from this provider
-            for deployment in &deployments.resources {
-                let deployed_model = deployment
-                    .get_aicore_model_name()
-                    .unwrap_or_else(|| "N/A".to_string());
-                // Find matching config model
-                let config_model = self
-                    .config_models
-                    .iter()
-                    .find(|m| {
-                        let aicore_name = m.aicore_model_name.as_ref().unwrap_or(&m.name);
-                        aicore_name == &deployed_model && m.routes_to_provider(provider)
-                    })
-                    .map(|m| m.name.clone())
-                    .unwrap_or_else(|| "-".to_string());
+            // Log all deployments once per pool (same ids behind every credential).
+            if logged_pools.insert(provider.pool.clone()) {
+                for deployment in &deployments.resources {
+                    let deployed_model = deployment
+                        .get_aicore_model_name()
+                        .unwrap_or_else(|| "N/A".to_string());
+                    // Find matching config model
+                    let config_model = self
+                        .config_models
+                        .iter()
+                        .find(|m| {
+                            let aicore_name = m.aicore_model_name.as_ref().unwrap_or(&m.name);
+                            aicore_name == &deployed_model && m.routes_to_provider(provider)
+                        })
+                        .map(|m| m.name.clone())
+                        .unwrap_or_else(|| "-".to_string());
 
-                table_rows.push((
-                    provider.name.clone(),
-                    deployment.id.clone(),
-                    deployment.status.clone(),
-                    deployed_model,
-                    config_model,
-                ));
+                    table_rows.push((
+                        provider.pool.clone(),
+                        deployment.id.clone(),
+                        deployment.status.clone(),
+                        deployed_model,
+                        config_model,
+                    ));
+                }
             }
 
             // Resolve config models to deployments
@@ -407,7 +421,7 @@ impl ModelRegistry {
         }
 
         info!(
-            "Deployment refresh complete: {} models resolved across {} provider deployments",
+            "Deployment refresh complete: {} models resolved across {} credential deployments",
             resolved_count, total_deployments
         );
 

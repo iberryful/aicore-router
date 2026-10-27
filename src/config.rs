@@ -626,6 +626,22 @@ impl Config {
         self.api_keys.iter().map(|k| k.key.clone()).collect()
     }
 
+    /// Providers grouped by pool, preserving first-appearance order. Each entry
+    /// is `(pool_name, members)`; a single-credential provider is a pool of one.
+    /// The single place that reconstructs pools from the expanded provider list
+    /// (used by startup/diagnostic logging and the e2e config synthesizer).
+    pub fn provider_pools(&self) -> Vec<(&str, Vec<&Provider>)> {
+        let mut groups: Vec<(&str, Vec<&Provider>)> = Vec::new();
+        for provider in &self.providers {
+            if let Some(entry) = groups.iter_mut().find(|(name, _)| *name == provider.pool) {
+                entry.1.push(provider);
+            } else {
+                groups.push((provider.pool.as_str(), vec![provider]));
+            }
+        }
+        groups
+    }
+
     pub fn load(config_path: Option<&str>) -> Result<Self> {
         let config_file_path = match config_path {
             Some(path) => path.to_string(),
@@ -1331,6 +1347,46 @@ models:
                 .contains("provider-level 'weight' is no longer supported"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn test_provider_pools_groups_members_in_order() {
+        let yaml_content = r#"
+providers:
+  - name: poolA
+    genai_api_url: https://a.example.com
+    uaa_token_url: https://a.example.com/oauth/token
+    resource_group: default
+    credentials:
+      - name: c1
+        uaa_client_id: id1
+        uaa_client_secret: s1
+      - name: c2
+        uaa_client_id: id2
+        uaa_client_secret: s2
+  - name: solo
+    uaa_token_url: https://b.example.com/oauth/token
+    uaa_client_id: idb
+    uaa_client_secret: sb
+    genai_api_url: https://b.example.com
+api_keys:
+  - test-api-key
+models:
+  - name: m1
+"#;
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("pools.yaml");
+        fs::write(&config_path, yaml_content).unwrap();
+        let config = Config::load(Some(config_path.to_str().unwrap())).unwrap();
+
+        let pools = config.provider_pools();
+        // First-appearance order preserved; a pool groups its credentials, a
+        // single-credential provider is a pool of one.
+        let names: Vec<(&str, usize)> = pools.iter().map(|(n, m)| (*n, m.len())).collect();
+        assert_eq!(names, vec![("poolA", 2), ("solo", 1)]);
+        let member_names: Vec<&str> = pools[0].1.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(member_names, vec!["poolA/c1", "poolA/c2"]);
+        assert_eq!(pools[1].1[0].name, "solo");
     }
 
     #[test]
