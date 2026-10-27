@@ -889,23 +889,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
-        let provider = |name: &str, weight: u32| Provider {
-            name: name.to_string(),
-            kind: crate::config::ProviderKind::Aicore,
-            auth: crate::config::ProviderAuth::ClientCredentials,
-            uaa_token_url: format!("http://{address}/oauth/token"),
-            uaa_client_id: format!("{name}-client"),
-            uaa_client_secret: format!("{name}-secret"),
-            genai_api_url: format!("http://{address}"),
-            base_url: String::new(),
-            api_key: String::new(),
-            auth_header: "authorization".to_string(),
-            prefixes: crate::config::PassthroughPrefixes::default(),
-            resource_group: "default".to_string(),
-            weight,
-            pool: name.to_string(),
-            cooldown_secs: crate::constants::config::DEFAULT_COOLDOWN_SECS,
-            enabled: true,
+        let provider = |name: &str, weight: u32| {
+            let mut p = crate::config::test_aicore_provider(name);
+            p.uaa_token_url = format!("http://{address}/oauth/token");
+            p.genai_api_url = format!("http://{address}");
+            p.weight = weight;
+            p
         };
         let registry = ModelRegistry::new(
             vec![Model {

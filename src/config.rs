@@ -1449,23 +1449,11 @@ models:
 
     #[test]
     fn test_model_routes_to_provider_pool_and_enabled_semantics() {
-        let provider = |name: &str, pool: &str, enabled: bool| Provider {
-            name: name.to_string(),
-            kind: ProviderKind::Aicore,
-            auth: ProviderAuth::ClientCredentials,
-            uaa_token_url: "https://example.com/oauth/token".to_string(),
-            uaa_client_id: "client".to_string(),
-            uaa_client_secret: "secret".to_string(),
-            genai_api_url: "https://example.com".to_string(),
-            base_url: String::new(),
-            api_key: String::new(),
-            auth_header: default_auth_header(),
-            prefixes: PassthroughPrefixes::default(),
-            resource_group: "default".to_string(),
-            weight: 1,
-            pool: pool.to_string(),
-            cooldown_secs: DEFAULT_COOLDOWN_SECS,
-            enabled,
+        let provider = |name: &str, pool: &str, enabled: bool| {
+            let mut p = test_aicore_provider(name);
+            p.pool = pool.to_string();
+            p.enabled = enabled;
+            p
         };
         let unrestricted = Model {
             name: "unrestricted".to_string(),
